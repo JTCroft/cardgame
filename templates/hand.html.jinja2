@@ -1,0 +1,24 @@
+{% include "styles.css" %}
+<div class="handarray">
+    {% for suit in hand.cards_for_display %}
+        <div class="hand">
+            {% for card in suit %}
+                {% if card %}
+                    <div class="card {% if card.facedown %}facedown{% else %}{{ card.suit_name }}{% endif %}">
+                        {% if not card.facedown %}
+                            <div class="corner top-left">
+                                <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
+                            </div>
+                            <div class="suit">{{ card.suit }}</div>
+                            <div class="corner bottom-right">
+                                <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
+                            </div>
+                        {% endif %}
+                    </div>
+                {% else %}
+                    <div></div>
+                {% endif %}
+            {% endfor %}
+        </div>
+    {% endfor %}
+</div>
