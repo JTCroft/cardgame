@@ -1,0 +1,122 @@
+{% block style %}
+<style type="text/css">
+    .game-container {
+        display: flex;
+        align-items: center;
+        gap: 40px;
+    }
+    .hands {
+        display: flex;
+        flex-direction: column;
+        gap: 50px;
+    }
+    .board {
+        display: grid;
+        grid-template-columns: repeat(6, 100px);
+        grid-template-rows: repeat(6, 150px);
+        gap: 10px;
+    }
+    .card {
+        width: 100px;
+        height: 150px;
+        border: 1px solid #000;
+        border-radius: 10px;
+        background-color: white;
+        position: relative;
+        font-family: 'Arial', sans-serif;
+        box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.3);
+    }
+    .card.taken {
+        visibility: hidden
+    }
+    .card.hearts, .card.diamonds {
+        color: red;
+    }
+    .card.clubs, .card.spades {
+        color: black;
+    }
+    .card .corner {
+        position: absolute;
+        dont-size: 20px;
+        line-height: 1;
+    }
+    .card .top-left {
+        top: 5px;
+        left: 5px;
+    }
+    .card .bottom-right {
+        bottom: 5px;
+        right: 5px;
+        transform: rotate(180deg);
+    }
+    .card .suit {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 50px;
+    }
+    .card.facedown {
+        background: radial-gradient(circle, #3c3, #363);
+        color: transparent;
+    }
+    .handarray {
+        display: flex;
+        position: relative;
+        flex-direction: column;
+        height: 285px;
+    }
+    .hand {
+        display: flex;
+        position: relative;
+        flex-direction: row;
+    }
+    .handarray > .hand {
+        position: absolute;
+        height: 150px;
+    }
+    .hand > .card {
+        position: absolute;
+        height: 150px;
+    }
+    .hand:nth-child(1) {
+        top: 0;
+    }
+    .hand:nth-child(2) {
+        top: 45px;
+    }
+    .hand:nth-child(3) {
+        top: 90px;
+    }
+    .hand:nth-child(4) {
+        top: 135px;
+    }
+    .hand > .card:nth-child(1) {
+        left: 0;
+    }
+    .hand > .card:nth-child(2) {
+        left: 20px;
+    }
+    .hand > .card:nth-child(3) {
+        left: 40px;
+    }
+    .hand > .card:nth-child(4) {
+        left: 60px;
+    }
+    .hand > .card:nth-child(5) {
+        left: 80px;
+    }
+    .hand > .card:nth-child(6) {
+        left: 100px;
+    }
+    .hand > .card:nth-child(7) {
+        left: 120px;
+    }
+    .hand > .card:nth-child(8) {
+        left: 140px;
+    }
+    .hand > .card:nth-child(9) {
+        left: 160px;
+    }
+</style>
+{% endblock style %}
