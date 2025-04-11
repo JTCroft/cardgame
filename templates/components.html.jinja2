@@ -1,0 +1,48 @@
+{% macro draw_card(card) %}
+  {% if card %}
+    <div class="card {% if card.facedown %}facedown{% else %}{{ card.suit_name }}{% endif %}">
+      {% if not card.facedown %}
+        <div class="corner top-left">
+          <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
+        </div>
+        <div class="suit">{{ card.suit }}</div>
+        <div class="corner bottom-right">
+          <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
+        </div>
+      {% endif %}
+    </div>
+{% else %}
+  <div></div>
+  {% endif %}
+{% endmacro %}
+
+{% macro draw_board(board, move_sequence=None) %}
+<div class="board">
+    {% for row in board %}
+        {% set row_index = loop.index0 %}
+        {% for card in row %}
+            {% if move_sequence and ((row_index, loop.index0) in move_sequence) %}
+                <div></div>
+            {% else %}
+                {{ draw_card(card) }}
+            {% endif %}
+        {% endfor %}
+    {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro draw_hand(hand) %}
+<div class="handarray">
+    {% for suit in hand.cards_for_display %}
+        <div class="hand">
+            {% for card in suit %}
+                {% if card %}
+                    {{ draw_card(card) }}
+                {% else %}
+                    <div></div>
+                {% endif %}
+            {% endfor %}
+        </div>
+    {% endfor %}
+</div>
+{% endmacro %}
