@@ -4,6 +4,7 @@
         display: flex;
         align-items: center;
         gap: 40px;
+        margin: 15px;
     }
     .hands {
         display: flex;
@@ -24,7 +25,22 @@
         background-color: white;
         position: relative;
         font-family: 'Arial', sans-serif;
+        font-size: 1.5em;
         box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.3);
+    }
+
+    .marker::after {
+        content: '';
+        position: relative;
+        display: block;
+        left: 50%; 
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: 50%;
+        aspect-ratio: 1 / 1;
+        background-color: blue;
+        border-radius: 50%;
+        box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.2);
     }
     .card.taken {
         visibility: hidden
@@ -38,7 +54,7 @@
     .card .corner {
         position: absolute;
         dont-size: 20px;
-        line-height: 1;
+        line-height: 0.8;
     }
     .card .top-left {
         top: 5px;

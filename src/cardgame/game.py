@@ -102,10 +102,15 @@ class Hand(tuple):
 
     def __new__(cls, cards):
         return super().__new__(cls, tuple(sorted(cards)))
+        
 
     def _repr_html_(self):
         return self.template.render(hand=self)
 
+    @property
+    def num_kings(self):
+        return len(set(self) & Card.kings)
+    
     @property
     def ranks(self):
         yield from groupby(self, key=itemgetter(0))
