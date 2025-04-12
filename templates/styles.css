@@ -9,13 +9,25 @@
     .hands {
         display: flex;
         flex-direction: column;
-        gap: 50px;
+        gap: 30px;
     }
     .board {
         display: grid;
         grid-template-columns: repeat(6, 100px);
         grid-template-rows: repeat(6, 150px);
         gap: 10px;
+        position: relative;
+    }
+    .board::before {
+        content: "";
+        position: absolute;
+        top: 74px;
+        left: 49px;
+        width: 552px;
+        height: 802px;
+        background-image: linear-gradient(to right, #555 2px, transparent 2px), /* Adjusted transparency start */
+                          linear-gradient(to bottom, #555 2px, transparent 2px); /* Adjusted transparency start */
+        background-size: 110px 160px;
     }
     .card {
         width: 100px;
@@ -75,6 +87,10 @@
     .card.facedown {
         background: radial-gradient(circle, #3c3, #363);
         color: transparent;
+    }
+    .score {
+        font-size: 3em;
+        font-weight: 500;
     }
     .handarray {
         display: flex;

@@ -29,17 +29,20 @@
 {% endmacro %}
 
 {% macro draw_hand(hand) %}
-<div class="handarray">
-    {% for suit in hand.cards_for_display %}
-        <div class="hand">
-            {% for card in suit %}
-                {% if card %}
-                    {{ draw_card(card) }}
-                {% else %}
-                    <div></div>
-                {% endif %}
-            {% endfor %}
-        </div>
-    {% endfor %}
+<div>
+    <div class="score">{{ hand.score() }} points</div>
+    <div class="handarray">
+        {% for suit in hand.cards_for_display %}
+            <div class="hand">
+                {% for card in suit %}
+                    {% if card %}
+                        {{ draw_card(card) }}
+                    {% else %}
+                        <div></div>
+                    {% endif %}
+                {% endfor %}
+            </div>
+        {% endfor %}
+    </div>
 </div>
 {% endmacro %}
