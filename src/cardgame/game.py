@@ -37,6 +37,7 @@ def _calculate_score_lookups():
         for pmut in product([False, True], repeat=4) for kings in product(*(([False] if card else [False, True]) for card in pmut))
     }
     return rank_scores, suit_scores
+
 _rank_scores, _suit_scores = _calculate_score_lookups()
 
 Suit = IntEnum("suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
@@ -285,3 +286,26 @@ class Game:
 
     def _repr_html_(self):
         return self.template.render(game=self)
+
+    def undo(self, number_of_moves=1):
+        
+        if number_of_moves < 0:
+            raise ValueError('Cannot undo a negative number of moves')
+        elif number_of_moves == 0:
+            return self
+        elif number_of_moves > len(self.moves):
+            raise ValueError(f'There are only {len(self.moves)} to undo!')
+
+        moves_to_undo = self.moves[-number_of_moves:]
+        moves_which_were_fd = set(moves_to_undo) & set(self.board.facedown_positions)
+        if moves_which_were_fd:
+            fd_card = Card(facedown=True)
+            to_add_back_to_fd = []
+            new_board = [list(row) for row in self.board]
+            for row, col in moves_which_were_fd:
+                to_add_back_to_fd.append(self.board[row][col])
+                new_board[row][col] = fd_card
+            board = Board(new_board, self.board.facedown_cards + tuple(to_add_back_to_fd))
+        else:
+            board = self.board
+        return self.__class__(board, tuple(self.moves[:-number_of_moves]))
