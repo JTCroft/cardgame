@@ -1,12 +1,43 @@
 from enum import IntEnum
 from jinja2 import Environment, PackageLoader
 from random import shuffle, choice
-from operator import itemgetter
-from itertools import groupby, combinations, islice
+from operator import itemgetter, or_
+from functools import reduce
+from itertools import groupby, combinations, product
 
 __all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game")
 
 env = Environment(loader=PackageLoader(package_name="cardgame", package_path="../../templates"))
+
+def _calculate_score_lookups():
+    
+    suit_scores = {}
+    for pmut in product([False, True], repeat=8):
+        for kings in product(*(([False] if card else [False, True]) for card in pmut)):
+            if sum(kings) > 4:
+                continue
+            score = 0
+            run = 0
+            kings_in_run = 0
+            for card, king in zip(pmut, kings):
+                if card:
+                    run += 1
+                elif king:
+                    run += 1
+                    kings_in_run += 1
+                else:
+                    if run >= 3:
+                        score += run * 2 - 3 - kings_in_run
+                    run = kings_in_run = 0
+            if run >= 3:
+                score += run * 2 - 3 - kings_in_run
+            suit_scores[(reduce(or_, (1<<i for i, card in enumerate(pmut) if card), 0), reduce(or_, (1<<i for i, card in enumerate(kings) if card), 0))] = score
+    rank_scores = {
+        (reduce(or_, (1 << (8 * i) for i, card in enumerate(pmut) if card), 0), reduce(or_, (1 << (8 * i) for i, card in enumerate(kings) if card), 0)): (2 * sum(pmut) - 3 + sum(kings) if sum(pmut) + sum(kings) >= 3 else 0)
+        for pmut in product([False, True], repeat=4) for kings in product(*(([False] if card else [False, True]) for card in pmut))
+    }
+    return rank_scores, suit_scores
+_rank_scores, _suit_scores = _calculate_score_lookups()
 
 Suit = IntEnum("suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
 Rank = IntEnum("rank", names=list("A2345678K"))
@@ -96,13 +127,68 @@ class Board(tuple):
             current_board[row] = tuple(row_to_change)
             yield self.__class__(tuple(current_board), self.facedown_cards[:i] + self.facedown_cards[i+1:])
 
+def _int_to_bits(n):
+    components = []
+    while n > 0:
+        lsb = n & -n 
+        components.append(lsb)
+        n &= (n - 1)
+    return tuple(reversed(components))
+
 class Hand(tuple):
 
     template = env.get_template("hand.html.jinja2")
 
     def __new__(cls, cards):
         return super().__new__(cls, tuple(sorted(cards)))
-        
+
+    @property
+    def as_int(self):
+        hand_int = 0
+        num_kings = 0
+        hand_iterator = iter(reversed(self))
+        try:
+            card = next(hand_iterator)
+        except StopIteration:
+            return 0, 0
+        while card[0] is Rank.K:
+            num_kings += 1
+            try:
+                card = next(hand_iterator)
+            except StopIteration:
+                return hand_int, num_kings
+        hand_int |= 1 << ((card[1] * 8) + card[0] - 1)
+        for card in hand_iterator:
+            hand_int |= 1 << ((card[1] * 8) + card[0] - 1)
+        return hand_int, num_kings
+    
+    def score(self, king_info=False):
+        hand_int, number_of_kings = self.as_int
+        possible_kings = _int_to_bits(0b11111111111111111111111111111111 ^ hand_int)
+        best_score, best_kings = 0, 0
+        suit_mask = 0b11111111
+        rank_mask = 0b1000000010000000100000001
+        for king_allocation in combinations(possible_kings, number_of_kings):
+            king_int = reduce(or_, king_allocation, 0)
+            score = 0
+            for suit in Suit:
+                base_suit = (hand_int >> (8 * suit)) & suit_mask
+                king_suit = (king_int >> (8 * suit)) & suit_mask
+                score += _suit_scores[(base_suit, king_suit)]
+            for rank in list(Rank)[:-1]:
+                base_rank = (hand_int >> (rank - 1)) & rank_mask
+                king_rank = (king_int >> (rank - 1)) & rank_mask
+                score += _rank_scores[(base_rank, king_rank)]
+            best_score, best_kings = max((best_score, best_kings), (score, king_int))
+        if not king_info:
+            return best_score
+        king_cards = tuple(
+            Card(
+                ((king_int.bit_length() - 1) % 8) + 1, 
+                (king_int.bit_length()-1) // 8
+            ) for king_int in _int_to_bits(best_kings)
+        )
+        return best_score, king_cards
 
     def _repr_html_(self):
         return self.template.render(hand=self)
@@ -124,14 +210,24 @@ class Hand(tuple):
     @property
     def cards_for_display(self):
 
-        grid_hand = [[None for j in range(9)] for i in range(4)]
+        grid_hand = [[None for j in range(8)] for i in range(4)]
+        score, king_cards = self.score(king_info=True)
+        king_card_iter = iter(king_cards)
         for card in self:
-            grid_hand[card[1]][card[0] - 1] = card
+            if not card[0] is Rank.K:
+                grid_hand[card[1]][card[0] - 1] = card
+            else:
+                king_card = next(king_card_iter)
+                grid_hand[king_card[1]][king_card[0] - 1] = card
         return grid_hand
-
+    
     def __add__(self, other):
 
         return self.__class__(tuple.__add__(self, other))
+
+    def __sub__(self, other):
+
+        return self.__class__(set(self) - set(other))
 
 class Game:
     starting_position = (2, 2)
