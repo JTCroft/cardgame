@@ -272,6 +272,10 @@ class Game:
         return Hand(self.board[position[0]][position[1]] for position in self.moves[key])
 
     @property
+    def score(self):
+        return self.p1.score() - self.p2.score()
+
+    @property
     def p1(self):
         return self.get_hand(slice(None, None, 2))
 
