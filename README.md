@@ -55,7 +55,24 @@ game = Game.deal()
 game
 ```
 
+To simulate gameplay, we can use a simple loop
+
+```python
+game = Game.deal()
+while game.legal_moves:
+    game = game.random_move()
+print(game.score)
+```
+
 This package is mostly focussed on enabling the calculation of optimal strategies in a given position, which has some nuance due to the random elements of the game.
+
+This would calculate the probabilistic score of each move from the position the game was in 5 moves ago with optimal play, from the perspective of the player to move
+
+```python
+game.undo(5).move_evals
+```
+
+Examples of further functionality to explore the state space are given below, the implementation is far from exhaustive
 
 ```python
 # Get the players hands
@@ -77,5 +94,5 @@ game.score
 best_score, best_move = game.score_walk()
 
 # Display the evalualtions of each move from a position
-best_score, best_move = game.score_walk()
+best_score, best_move = game.move_eval
 ```
