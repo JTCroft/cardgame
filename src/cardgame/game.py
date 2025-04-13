@@ -7,7 +7,7 @@ from itertools import groupby, combinations, product
 from math import factorial
 from collections import Counter
 
-__all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game")
+__all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game", "ProbEval")
 
 env = Environment(loader=PackageLoader(package_name="cardgame", package_path="../../templates"))
 
@@ -254,12 +254,37 @@ class ProbEval(Counter):
         s = sum(k * v for k, v in self.items())
         return w, d, l, s
 
+    def bound(self, fill_value):
+        multiplicity = self.multiplicity
+        observed = self.observed
+        if multiplicity == observed:
+            return self
+        inst = self.copy()
+        inst.update({fill_value: multiplicity - observed})
+        return inst
+        
+    @property
+    def lower_bound(self):
+        return self.bound(-25)
+    
+    @property
+    def upper_bound(self):
+        return self.bound(25)
+        
     def multiplied_wdl(self, multiplier):
         return tuple(multiplier * val for val in self.wdls)
     
     def multiplied_eval(self, multiplier):
         return self.eval_from_wdls(*self.multiplied_wdl(multiplier))
 
+    @property
+    def observed_eval(self):
+        w = sum(v for k, v in self.items() if k > 0)
+        d = self[0]
+        l = self.observed - w - d
+        s = sum(k * v for k, v in self.items())
+        return self.eval_from_wdls(w, d, l, s)
+        
     @staticmethod
     def normalise_eval(evaluation, multiplicity):
         return tuple(val / multiplicity for val in evaluation)
@@ -275,6 +300,12 @@ class ProbEval(Counter):
     @property
     def normed_eval(self):
         return self.normalise_eval(self.eval, self.multiplicity)
+
+    def __lt__(self, other):
+        return self.multiplied_eval(other.multiplicity) < other.multiplied_eval(self.multiplicity)
+
+    def __lte__(self, other):
+        return self.multiplied_eval(other.multiplicity) <= other.multiplied_eval(self.multiplicity)
     
     def __gt__(self, other):
         return self.multiplied_eval(other.multiplicity) > other.multiplied_eval(self.multiplicity)
@@ -286,7 +317,7 @@ class ProbEval(Counter):
         return self.multiplied_wdl(other.multiplicity) == other.multiplied_wdl(self.multiplicity)
 
     def __neg__(self):
-        inst = self.__class__(self.multiplicity)
+        inst = self.__class__(multiplicity=self.multiplicity)
         for k, v in self.items():
             inst[-k] = v
         return inst
@@ -298,8 +329,8 @@ class ProbEval(Counter):
             inst.update(prob_eval)
         return inst
 
-EVAL_LOWER_BOUND = ProbEval({-25: 1})
-EVAL_UPPER_BOUND = ProbEval({-25: 1})
+    def copy(self):
+        return self.__class__(multiplicity=self.multiplicity, initial_counts=dict(self))
 
 class Game:
     starting_position = (2, 2)
