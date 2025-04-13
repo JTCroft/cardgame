@@ -4,6 +4,8 @@ from random import shuffle, choice
 from operator import itemgetter, or_
 from functools import reduce
 from itertools import groupby, combinations, product
+from math import factorial
+from collections import Counter
 
 __all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game")
 
@@ -230,6 +232,75 @@ class Hand(tuple):
 
         return self.__class__(set(self) - set(other))
 
+class ProbEval(Counter):
+
+    def __init__(self, multiplicity=1, initial_counts=None):
+        super().__init__()
+        if initial_counts:
+            self.update(initial_counts)
+        self.multiplicity = multiplicity
+
+    @property
+    def observed(self):
+        return sum(v for v in self.values())
+    
+    @property
+    def wdls(self):
+        if self.observed != self.multiplicity:
+            raise ValueError('Score is not fully evaluated!')
+        w = sum(v for k, v in self.items() if k > 0)
+        d = self[0]
+        l = self.multiplicity - w - d
+        s = sum(k * v for k, v in self.items())
+        return w, d, l, s
+
+    def multiplied_wdl(self, multiplier):
+        return tuple(multiplier * val for val in self.wdls)
+    
+    def multiplied_eval(self, multiplier):
+        return self.eval_from_wdls(*self.multiplied_wdl(multiplier))
+
+    @staticmethod
+    def normalise_eval(evaluation, multiplicity):
+        return tuple(val / multiplicity for val in evaluation)
+        
+    @staticmethod
+    def eval_from_wdls(w, d, l, s):
+        return (w + d/2, w, w + d, s)
+        
+    @property
+    def eval(self):
+        return self.eval_from_wdls(*self.wdls)
+
+    @property
+    def normed_eval(self):
+        return self.normalise_eval(self.eval, self.multiplicity)
+    
+    def __gt__(self, other):
+        return self.multiplied_eval(other.multiplicity) > other.multiplied_eval(self.multiplicity)
+
+    def __gte__(self, other):
+        return self.multiplied_eval(other.multiplicity) >= other.multiplied_eval(self.multiplicity)
+
+    def __eq__(self, other):
+        return self.multiplied_wdl(other.multiplicity) == other.multiplied_wdl(self.multiplicity)
+
+    def __neg__(self):
+        inst = self.__class__(self.multiplicity)
+        for k, v in self.items():
+            inst[-k] = v
+        return inst
+
+    @classmethod
+    def combine(cls, prob_evals):
+        inst = cls(multiplicity=sum(prob_eval.multiplicity for prob_eval in prob_evals))
+        for prob_eval in prob_evals:
+            inst.update(prob_eval)
+        return inst
+
+EVAL_LOWER_BOUND = ProbEval({-25: 1})
+EVAL_UPPER_BOUND = ProbEval({-25: 1})
+
 class Game:
     starting_position = (2, 2)
     possible_moves = {
@@ -277,6 +348,16 @@ class Game:
         return self.p1.score() - self.p2.score()
 
     @property
+    def negamax_score(self):
+        if len(self.moves) % 2:
+            return -self.score
+        return self.score
+    
+    @property
+    def multiplicity(self):
+        return factorial(len(self.board.facedown_cards))
+    
+    @property
     def p1(self):
         return self.get_hand(slice(None, None, 2))
 
@@ -309,3 +390,18 @@ class Game:
         else:
             board = self.board
         return self.__class__(board, tuple(self.moves[:-number_of_moves]))
+
+    @property
+    def move_evals(self):
+        return {
+            move[0].marker: -ProbEval.combine([move_possibility.score_walk()[0] for move_possibility in move]) 
+            for move in self.all_moves()
+        }
+    
+    def score_walk(self):
+    
+        if not self.legal_moves:
+            multiplicity = self.multiplicity
+            return ProbEval(multiplicity=multiplicity, initial_counts={self.negamax_score: multiplicity}), (-1, -1)
+        best_score = max((-ProbEval.combine([move_possibility.score_walk()[0] for move_possibility in move]), move[0].marker) for move in self.all_moves())
+        return best_score
