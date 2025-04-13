@@ -28,9 +28,9 @@
 </div>
 {% endmacro %}
 
-{% macro draw_hand(hand) %}
+{% macro draw_hand(hand, turn_indicator=False) %}
 <div>
-    <div class="score">{{ hand.score() }} points</div>
+    <div class="score">{{ hand.score() }} points{% if turn_indicator %}<span class="turnmarker"></span>{% endif %}</div>
     <div class="handarray">
         {% for suit in hand.cards_for_display %}
             <div class="hand">

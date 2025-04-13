@@ -352,7 +352,7 @@ class Game:
         if len(self.moves) % 2:
             return -self.score
         return self.score
-    
+
     @property
     def multiplicity(self):
         return factorial(len(self.board.facedown_cards))
@@ -365,6 +365,14 @@ class Game:
     def p2(self):
         return self.get_hand(slice(1, None, 2))
 
+    @property
+    def is_p1_turn(self):
+        return bool(self.legal_moves and (len(self.moves) % 2 == 0))
+
+    @property
+    def is_p2_turn(self):
+        return bool(self.legal_moves and (len(self.moves) % 2))
+    
     def _repr_html_(self):
         return self.template.render(game=self)
 

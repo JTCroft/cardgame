@@ -3,8 +3,8 @@
 <div class="game-container">
     {{ macros.draw_board(game.board, game.moves, marker_pos=game.marker) }}
     <div class="hands">
-        {{ macros.draw_hand(game.p1) }}
-        {{ macros.draw_hand(game.p2) }}
+        {{ macros.draw_hand(game.p1, turn_indicator=game.is_p1_turn) }}
+        {{ macros.draw_hand(game.p2, turn_indicator=game.is_p2_turn) }}
     </div>
 </div>
 {% endblock %}
