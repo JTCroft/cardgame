@@ -66,7 +66,7 @@ print(game.score)
 
 This package is mostly focussed on enabling the calculation of optimal strategies in a given position, which has some nuance due to the random elements of the game.
 
-This would calculate the probabilistic score of each move from the position the game was in 5 moves ago with optimal play, from the perspective of the player to move
+This would calculate the probabilistic score of each move from the position the game was in 5 moves ago with optimal play, from the perspective of the player to move (positive score -> player whos turn it is will win)
 
 ```python
 game.undo(5).move_evals
@@ -96,3 +96,13 @@ best_score, best_move = game.score_walk()
 # Display the evalualtions of each move from a position
 best_score, best_move = game.move_eval
 ```
+
+## Possible future additions
+
+Looking at improving the ability to use this package to generate insights into the optimal strategy in this game
+
+- Caching of calculated hand scores
+- alpha/beta pruning game tree search and evaluation
+- Using upper and lower bounds on the score difference to bound the scores of randomness (facedown cards)
+- Calculation of legal moves using a sequence of lookups & precalculation
+- Changing the search order to bound the evaluation of a position quicker than A/B pruning (not using DFS)
