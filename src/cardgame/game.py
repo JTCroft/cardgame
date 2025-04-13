@@ -400,11 +400,27 @@ class Game:
         return self.__class__(board, tuple(self.moves[:-number_of_moves]))
 
     @property
+    def taken_card(self):
+        if not self.moves:
+            raise ValueError('No cards have been taken')
+        row, col = self.marker
+        return self.board[row][col]
+    
+    @property
     def move_evals(self):
-        return {
-            move[0].marker: -ProbEval.combine([move_possibility.score_walk()[0] for move_possibility in move]) 
-            for move in self.all_moves()
-        }
+        move_evals = {}
+        for move in self.all_moves():
+            move_evals[move[0].marker] = {
+                "resolved_evals": {
+                    move_possibility.taken_card: -(move_possibility.score_walk()[0])
+                    for move_possibility in move
+                }
+            }
+            if move[0].marker in self.board.facedown_positions:
+                move_evals[move[0].marker]["combined_eval"] = ProbEval.combine(list(move_evals[move[0].marker]["resolved_evals"].values()))
+            else:
+                move_evals[move[0].marker]["combined_eval"] = move_evals[move[0].marker]["resolved_evals"][move[0].taken_card]
+        return move_evals
     
     def score_walk(self):
     
