@@ -66,7 +66,7 @@ print(game.score)
 
 This package is mostly focussed on enabling the calculation of optimal strategies in a given position, which has some nuance due to the random elements of the game.
 
-This would calculate the probabilistic score of each move from the position the game was in 5 moves ago with optimal play, from the perspective of the player to move (positive score -> player whos turn it is will win)
+This would calculate the probabilistic score of each move from the position the game was in 5 moves ago with optimal play, from the perspective of the player to move (positive score -> player whose turn it is will win)
 
 ```python
 game.undo(5).move_evals
