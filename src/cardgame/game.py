@@ -89,6 +89,16 @@ def _int_to_bits(n):
     return tuple(reversed(components))
 
 
+def _common_prefix(move_sequences):
+    prefix = []
+    for elements in zip(*move_sequences):
+        if len(set(elements)) == 1:
+            prefix.append(elements[0])
+        else:
+            break
+    return tuple(prefix)
+
+
 class Card(tuple):
     template = env.get_template("card.html.jinja2")
     _symbols = "♥♣♦♠"
@@ -603,30 +613,42 @@ class Game:
     def evaluate(self, alpha=None, beta=None):
         multiplicity = self.multiplicity
         if not self.legal_moves:
-            return ProbEval(multiplicity, {self.negamax_score: multiplicity}), (-1, -1)
+            return {
+                'Evaluation': ProbEval(multiplicity, {self.negamax_score: multiplicity}),
+                'Deterministic optimal moves': tuple(),
+            }
         if not alpha:
             base = ProbEval(multiplicity)
             alpha = base.lower_bound.eval
             beta = base.upper_bound.eval
         best_score = ProbEval(multiplicity).lower_bound
-        best_move = (-1, -1)
-        ordered_moves = self.all_moves()
-        #ordered_moves = sorted(self.all_moves(), key=len)
+        best_move_seq = ((-1, -1),)
+        ordered_moves = sorted(self.all_moves(), key=len)
+        detailed_move_scores = {}
+        
         for move in ordered_moves:
             move_marker = move[0].marker
             if len(move) == 1:
-                move_score = -(move[0].evaluate(-beta, -alpha)[0])
-                if (move_score, move_marker) > (best_score, best_move):
+                move_eval = move[0].evaluate(-beta, -alpha)
+                move_score = -(move_eval['Evaluation'])
+                detailed_move_scores[move_marker] = move_score
+                if (move_score, move_marker) > (best_score, best_move_seq[0]):
                     best_score = move_score
-                    best_move = move_marker
+                    best_move_seq = (move[0].taken_card,) + move_eval['Deterministic optimal moves']
                 alpha = max(best_score.lower_bound.eval, alpha)
             else:
+                detailed_move_scores[move_marker] = {}
                 move_score = ProbEval(multiplicity)
+                possibility_move_seqs = []
                 for possibility in move:
-                    move_score.update(-(possibility.evaluate()[0]))
-                    if (move_score, move_marker) > (best_score, best_move):
+                    possibility_eval = possibility.evaluate()
+                    possibility_score = -(possibility_eval['Evaluation'])
+                    possibility_move_seqs.append(possibility_eval['Deterministic optimal moves'])
+                    detailed_move_scores[move_marker][possibility.taken_card] = possibility_score
+                    move_score.update(possibility_score)
+                    if (move_score, move_marker) > (best_score, best_move_seq[0]):
                         best_score = move_score
-                        best_move = move_marker
+                        best_move_seq = (move_marker,) + _common_prefix(possibility_move_seqs)
                     if move_score.upper_bound.eval < alpha:
                         break
                     alpha = max(best_score.lower_bound.eval, alpha)
@@ -634,7 +656,11 @@ class Game:
                         break
             if alpha > beta and not (-alpha) > (-beta):
                 break
-        return best_score, best_move
+        return {
+            'Evaluation': best_score,
+            'Deterministic optimal moves': best_move_seq,
+            'Known info for other branches': detailed_move_scores
+        }
 
     def save(self, alnum=False):
         board_str = self.board.save(alnum=alnum)
