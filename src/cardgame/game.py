@@ -92,6 +92,7 @@ def _int_to_bits(n):
 class Card(tuple):
     template = env.get_template("card.html.jinja2")
     _symbols = "♥♣♦♠"
+    _letters = "HCDS"
 
     def __new__(cls, rank=None, suit=None, facedown=False):
         if facedown:
@@ -101,6 +102,16 @@ class Card(tuple):
         instance.facedown = facedown
         return instance
 
+    @classmethod
+    def from_str(cls, card_str):
+        if card_str == '??':
+            return cls(facedown=True)
+        rank, suit = card_str
+        rank = Rank.__members__[rank]
+        suit = Suit(cls._symbols.index(suit) if suit in cls._symbols else cls._letters.index(suit))
+        return cls(rank, suit)
+        
+        
     @property
     def rank(self):
         return "?" if self.facedown else self[0].name
@@ -110,12 +121,22 @@ class Card(tuple):
         return "?" if self.facedown else self._symbols[self[1]]
 
     @property
+    def letter(self):
+        return "?" if self.facedown else self._letters[self[1]]
+
+    @property
     def suit_name(self):
         return None if self.facedown else self[1].name
 
-    def __repr__(self):
+    def __str__(self):
         return self.rank + self.suit
 
+    def __repr__(self):
+        return self.rank + self.letter
+
+    def _repr_pretty_(self, pp, cycle):
+        pp.text(str(self))
+    
     def _repr_html_(self):
         return self.template.render(card=self)
 
@@ -145,6 +166,23 @@ class Board(tuple):
         instance.facedown_cards = tuple(facedown_cards)
         return instance
 
+    def save(self, alnum=False):
+        func = repr if alnum else str
+        board_str = '/'.join(''.join(func(card) for card in row) for row in self)
+        fd_str = ''.join(func(card) for card in self.facedown_cards)
+        return f'{board_str}//{fd_str}'
+
+    @classmethod
+    def load(cls, save):
+        board, fd = save.split('//')
+        def get_str_pairs(input_str):
+            while input_str:
+                yield input_str[:2]
+                input_str = input_str[2:]
+        board = [tuple(Card.from_str(card) for card in get_str_pairs(row)) for row in board.split('/')]
+        fd = tuple(Card.from_str(card) for card in get_str_pairs(fd))
+        return cls(board, fd)
+        
     @classmethod
     def deal(cls):
         deck = list(Card.deck)
@@ -597,3 +635,23 @@ class Game:
             if alpha > beta and not (-alpha) > (-beta):
                 break
         return best_score, best_move
+
+    def save(self, alnum=False):
+        board_str = self.board.save(alnum=alnum)
+        ordered_poss_moves = {marker: sorted(moves) for marker, moves in self.possible_moves.items()}
+        move_ind = [str(ordered_poss_moves[marker].index(move)) for marker, move in zip((self.starting_position,) + self.moves[:-1], self.moves)]
+        moves_str = ''.join(move_ind)
+        return f'{board_str}//{moves_str}'
+
+    @classmethod
+    def load(cls, save):
+        board, moves = save.rsplit('//', maxsplit=1)
+        board = Board.load(board)
+        ordered_poss_moves = {marker: sorted(moves) for marker, moves in cls.possible_moves.items()}
+        move_indexes = [int(move) for move in moves]
+        position = cls.starting_position
+        moves_list = []
+        for move_index in move_indexes:
+            position = ordered_poss_moves[position][move_index]
+            moves_list.append(position)
+        return cls(board, tuple(moves_list))
