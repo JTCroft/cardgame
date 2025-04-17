@@ -2,17 +2,19 @@ from enum import IntEnum
 from jinja2 import Environment, PackageLoader
 from random import shuffle, choice
 from operator import itemgetter, or_
-from functools import reduce
+from functools import reduce, lru_cache
 from itertools import groupby, combinations, product
 from math import factorial
 from collections import Counter
 
-__all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game", "ProbEval")
+__all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game", "ProbEval", "Eval")
 
-env = Environment(loader=PackageLoader(package_name="cardgame", package_path="../../templates"))
+env = Environment(
+    loader=PackageLoader(package_name="cardgame", package_path="../../templates")
+)
+
 
 def _calculate_score_lookups():
-    
     suit_scores = {}
     for pmut in product([False, True], repeat=8):
         for kings in product(*(([False] if card else [False, True]) for card in pmut)):
@@ -33,20 +35,61 @@ def _calculate_score_lookups():
                     run = kings_in_run = 0
             if run >= 3:
                 score += run * 2 - 3 - kings_in_run
-            suit_scores[(reduce(or_, (1<<i for i, card in enumerate(pmut) if card), 0), reduce(or_, (1<<i for i, card in enumerate(kings) if card), 0))] = score
+            suit_scores[
+                (
+                    reduce(or_, (1 << i for i, card in enumerate(pmut) if card), 0),
+                    reduce(or_, (1 << i for i, card in enumerate(kings) if card), 0),
+                )
+            ] = score
     rank_scores = {
-        (reduce(or_, (1 << (8 * i) for i, card in enumerate(pmut) if card), 0), reduce(or_, (1 << (8 * i) for i, card in enumerate(kings) if card), 0)): (2 * sum(pmut) - 3 + sum(kings) if sum(pmut) + sum(kings) >= 3 else 0)
-        for pmut in product([False, True], repeat=4) for kings in product(*(([False] if card else [False, True]) for card in pmut))
+        (
+            reduce(or_, (1 << (8 * i) for i, card in enumerate(pmut) if card), 0),
+            reduce(or_, (1 << (8 * i) for i, card in enumerate(kings) if card), 0),
+        ): (2 * sum(pmut) - 3 + sum(kings) if sum(pmut) + sum(kings) >= 3 else 0)
+        for pmut in product([False, True], repeat=4)
+        for kings in product(*(([False] if card else [False, True]) for card in pmut))
     }
     return rank_scores, suit_scores
 
+
 _rank_scores, _suit_scores = _calculate_score_lookups()
+
 
 Suit = IntEnum("suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
 Rank = IntEnum("rank", names=list("A2345678K"))
 
-class Card(tuple):
 
+@lru_cache(maxsize=100000)
+def _calculate_score(hand_int, number_of_kings):
+    possible_kings = _int_to_bits(0b11111111111111111111111111111111 ^ hand_int)
+    best_score, best_kings = 0, 0
+    suit_mask = 0b11111111
+    rank_mask = 0b1000000010000000100000001
+    for king_allocation in combinations(possible_kings, number_of_kings):
+        king_int = reduce(or_, king_allocation, 0)
+        score = 0
+        for suit in Suit:
+            base_suit = (hand_int >> (8 * suit)) & suit_mask
+            king_suit = (king_int >> (8 * suit)) & suit_mask
+            score += _suit_scores[(base_suit, king_suit)]
+        for rank in list(Rank)[:-1]:
+            base_rank = (hand_int >> (rank - 1)) & rank_mask
+            king_rank = (king_int >> (rank - 1)) & rank_mask
+            score += _rank_scores[(base_rank, king_rank)]
+        best_score = max(best_score, score)
+    return best_score
+
+
+def _int_to_bits(n):
+    components = []
+    while n > 0:
+        lsb = n & -n
+        components.append(lsb)
+        n &= n - 1
+    return tuple(reversed(components))
+
+
+class Card(tuple):
     template = env.get_template("card.html.jinja2")
     _symbols = "♥♣♦♠"
 
@@ -60,11 +103,11 @@ class Card(tuple):
 
     @property
     def rank(self):
-        return '?' if self.facedown else self[0].name
+        return "?" if self.facedown else self[0].name
 
     @property
     def suit(self):
-        return '?' if self.facedown else self._symbols[self[1]]
+        return "?" if self.facedown else self._symbols[self[1]]
 
     @property
     def suit_name(self):
@@ -91,11 +134,11 @@ class Card(tuple):
     def nonkings(cls):
         return set(cls.deck) - cls.kings
 
-class Board(tuple):
 
+class Board(tuple):
     template = env.get_template("board.html.jinja2")
     facedown_indices = set(range(0, 36, 5)) | set(range(0, 36, 7))
-    facedown_positions = {(i//6, i%6) for i in facedown_indices}
+    facedown_positions = {(i // 6, i % 6) for i in facedown_indices}
 
     def __new__(cls, cards, facedown_cards):
         instance = super().__new__(cls, tuple(tuple(row) for row in cards))
@@ -110,36 +153,27 @@ class Board(tuple):
         facedown_card = Card(facedown=True)
         for index in cls.facedown_indices:
             deck[index] = facedown_card
-        return cls([deck[i:i+6] for i in range(0, 36, 6)], facedown_cards)
+        return cls([deck[i : i + 6] for i in range(0, 36, 6)], facedown_cards)
 
     def __repr__(self):
-        return '\n'.join(
-            ' '.join(str(card) for card in row)
-            for row in self
-        )
+        return "\n".join(" ".join(str(card) for card in row) for row in self)
 
     def _repr_html_(self):
         return self.template.render(board=self)
 
     def resolve(self, row, col):
-
         current_board = list(self)
         row_to_change = list(current_board[row])
         for i, card in enumerate(self.facedown_cards):
             row_to_change[col] = card
             current_board[row] = tuple(row_to_change)
-            yield self.__class__(tuple(current_board), self.facedown_cards[:i] + self.facedown_cards[i+1:])
+            yield self.__class__(
+                tuple(current_board),
+                self.facedown_cards[:i] + self.facedown_cards[i + 1 :],
+            )
 
-def _int_to_bits(n):
-    components = []
-    while n > 0:
-        lsb = n & -n 
-        components.append(lsb)
-        n &= (n - 1)
-    return tuple(reversed(components))
 
 class Hand(tuple):
-
     template = env.get_template("hand.html.jinja2")
 
     def __new__(cls, cards):
@@ -164,9 +198,12 @@ class Hand(tuple):
         for card in hand_iterator:
             hand_int |= 1 << ((card[1] * 8) + card[0] - 1)
         return hand_int, num_kings
-    
+
     def score(self, king_info=False):
         hand_int, number_of_kings = self.as_int
+        if not king_info:
+            return _calculate_score(hand_int, number_of_kings)
+
         possible_kings = _int_to_bits(0b11111111111111111111111111111111 ^ hand_int)
         best_score, best_kings = 0, 0
         suit_mask = 0b11111111
@@ -183,13 +220,11 @@ class Hand(tuple):
                 king_rank = (king_int >> (rank - 1)) & rank_mask
                 score += _rank_scores[(base_rank, king_rank)]
             best_score, best_kings = max((best_score, best_kings), (score, king_int))
-        if not king_info:
-            return best_score
         king_cards = tuple(
             Card(
-                ((king_int.bit_length() - 1) % 8) + 1, 
-                (king_int.bit_length()-1) // 8
-            ) for king_int in _int_to_bits(best_kings)
+                ((king_int.bit_length() - 1) % 8) + 1, (king_int.bit_length() - 1) // 8
+            )
+            for king_int in _int_to_bits(best_kings)
         )
         return best_score, king_cards
 
@@ -199,7 +234,7 @@ class Hand(tuple):
     @property
     def num_kings(self):
         return len(set(self) & Card.kings)
-    
+
     @property
     def ranks(self):
         yield from groupby(self, key=itemgetter(0))
@@ -212,7 +247,6 @@ class Hand(tuple):
 
     @property
     def cards_for_display(self):
-
         grid_hand = [[None for j in range(8)] for i in range(4)]
         score, king_cards = self.score(king_info=True)
         king_card_iter = iter(king_cards)
@@ -223,17 +257,74 @@ class Hand(tuple):
                 king_card = next(king_card_iter)
                 grid_hand[king_card[1]][king_card[0] - 1] = card
         return grid_hand
-    
-    def __add__(self, other):
 
+    def __add__(self, other):
         return self.__class__(tuple.__add__(self, other))
 
     def __sub__(self, other):
-
         return self.__class__(set(self) - set(other))
 
-class ProbEval(Counter):
 
+class Eval(tuple):
+    def __new__(cls, multiplicity, w, d, s):
+        inst = super().__new__(cls, (w, d, s))
+        inst.multiplicity = multiplicity
+        return inst
+
+    @property
+    def eval(self):
+        return self.eval_from_wds(*self)
+
+    @staticmethod
+    def eval_from_wds(w, d, s):
+        return (w + d / 2, w, s)
+
+    @property
+    def normed_eval(self):
+        return tuple(x / self.multiplicity for x in self.eval)
+
+    def multiplied_wds(self, multiplier):
+        return tuple(multiplier * val for val in self)
+
+    def multiplied_eval(self, multiplier):
+        return self.eval_from_wds(*self.multiplied_wds(multiplier))
+
+    def __lt__(self, other):
+        return self.multiplied_eval(other.multiplicity) < other.multiplied_eval(
+            self.multiplicity
+        )
+
+    def __lte__(self, other):
+        return self.multiplied_eval(other.multiplicity) <= other.multiplied_eval(
+            self.multiplicity
+        )
+
+    def __gt__(self, other):
+        return self.multiplied_eval(other.multiplicity) > other.multiplied_eval(
+            self.multiplicity
+        )
+
+    def __gte__(self, other):
+        return self.multiplied_eval(other.multiplicity) >= other.multiplied_eval(
+            self.multiplicity
+        )
+
+    def __eq__(self, other):
+        return self.multiplied_wds(other.multiplicity) == other.multiplied_wds(
+            self.multiplicity
+        )
+
+    def __neg__(self):
+        return self.__class__(
+            self.multiplicity, self.multiplicity - self[0] - self[1], self[1], -self[2]
+        )
+
+    def __repr__(self):
+        normed_formatted_str = ", ".join(f"{x:.2f}" for x in self.normed_eval)
+        return f"Eval({normed_formatted_str})"
+
+
+class ProbEval(Counter):
     def __init__(self, multiplicity=1, initial_counts=None):
         super().__init__()
         if initial_counts:
@@ -243,16 +334,22 @@ class ProbEval(Counter):
     @property
     def observed(self):
         return sum(v for v in self.values())
-    
+
     @property
-    def wdls(self):
+    def wds(self):
         if self.observed != self.multiplicity:
-            raise ValueError('Score is not fully evaluated!')
+            raise ValueError("Score is not fully evaluated!")
+        return self.observed_wds
+
+    @property
+    def observed_wds(self):
         w = sum(v for k, v in self.items() if k > 0)
         d = self[0]
-        l = self.multiplicity - w - d
         s = sum(k * v for k, v in self.items())
-        return w, d, l, s
+        return w, d, s
+
+    def copy(self):
+        return ProbEval(multiplicity=self.multiplicity, initial_counts=dict(self))
 
     def bound(self, fill_value):
         multiplicity = self.multiplicity
@@ -262,65 +359,18 @@ class ProbEval(Counter):
         inst = self.copy()
         inst.update({fill_value: multiplicity - observed})
         return inst
-        
+
     @property
     def lower_bound(self):
         return self.bound(-25)
-    
+
     @property
     def upper_bound(self):
         return self.bound(25)
-        
-    def multiplied_wdl(self, multiplier):
-        return tuple(multiplier * val for val in self.wdls)
-    
-    def multiplied_eval(self, multiplier):
-        return self.eval_from_wdls(*self.multiplied_wdl(multiplier))
 
-    @property
-    def observed_eval(self):
-        w = sum(v for k, v in self.items() if k > 0)
-        d = self[0]
-        l = self.observed - w - d
-        s = sum(k * v for k, v in self.items())
-        return self.eval_from_wdls(w, d, l, s)
-        
-    @staticmethod
-    def normalise_eval(evaluation, multiplicity):
-        return tuple(val / multiplicity for val in evaluation)
-        
-    @staticmethod
-    def eval_from_wdls(w, d, l, s):
-        return (w + d/2, w, w + d, s)
-        
     @property
     def eval(self):
-        return self.eval_from_wdls(*self.wdls)
-
-    @property
-    def normed_eval(self):
-        return self.normalise_eval(self.eval, self.multiplicity)
-
-    def __lt__(self, other):
-        return self.multiplied_eval(other.multiplicity) < other.multiplied_eval(self.multiplicity)
-
-    def __lte__(self, other):
-        return self.multiplied_eval(other.multiplicity) <= other.multiplied_eval(self.multiplicity)
-    
-    def __gt__(self, other):
-        return self.multiplied_eval(other.multiplicity) > other.multiplied_eval(self.multiplicity)
-
-    def __gte__(self, other):
-        return self.multiplied_eval(other.multiplicity) >= other.multiplied_eval(self.multiplicity)
-
-    def __eq__(self, other):
-        return self.multiplied_wdl(other.multiplicity) == other.multiplied_wdl(self.multiplicity)
-
-    def __neg__(self):
-        inst = self.__class__(multiplicity=self.multiplicity)
-        for k, v in self.items():
-            inst[-k] = v
-        return inst
+        return Eval(self.multiplicity, *self.wds)
 
     @classmethod
     def combine(cls, prob_evals):
@@ -329,22 +379,42 @@ class ProbEval(Counter):
             inst.update(prob_eval)
         return inst
 
-    def copy(self):
-        return self.__class__(multiplicity=self.multiplicity, initial_counts=dict(self))
+    def __lt__(self, other):
+        return self.upper_bound.eval < other.lower_bound.eval
+
+    def __lte__(self, other):
+        return self.upper_bound.eval <= other.lower_bound.eval
+
+    def __gt__(self, other):
+        return self.lower_bound.eval > other.upper_bound.eval
+
+    def __gte__(self, other):
+        return self.lower_bound.eval >= other.upper_bound.eval
+
+    def __eq__(self, other):
+        return bool(
+            (self.multiplicity == other.multiplicity) and (dict(self) == dict(other))
+        )
+
+    def __neg__(self):
+        inst = ProbEval(multiplicity=self.multiplicity)
+        for k, v in self.items():
+            inst[-k] = v
+        return inst
+
 
 class Game:
     starting_position = (2, 2)
     possible_moves = {
         (i, j): (
-            (
-                {(i, j2) for j2 in range(6)} | {(i2, j) for i2 in range(6)}
-            ) - {(i, j)}
-        ) for i in range(6) for j in range(6)
+            ({(i, j2) for j2 in range(6)} | {(i2, j) for i2 in range(6)}) - {(i, j)}
+        )
+        for i in range(6)
+        for j in range(6)
     }
     template = env.get_template("game.html.jinja2")
 
     def __init__(self, board, moves):
-
         self.board = board
         self.moves = moves
 
@@ -364,15 +434,31 @@ class Game:
         for row, col in self.legal_moves:
             new_moves = self.moves + ((row, col),)
             if self.board[row][col].facedown:
-                yield tuple(self.__class__(new_board, new_moves) for new_board in self.board.resolve(row, col))
+                yield tuple(
+                    self.__class__(new_board, new_moves)
+                    for new_board in self.board.resolve(row, col)
+                )
             else:
                 yield (self.__class__(self.board, new_moves),)
 
+    def move(self, row, col):
+        if (row, col) not in self.legal_moves:
+            raise ValueError("Illegal move")
+        new_moves = self.moves + ((row, col),)
+        if self.board[row][col].facedown:
+            return tuple(
+                self.__class__(new_board, new_moves)
+                for new_board in self.board.resolve(row, col)
+            )
+        return (self.__class__(self.board, new_moves),)
+
     def random_move(self):
         return choice(choice(list(self.all_moves())))
-    
+
     def get_hand(self, key):
-        return Hand(self.board[position[0]][position[1]] for position in self.moves[key])
+        return Hand(
+            self.board[position[0]][position[1]] for position in self.moves[key]
+        )
 
     @property
     def score(self):
@@ -387,7 +473,7 @@ class Game:
     @property
     def multiplicity(self):
         return factorial(len(self.board.facedown_cards))
-    
+
     @property
     def p1(self):
         return self.get_hand(slice(None, None, 2))
@@ -403,18 +489,17 @@ class Game:
     @property
     def is_p2_turn(self):
         return bool(self.legal_moves and (len(self.moves) % 2))
-    
+
     def _repr_html_(self):
         return self.template.render(game=self)
 
     def undo(self, number_of_moves=1):
-        
         if number_of_moves < 0:
-            raise ValueError('Cannot undo a negative number of moves')
+            raise ValueError("Cannot undo a negative number of moves")
         elif number_of_moves == 0:
             return self
         elif number_of_moves > len(self.moves):
-            raise ValueError(f'There are only {len(self.moves)} to undo!')
+            raise ValueError(f"There are only {len(self.moves)} to undo!")
 
         moves_to_undo = self.moves[-number_of_moves:]
         moves_which_were_fd = set(moves_to_undo) & set(self.board.facedown_positions)
@@ -425,7 +510,9 @@ class Game:
             for row, col in moves_which_were_fd:
                 to_add_back_to_fd.append(self.board[row][col])
                 new_board[row][col] = fd_card
-            board = Board(new_board, self.board.facedown_cards + tuple(to_add_back_to_fd))
+            board = Board(
+                new_board, self.board.facedown_cards + tuple(to_add_back_to_fd)
+            )
         else:
             board = self.board
         return self.__class__(board, tuple(self.moves[:-number_of_moves]))
@@ -433,10 +520,10 @@ class Game:
     @property
     def taken_card(self):
         if not self.moves:
-            raise ValueError('No cards have been taken')
+            raise ValueError("No cards have been taken")
         row, col = self.marker
         return self.board[row][col]
-    
+
     @property
     def move_evals(self):
         move_evals = {}
@@ -448,15 +535,65 @@ class Game:
                 }
             }
             if move[0].marker in self.board.facedown_positions:
-                move_evals[move[0].marker]["combined_eval"] = ProbEval.combine(list(move_evals[move[0].marker]["resolved_evals"].values()))
+                move_evals[move[0].marker]["combined_eval"] = ProbEval.combine(
+                    list(move_evals[move[0].marker]["resolved_evals"].values())
+                )
             else:
-                move_evals[move[0].marker]["combined_eval"] = move_evals[move[0].marker]["resolved_evals"][move[0].taken_card]
+                move_evals[move[0].marker]["combined_eval"] = move_evals[
+                    move[0].marker
+                ]["resolved_evals"][move[0].taken_card]
         return move_evals
-    
+
     def score_walk(self):
-    
         if not self.legal_moves:
             multiplicity = self.multiplicity
-            return ProbEval(multiplicity=multiplicity, initial_counts={self.negamax_score: multiplicity}), (-1, -1)
-        best_score = max((-ProbEval.combine([move_possibility.score_walk()[0] for move_possibility in move]), move[0].marker) for move in self.all_moves())
+            return ProbEval(
+                multiplicity=multiplicity,
+                initial_counts={self.negamax_score: multiplicity},
+            ), (-1, -1)
+        best_score = max(
+            (
+                -ProbEval.combine(
+                    [move_possibility.score_walk()[0] for move_possibility in move]
+                ),
+                move[0].marker,
+            )
+            for move in self.all_moves()
+        )
         return best_score
+
+    def evaluate(self, alpha=None, beta=None):
+        multiplicity = self.multiplicity
+        if not self.legal_moves:
+            return ProbEval(multiplicity, {self.negamax_score: multiplicity}), (-1, -1)
+        if not alpha:
+            base = ProbEval(multiplicity)
+            alpha = base.lower_bound.eval
+            beta = base.upper_bound.eval
+        best_score = ProbEval(multiplicity).lower_bound
+        best_move = (-1, -1)
+        ordered_moves = self.all_moves()
+        #ordered_moves = sorted(self.all_moves(), key=len)
+        for move in ordered_moves:
+            move_marker = move[0].marker
+            if len(move) == 1:
+                move_score = -(move[0].evaluate(-beta, -alpha)[0])
+                if (move_score, move_marker) > (best_score, best_move):
+                    best_score = move_score
+                    best_move = move_marker
+                alpha = max(best_score.lower_bound.eval, alpha)
+            else:
+                move_score = ProbEval(multiplicity)
+                for possibility in move:
+                    move_score.update(-(possibility.evaluate()[0]))
+                    if (move_score, move_marker) > (best_score, best_move):
+                        best_score = move_score
+                        best_move = move_marker
+                    if move_score.upper_bound.eval < alpha:
+                        break
+                    alpha = max(best_score.lower_bound.eval, alpha)
+                    if alpha > beta and not (-alpha) > (-beta):
+                        break
+            if alpha > beta and not (-alpha) > (-beta):
+                break
+        return best_score, best_move

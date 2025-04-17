@@ -1,1 +1,1 @@
-from .game import Rank, Suit, Card, Board, Hand, Game, ProbEval
+from .game import Rank, Suit, Card, Board, Hand, Game, ProbEval, Eval
