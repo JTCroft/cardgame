@@ -6,13 +6,13 @@ A python implementation of a 2 player card game using a subset of standard playi
 pip install git+https://github.com/JTCroft/cardgame.git
 ```
 
+## Contents
+
 - [Gameplay](#gameplay)
 - [Scoring](#scoring)
 - [Position Evaluation](#position-evaluation)
 - [Other functionality](#other-functionality)
 - [Possible additions](#possible-additions)
-
-----
 
 ## Gameplay
 
