@@ -2,9 +2,13 @@
 
 A python implementation of a 2 player card game using a subset of standard playing cards called Cross Kings
 
+```bash
+pip install git+https://github.com/JTCroft/cardgame.git
+```
+
 ## Gameplay
 
-The game uses the cards Ace to 8 of all suits plus the Kings. To start the game deal the cards in a 6 by 6 grid, with all cards on the diagonals face down and all other cards face up.
+The game uses the cards Ace to 8 of all suits plus the four Kings. To start the game deal the cards in a 6 by 6 grid, with all cards on the diagonals face down and all other cards face up.
 
 A marker displays the current position, the player who is taking the second turn may choose which of the 4 centre-most cards to place the marker on. In this implementation the starting position is fixed.
 
