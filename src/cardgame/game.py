@@ -642,7 +642,7 @@ class Game:
                     best_move_seq = (move[0].taken_card,) + move_eval['Deterministic optimal moves']
                 alpha = max(best_score.lower_bound.eval, alpha)
             else:
-                detailed_move_scores[move_marker] = {}
+                detailed_move_scores[move_marker] = {fd_card: None for fd_card in self.board.facedown_cards}
                 move_score = ProbEval(multiplicity)
                 possibility_move_seqs = []
                 for possibility in move:
