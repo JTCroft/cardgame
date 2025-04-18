@@ -10,6 +10,7 @@ pip install git+https://github.com/JTCroft/cardgame.git
 
 - [Gameplay](#gameplay)
 - [Scoring](#scoring)
+- [Usage](#usage)
 - [Position Evaluation](#position-evaluation)
 - [Other functionality](#other-functionality)
 - [Possible additions](#possible-additions)
