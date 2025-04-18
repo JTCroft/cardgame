@@ -87,10 +87,10 @@ To determine if a position (which may not be fully evaluated) is better for the 
 * Take the lower bound of the possible outcomes for the position, filling in any unevaluated branches with -25
 * Take the upper bound of the possible outcomes for the other position, filling in any unevaluated branches with +25
 * Calculate the number of wins, draws, and losses for each of those, and the sum of the scores of all possible outcomes
-* With the win count, draw count, and cumulative score are given by variables w, d, s I calculate (w + d/2, w, s)
+* With the win count, draw count, and cumulative score given by variables `w`, `d`, and `s` I calculate `(w + d/2, w, s)`
 * I compare the tuple calculated for each position
 
-The terms in the evaluation (w + d/2, w, s) are based on calculating
+The terms in the evaluation `(w + d/2, w, s)` are based on calculating
 
 * the expected value (1 point for a win, half a point for a draw)
 * Preferring decisive outcomes over tied outcomes.
