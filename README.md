@@ -6,6 +6,14 @@ A python implementation of a 2 player card game using a subset of standard playi
 pip install git+https://github.com/JTCroft/cardgame.git
 ```
 
+- [Gameplay](#gameplay)
+- [Scoring](#scoring)
+- [Position Evaluation](#position-evaluation)
+- [Other functionality](#other-functionality)
+- [Possible additions](#possible-additions)
+
+----
+
 ## Gameplay
 
 The game uses the cards Ace to 8 of all suits plus the four Kings. To start the game deal the cards in a 6 by 6 grid, with all cards on the diagonals face down and all other cards face up.
@@ -84,7 +92,7 @@ Scores in the evaluation are given from the perspective of the player to move, a
 game.undo(5).evaluate()
 ```
 
-## Notes on the evaluation
+## Position Evaluation
 
 To calculate how 'good' an outcome is for a player has some complexity due to how the final score maps onto the win/draw/loss possibilities.
 
@@ -140,7 +148,7 @@ best_score, best_move = game.score_walk()
 game.move_evals
 ```
 
-## Possible future additions
+## Possible additions
 
 Looking at improving the ability to use this package to generate insights into the optimal strategy in this game
 
