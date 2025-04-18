@@ -450,6 +450,9 @@ class ProbEval(Counter):
             inst[-k] = v
         return inst
 
+    def __repr__(self):
+        ordered_dict = dict(sorted(self.items()))
+        return f'{self.__class__.__name__}({self.observed}/{self.multiplicity} possibilities, {ordered_dict!r})'
 
 class Game:
     starting_position = (2, 2)
