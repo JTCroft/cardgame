@@ -10,9 +10,11 @@ pip install git+https://github.com/JTCroft/cardgame.git
 
 The game uses the cards Ace to 8 of all suits plus the four Kings. To start the game deal the cards in a 6 by 6 grid, with all cards on the diagonals face down and all other cards face up.
 
-A marker displays the current position, the player who is taking the second turn may choose which of the 4 centre-most cards to place the marker on. In this implementation the starting position is fixed.
+A marker displays the current position, the player who is not taking the first move may choose which of the 4 central face down cards of the grid to place the marker on at the start of the game. In this implementation the starting position is fixed.
 
-Play then proceeds in alternating turns. Each player moves the marker to any card that is in the same row or column as the marker, and collects that card into their hand. The marker must move on the first turn. The marker may pass over any gaps left by previously taken cards.
+Play then proceeds in alternating turns. Each player moves the marker to any card that is in the same row or column as the marker and collects that card into their hand, leaving a gap in the grid of cards with the marker in. The marker must move on the first turn. The marker may pass over any gaps left by previously taken cards.
+
+The hands of both players are open, displayed face up. Both players know which cards their opponent has collected, and when either player collects a facedown card into their hand the card is revealed to both players.
 
 The game finishes when the marker is left in a position with no moves, ie: when there are no cards in the same row or column as the marker.
 
@@ -97,14 +99,14 @@ To determine if a position (which may not be fully evaluated) is better for the 
 The terms in the evaluation `(w + d/2, w, s)` are based on calculating
 
 * the expected value (1 point for a win, half a point for a draw)
-* Preferring decisive outcomes over tied outcomes.
+* Preferring decisive outcomes over tied outcomes
 * How much you win or lose by on average
 
 This evaluation criteria is a choice, and the second term means it is not strictly well ordered which can cause issues in pruning branches in alpha beta search. One issue this introduces is best demonstrated with an example. If choosing between 2 moves where one of guarantees a draw, and one which has a 50% chance of a win and a 50% chance of a draw, the second term which enforces a preference for decisive outcomes means that a player would prefer the one that gives them a chance of winning. When doing a tree search, the other player will believe that the outcome of a draw is WORSE for them than a 50/50 win/loss, which means they may think it is BETTER for the original player causing the branch to be pruned unless you check that the difference is well ordered (implemented as only pruning when both `alpha > beta and not -alpha > -beta`)
 
-Another issue is that a preferable metric for the third component, based on how many points you expect to win or lose by, is also a compromise. I would consider a move to be better by considering which move will have a better outcome for the player (end with more points) more than 50% of the time that would be a better ordering, but that comparison is not well ordered either, as shown by the [intransitive dice](https://en.wikipedia.org/wiki/Intransitive_dice) example. Using the cumulative score difference (which is equivalent to the mean score difference for ordering) is used as a compromise.
+Another issue is that a preferable metric for the third component, based on how many points you expect to win or lose by, is also a compromise. I would consider a move to be better by considering which move will have a better outcome for the player (end with more points) more than 50% of the time that would be a better ordering, but that comparison is not well ordered either, as shown by the [intransitive dice](https://en.wikipedia.org/wiki/Intransitive_dice) example. Using the cumulative score difference (which is equivalent to the mean score difference for ordering) is used as a compromise, I could also use have chosen to use the median score, or another measure.
 
-A move evaluation can still be tied with the same outcome. As a tie breaker to make sure that any evaluation is deterministic the evaluation will prefer the move to a lower row, and then further right column.
+A move evaluation can still be tied with the same outcome after comparing each component in order. As a tie breaker to make sure that any evaluation is deterministic the evaluation will prefer the move to a lower row, and then further right column.
 
 ## Other functionality
 
