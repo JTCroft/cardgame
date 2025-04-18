@@ -96,15 +96,22 @@ The terms in the evaluation `(w + d/2, w, s)` are based on calculating
 * Preferring decisive outcomes over tied outcomes.
 * How much you win or lose by on average
 
-This evaluation criteria is a choice, and the second term means it is not strictly well ordered which can cause issues in pruning branches in alpha beta search. One issue this introduces is best demonstrated with an example. If choosing between 2 moves where one of guarantees a draw, and one which has a 50% chance of a win and a 50% chance of a draw, the second term which enforces a preference for decisive outcomes means that a player would prefer the one that gives them a chance of winning. When doing a tree search, the other player will believe that the outcome of a draw is WORSE for them than a 50/50 win/loss, which means they may think it is BETTER for the original player causing the branch to be pruned unless you check that the difference is well ordered (implemented as only pruning when both alpha > beta and not -alpha > -beta)
+This evaluation criteria is a choice, and the second term means it is not strictly well ordered which can cause issues in pruning branches in alpha beta search. One issue this introduces is best demonstrated with an example. If choosing between 2 moves where one of guarantees a draw, and one which has a 50% chance of a win and a 50% chance of a draw, the second term which enforces a preference for decisive outcomes means that a player would prefer the one that gives them a chance of winning. When doing a tree search, the other player will believe that the outcome of a draw is WORSE for them than a 50/50 win/loss, which means they may think it is BETTER for the original player causing the branch to be pruned unless you check that the difference is well ordered (implemented as only pruning when both `alpha > beta and not -alpha > -beta`)
 
 Another issue is that a preferable metric for the third component, based on how many points you expect to win or lose by, is also a compromise. I would consider a move to be better by considering which move will have a better outcome for the player (end with more points) more than 50% of the time that would be a better ordering, but that comparison is not well ordered either, as shown by the [intransitive dice](https://en.wikipedia.org/wiki/Intransitive_dice) example. Using the cumulative score difference (which is equivalent to the mean score difference for ordering) is used as a compromise.
+
+A move evaluation can still be tied with the same outcome. As a tie breaker to make sure that any evaluation is deterministic the evaluation will prefer the move to a lower row, and then further right column.
 
 ## Other functionality
 
 Examples of further methods to explore the state space are given below, the implementation is far from exhaustive
 
 ```python
+# Dump the game state to a string, and load from a string for portability
+saved_game = game.save()
+game_str = '5C2D8C3HKH??/AS??8S3S??7S/5S8H4H??5D7C/AH6C3D6S5HAD/6HKCACKD4C2H/8D2S7H4D7D??//2C3C4S6DKS//731630308968466917018937'
+game = Game.load(game_str)
+
 # Get the players hands
 p1_hand, p2_hand = game.p1, game.p2
 
@@ -117,10 +124,10 @@ game.moves
 # Calculate the scores for each hand
 p1_hand.score()
 
-# or the score for the game, which is the score for p1 - the score for p2
+# or the current score for the game, which is the score for p1 - the score for p2
 game.score
 
-# Find the best move from a given position (naive minimax)
+# Find the best move from a given position using naive minimax
 best_score, best_move = game.score_walk()
 
 # Display the evalualtions of each move from a position
@@ -134,5 +141,6 @@ Looking at improving the ability to use this package to generate insights into t
 - Improved constraints for alpha/beta pruning game tree search
 - Calculation of legal moves using a sequence of lookups & precalculation
 - Changing the search order to bound the evaluation of a position quicker than A/B pruning (not using DFS)
-- Further speed optimisation
-- Heuristic value of a position & iterative deepening
+- Speed optimisation
+- Heuristic value of a position & iterative deepening search
+- Transposition tables
