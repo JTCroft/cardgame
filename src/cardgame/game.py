@@ -325,11 +325,13 @@ class Eval(tuple):
 
     @staticmethod
     def eval_from_wds(w, d, s):
-        return (w + d / 2, w, s)
+        return (2 * w + d, w, s)
 
     @property
     def normed_eval(self):
-        return tuple(x / self.multiplicity for x in self.eval)
+        ev = self.eval
+        multiplicity = self.multiplicity
+        return (ev[0] / (2 * multiplicity), *(x / multiplicity for x in ev[1:]))
 
     def multiplied_wds(self, multiplier):
         return tuple(multiplier * val for val in self)
