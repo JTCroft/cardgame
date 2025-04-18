@@ -37,7 +37,7 @@ Each run or set is worth a base number of points based on how long it is accordi
 | 7                 | 11     |
 | 8                 | 13     |
 
-A player can use a king to act as a wildcard, choosing which card it will act as to maximise points. However each time a king forms part of a run or set that run or set will be worth one less point than it would be otherwise.
+A player can use a king to act as a wildcard, choosing which card it will act as to maximise points. However each time a king forms part of a scoring run or set that run or set will be worth one less point than it would be otherwise.
 
 This logic can be summarised as
 
