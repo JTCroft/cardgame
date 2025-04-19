@@ -422,6 +422,10 @@ class ProbEval(Counter):
     def eval(self):
         return Eval(self.multiplicity, *self.wds)
 
+    @property
+    def observed_eval(self):
+        return Eval(self.multiplicity, *self.observed_wds)
+    
     @classmethod
     def combine(cls, prob_evals):
         inst = cls(multiplicity=sum(prob_eval.multiplicity for prob_eval in prob_evals))
@@ -615,6 +619,30 @@ class Game:
         )
         return best_score
 
+    @staticmethod
+    def _get_bounds(branch_multiplicity, move_score, alpha, beta):
+        # How good does the branch evaluation have to be
+        # So that the LOWER BOUND of the combined eval with the move score
+        # would be ABOVE beta
+        remaining_unevaled_after_branch = move_score.multiplicity - move_score.observed - branch_multiplicity
+        ms_copy = move_score.copy()
+        ms_copy[-25] += remaining_unevaled_after_branch
+        subbeta = Eval(branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_eval)))
+    
+        # How bad does the branch evaluation have to be
+        # So that the UPPER BOUND of the combined eval with the move score
+        # would be BELOW alpha
+        ms_copy = move_score.copy()
+        ms_copy[25] += remaining_unevaled_after_branch
+        subalpha = Eval(branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_eval)))
+        
+        base = ProbEval(branch_multiplicity)
+        if subalpha < base.lower_bound.eval:
+            subalpha = base.lower_bound.eval
+        if subbeta > base.upper_bound.eval:
+            subbeta = base.upper_bound.eval
+        return subalpha, subbeta
+    
     def evaluate(self, alpha=None, beta=None):
         multiplicity = self.multiplicity
         if not self.legal_moves:
@@ -642,11 +670,13 @@ class Game:
                     best_move_seq = (move[0].taken_card,) + move_eval['Deterministic optimal moves']
                 alpha = max(best_score.lower_bound.eval, alpha)
             else:
-                detailed_move_scores[move_marker] = {fd_card: None for fd_card in self.board.facedown_cards}
+                branch_multiplicity = move[0].multiplicity
+                detailed_move_scores[move_marker] = {fd_card: ProbEval(branch_multiplicity) for fd_card in self.board.facedown_cards}
                 move_score = ProbEval(multiplicity)
                 possibility_move_seqs = []
                 for possibility in move:
-                    possibility_eval = possibility.evaluate()
+                    subalpha, subbeta = self._get_bounds(branch_multiplicity, move_score, alpha, beta)
+                    possibility_eval = possibility.evaluate(-subbeta, -subalpha)
                     possibility_score = -(possibility_eval['Evaluation'])
                     possibility_move_seqs.append(possibility_eval['Deterministic optimal moves'])
                     detailed_move_scores[move_marker][possibility.taken_card] = possibility_score
