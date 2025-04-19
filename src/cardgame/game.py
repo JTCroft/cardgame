@@ -627,22 +627,20 @@ class Game:
         remaining_unevaled_after_branch = move_score.multiplicity - move_score.observed - branch_multiplicity
         ms_copy = move_score.copy()
         ms_copy[-25] += remaining_unevaled_after_branch
-        sb_w, sb_d, sb_s = (b - m for b, m in zip(beta, ms_copy.observed_eval))
-        sb_w = min(branch_multiplicity, sb_w)
-        subbeta = Eval(branch_multiplicity, sb_w, min(sb_d, branch_multiplicity - sb_w), min(25 * branch_multiplicity, sb_s))
+        subbeta = Eval(branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_eval)))
     
         # How bad does the branch evaluation have to be
         # So that the UPPER BOUND of the combined eval with the move score
         # would be BELOW alpha
         ms_copy = move_score.copy()
         ms_copy[25] += remaining_unevaled_after_branch
-        sa_w, sa_d, sa_s = (a - m for a, m in zip(alpha, ms_copy.observed_eval))
-        subalpha = Eval(branch_multiplicity, max(0, sa_w), max(0, sa_d), max(-25 * branch_multiplicity, sa_s))
-        # base = ProbEval(branch_multiplicity)
-        # if subalpha < base.lower_bound.eval:
-        #     subalpha = base.lower_bound.eval
-        # if subbeta > base.upper_bound.eval:
-        #     subbeta = base.upper_bound.eval
+        subalpha = Eval(branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_eval)))
+        
+        base = ProbEval(branch_multiplicity)
+        if subalpha < base.lower_bound.eval:
+            subalpha = base.lower_bound.eval
+        if subbeta > base.upper_bound.eval:
+            subbeta = base.upper_bound.eval
         return subalpha, subbeta
     
     def evaluate(self, alpha=None, beta=None):
