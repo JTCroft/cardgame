@@ -1,7 +1,7 @@
 from enum import IntEnum
 from jinja2 import Environment, PackageLoader
 from random import shuffle, choice
-from operator import itemgetter, or_
+from operator import itemgetter, or_, lt, le, gt, ge, eq
 from functools import reduce, lru_cache
 from itertools import groupby, combinations, product
 from math import factorial
@@ -13,6 +13,9 @@ env = Environment(
     loader=PackageLoader(package_name="cardgame", package_path="../../templates")
 )
 
+# This is the approximate upper bound of the difference between 2 players scores
+# I think it might actually be 26, but it works alright for bounding purposes
+_SCORE_DIFFERENCE_BOUND = 25
 
 def _calculate_score_lookups():
     suit_scores = {}
@@ -339,30 +342,31 @@ class Eval(tuple):
     def multiplied_eval(self, multiplier):
         return self.eval_from_wds(*self.multiplied_wds(multiplier))
 
-    def __lt__(self, other):
-        return self.multiplied_eval(other.multiplicity) < other.multiplied_eval(
-            self.multiplicity
+    def __apply_op(self, op, other):
+        self_multip = self.multiplicity
+        other_multip = other.multiplicity
+
+        if self_multip == other_multip:
+            return op(self.eval, other.eval)
+        return op(
+            self.multiplied_eval(other.multiplicity), 
+            other.multiplied_eval(self.multiplicity)
         )
+        
+    def __lt__(self, other):
+        return self.__apply_op(lt, other)
 
     def __lte__(self, other):
-        return self.multiplied_eval(other.multiplicity) <= other.multiplied_eval(
-            self.multiplicity
-        )
+        return self.__apply_op(le, other)
 
     def __gt__(self, other):
-        return self.multiplied_eval(other.multiplicity) > other.multiplied_eval(
-            self.multiplicity
-        )
+        return self.__apply_op(gt, other)
 
     def __gte__(self, other):
-        return self.multiplied_eval(other.multiplicity) >= other.multiplied_eval(
-            self.multiplicity
-        )
+        return self.__apply_op(ge, other)
 
     def __eq__(self, other):
-        return self.multiplied_wds(other.multiplicity) == other.multiplied_wds(
-            self.multiplicity
-        )
+        return self.__apply_op(eq, other)
 
     def __neg__(self):
         return self.__class__(
@@ -412,11 +416,11 @@ class ProbEval(Counter):
 
     @property
     def lower_bound(self):
-        return self.bound(-25)
+        return self.bound(-_SCORE_DIFFERENCE_BOUND)
 
     @property
     def upper_bound(self):
-        return self.bound(25)
+        return self.bound(_SCORE_DIFFERENCE_BOUND)
 
     @property
     def eval(self):
@@ -626,21 +630,22 @@ class Game:
         # would be ABOVE beta
         remaining_unevaled_after_branch = move_score.multiplicity - move_score.observed - branch_multiplicity
         ms_copy = move_score.copy()
-        ms_copy[-25] += remaining_unevaled_after_branch
-        subbeta = Eval(branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_eval)))
-    
+        ms_copy[-_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
+        subbeta = Eval(branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_wds)))
         # How bad does the branch evaluation have to be
         # So that the UPPER BOUND of the combined eval with the move score
         # would be BELOW alpha
         ms_copy = move_score.copy()
-        ms_copy[25] += remaining_unevaled_after_branch
-        subalpha = Eval(branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_eval)))
+        ms_copy[_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
+        subalpha = Eval(branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_wds)))
         
         base = ProbEval(branch_multiplicity)
-        if subalpha < base.lower_bound.eval:
-            subalpha = base.lower_bound.eval
-        if subbeta > base.upper_bound.eval:
-            subbeta = base.upper_bound.eval
+        lb = base.lower_bound.eval
+        ub = base.upper_bound.eval
+        if subalpha < lb:
+            subalpha = lb
+        if subbeta > ub:
+            subbeta = ub
         return subalpha, subbeta
     
     def evaluate(self, alpha=None, beta=None):
