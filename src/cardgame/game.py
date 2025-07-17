@@ -679,6 +679,7 @@ class Game:
                 detailed_move_scores[move_marker] = {fd_card: ProbEval(branch_multiplicity) for fd_card in self.board.facedown_cards}
                 move_score = ProbEval(multiplicity)
                 possibility_move_seqs = []
+                curr_move_best_move = False
                 for possibility in move:
                     subalpha, subbeta = self._get_bounds(branch_multiplicity, move_score, alpha, beta)
                     possibility_eval = possibility.evaluate(-subbeta, -subalpha)
@@ -688,12 +689,14 @@ class Game:
                     move_score.update(possibility_score)
                     if (move_score, move_marker) > (best_score, best_move_seq[0]):
                         best_score = move_score
-                        best_move_seq = (move_marker,) + _common_prefix(possibility_move_seqs)
+                        curr_move_best_move = True
                     if move_score.upper_bound.eval < alpha:
                         break
                     alpha = max(best_score.lower_bound.eval, alpha)
                     if alpha > beta and not (-alpha) > (-beta):
                         break
+                if curr_move_best_move:
+                    best_move_seq = (move_marker,) + _common_prefix(possibility_move_seqs)
             if alpha > beta and not (-alpha) > (-beta):
                 break
         return {
