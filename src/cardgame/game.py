@@ -1,13 +1,13 @@
-from enum import IntEnum
 from jinja2 import Environment, PackageLoader
 from random import shuffle, choice
-from operator import itemgetter, or_, lt, le, gt, ge, eq
-from functools import reduce, lru_cache
-from itertools import groupby, combinations, product
+from operator import itemgetter, lt, le, gt, ge, eq
+from itertools import groupby
 from math import factorial
 from collections import Counter
+from .scoring import score_dp, score_with_king_allocation
+from .cards import Card, Rank
 
-__all__ = ("Suit", "Rank", "Card", "Board", "Hand", "Game", "ProbEval", "Eval")
+__all__ = ("Board", "Hand", "Game", "ProbEval", "Eval")
 
 env = Environment(
     loader=PackageLoader(package_name="cardgame", package_path="../../templates")
@@ -16,80 +16,6 @@ env = Environment(
 # This is the approximate upper bound of the difference between 2 players scores
 # I think it might actually be 26, but it works alright for bounding purposes
 _SCORE_DIFFERENCE_BOUND = 25
-
-def _calculate_score_lookups():
-    suit_scores = {}
-    for pmut in product([False, True], repeat=8):
-        for kings in product(*(([False] if card else [False, True]) for card in pmut)):
-            if sum(kings) > 4:
-                continue
-            score = 0
-            run = 0
-            kings_in_run = 0
-            for card, king in zip(pmut, kings):
-                if card:
-                    run += 1
-                elif king:
-                    run += 1
-                    kings_in_run += 1
-                else:
-                    if run >= 3:
-                        score += run * 2 - 3 - kings_in_run
-                    run = kings_in_run = 0
-            if run >= 3:
-                score += run * 2 - 3 - kings_in_run
-            suit_scores[
-                (
-                    reduce(or_, (1 << i for i, card in enumerate(pmut) if card), 0),
-                    reduce(or_, (1 << i for i, card in enumerate(kings) if card), 0),
-                )
-            ] = score
-    rank_scores = {
-        (
-            reduce(or_, (1 << (8 * i) for i, card in enumerate(pmut) if card), 0),
-            reduce(or_, (1 << (8 * i) for i, card in enumerate(kings) if card), 0),
-        ): (2 * sum(pmut) - 3 + sum(kings) if sum(pmut) + sum(kings) >= 3 else 0)
-        for pmut in product([False, True], repeat=4)
-        for kings in product(*(([False] if card else [False, True]) for card in pmut))
-    }
-    return rank_scores, suit_scores
-
-
-_rank_scores, _suit_scores = _calculate_score_lookups()
-
-
-Suit = IntEnum("suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
-Rank = IntEnum("rank", names=list("A2345678K"))
-
-
-@lru_cache(maxsize=100000)
-def _calculate_score(hand_int, number_of_kings):
-    possible_kings = _int_to_bits(0b11111111111111111111111111111111 ^ hand_int)
-    best_score, best_kings = 0, 0
-    suit_mask = 0b11111111
-    rank_mask = 0b1000000010000000100000001
-    for king_allocation in combinations(possible_kings, number_of_kings):
-        king_int = reduce(or_, king_allocation, 0)
-        score = 0
-        for suit in Suit:
-            base_suit = (hand_int >> (8 * suit)) & suit_mask
-            king_suit = (king_int >> (8 * suit)) & suit_mask
-            score += _suit_scores[(base_suit, king_suit)]
-        for rank in list(Rank)[:-1]:
-            base_rank = (hand_int >> (rank - 1)) & rank_mask
-            king_rank = (king_int >> (rank - 1)) & rank_mask
-            score += _rank_scores[(base_rank, king_rank)]
-        best_score = max(best_score, score)
-    return best_score
-
-
-def _int_to_bits(n):
-    components = []
-    while n > 0:
-        lsb = n & -n
-        components.append(lsb)
-        n &= n - 1
-    return tuple(reversed(components))
 
 
 def _common_prefix(move_sequences):
@@ -100,73 +26,6 @@ def _common_prefix(move_sequences):
         else:
             break
     return tuple(prefix)
-
-
-class Card(tuple):
-    template = env.get_template("card.html.jinja2")
-    _symbols = "♥♣♦♠"
-    _letters = "HCDS"
-
-    def __new__(cls, rank=None, suit=None, facedown=False):
-        if facedown:
-            instance = super().__new__(cls, (None, None))
-        else:
-            instance = super().__new__(cls, (Rank(rank), Suit(suit)))
-        instance.facedown = facedown
-        return instance
-
-    @classmethod
-    def from_str(cls, card_str):
-        if card_str == '??':
-            return cls(facedown=True)
-        rank, suit = card_str
-        rank = Rank.__members__[rank]
-        suit = Suit(cls._symbols.index(suit) if suit in cls._symbols else cls._letters.index(suit))
-        return cls(rank, suit)
-        
-        
-    @property
-    def rank(self):
-        return "?" if self.facedown else self[0].name
-
-    @property
-    def suit(self):
-        return "?" if self.facedown else self._symbols[self[1]]
-
-    @property
-    def letter(self):
-        return "?" if self.facedown else self._letters[self[1]]
-
-    @property
-    def suit_name(self):
-        return None if self.facedown else self[1].name
-
-    def __str__(self):
-        return self.rank + self.suit
-
-    def __repr__(self):
-        return self.rank + self.letter
-
-    def _repr_pretty_(self, pp, cycle):
-        pp.text(str(self))
-    
-    def _repr_html_(self):
-        return self.template.render(card=self)
-
-    @classmethod
-    @property
-    def deck(cls):
-        return tuple(cls(rank=rank, suit=suit) for suit in Suit for rank in Rank)
-
-    @classmethod
-    @property
-    def kings(cls):
-        return {cls(rank=Rank.K, suit=suit) for suit in Suit}
-
-    @classmethod
-    @property
-    def nonkings(cls):
-        return set(cls.deck) - cls.kings
 
 
 class Board(tuple):
@@ -181,21 +40,26 @@ class Board(tuple):
 
     def save(self, alnum=False):
         func = repr if alnum else str
-        board_str = '/'.join(''.join(func(card) for card in row) for row in self)
-        fd_str = ''.join(func(card) for card in self.facedown_cards)
-        return f'{board_str}//{fd_str}'
+        board_str = "/".join("".join(func(card) for card in row) for row in self)
+        fd_str = "".join(func(card) for card in self.facedown_cards)
+        return f"{board_str}//{fd_str}"
 
     @classmethod
     def load(cls, save):
-        board, fd = save.split('//')
+        board, fd = save.split("//")
+
         def get_str_pairs(input_str):
             while input_str:
                 yield input_str[:2]
                 input_str = input_str[2:]
-        board = [tuple(Card.from_str(card) for card in get_str_pairs(row)) for row in board.split('/')]
+
+        board = [
+            tuple(Card.from_str(card) for card in get_str_pairs(row))
+            for row in board.split("/")
+        ]
         fd = tuple(Card.from_str(card) for card in get_str_pairs(fd))
         return cls(board, fd)
-        
+
     @classmethod
     def deal(cls):
         deck = list(Card.deck)
@@ -253,30 +117,8 @@ class Hand(tuple):
     def score(self, king_info=False):
         hand_int, number_of_kings = self.as_int
         if not king_info:
-            return _calculate_score(hand_int, number_of_kings)
-
-        possible_kings = _int_to_bits(0b11111111111111111111111111111111 ^ hand_int)
-        best_score, best_kings = 0, 0
-        suit_mask = 0b11111111
-        rank_mask = 0b1000000010000000100000001
-        for king_allocation in combinations(possible_kings, number_of_kings):
-            king_int = reduce(or_, king_allocation, 0)
-            score = 0
-            for suit in Suit:
-                base_suit = (hand_int >> (8 * suit)) & suit_mask
-                king_suit = (king_int >> (8 * suit)) & suit_mask
-                score += _suit_scores[(base_suit, king_suit)]
-            for rank in list(Rank)[:-1]:
-                base_rank = (hand_int >> (rank - 1)) & rank_mask
-                king_rank = (king_int >> (rank - 1)) & rank_mask
-                score += _rank_scores[(base_rank, king_rank)]
-            best_score, best_kings = max((best_score, best_kings), (score, king_int))
-        king_cards = tuple(
-            Card(
-                ((king_int.bit_length() - 1) % 8) + 1, (king_int.bit_length() - 1) // 8
-            )
-            for king_int in _int_to_bits(best_kings)
-        )
+            return score_dp(hand_int, number_of_kings)
+        best_score, king_cards = score_with_king_allocation(hand_int, number_of_kings)
         return best_score, king_cards
 
     def _repr_html_(self):
@@ -302,7 +144,7 @@ class Hand(tuple):
         score, king_cards = self.score(king_info=True)
         king_card_iter = iter(king_cards)
         for card in self:
-            if not card[0] is Rank.K:
+            if card[0] is not Rank.K:
                 grid_hand[card[1]][card[0] - 1] = card
             else:
                 king_card = next(king_card_iter)
@@ -349,10 +191,10 @@ class Eval(tuple):
         if self_multip == other_multip:
             return op(self.eval, other.eval)
         return op(
-            self.multiplied_eval(other.multiplicity), 
-            other.multiplied_eval(self.multiplicity)
+            self.multiplied_eval(other.multiplicity),
+            other.multiplied_eval(self.multiplicity),
         )
-        
+
     def __lt__(self, other):
         return self.__apply_op(lt, other)
 
@@ -429,7 +271,7 @@ class ProbEval(Counter):
     @property
     def observed_eval(self):
         return Eval(self.multiplicity, *self.observed_wds)
-    
+
     @classmethod
     def combine(cls, prob_evals):
         inst = cls(multiplicity=sum(prob_eval.multiplicity for prob_eval in prob_evals))
@@ -462,7 +304,8 @@ class ProbEval(Counter):
 
     def __repr__(self):
         ordered_dict = dict(sorted(self.items()))
-        return f'{self.__class__.__name__}({self.observed}/{self.multiplicity} possibilities, {ordered_dict!r})'
+        return f"{self.__class__.__name__}({self.observed}/{self.multiplicity} possibilities, {ordered_dict!r})"
+
 
 class Game:
     starting_position = (2, 2)
@@ -628,17 +471,23 @@ class Game:
         # How good does the branch evaluation have to be
         # So that the LOWER BOUND of the combined eval with the move score
         # would be ABOVE beta
-        remaining_unevaled_after_branch = move_score.multiplicity - move_score.observed - branch_multiplicity
+        remaining_unevaled_after_branch = (
+            move_score.multiplicity - move_score.observed - branch_multiplicity
+        )
         ms_copy = move_score.copy()
         ms_copy[-_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
-        subbeta = Eval(branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_wds)))
+        subbeta = Eval(
+            branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_wds))
+        )
         # How bad does the branch evaluation have to be
         # So that the UPPER BOUND of the combined eval with the move score
         # would be BELOW alpha
         ms_copy = move_score.copy()
         ms_copy[_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
-        subalpha = Eval(branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_wds)))
-        
+        subalpha = Eval(
+            branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_wds))
+        )
+
         base = ProbEval(branch_multiplicity)
         lb = base.lower_bound.eval
         ub = base.upper_bound.eval
@@ -647,13 +496,15 @@ class Game:
         if subbeta > ub:
             subbeta = ub
         return subalpha, subbeta
-    
+
     def evaluate(self, alpha=None, beta=None):
         multiplicity = self.multiplicity
         if not self.legal_moves:
             return {
-                'Evaluation': ProbEval(multiplicity, {self.negamax_score: multiplicity}),
-                'Deterministic optimal moves': tuple(),
+                "Evaluation": ProbEval(
+                    multiplicity, {self.negamax_score: multiplicity}
+                ),
+                "Deterministic optimal moves": tuple(),
             }
         if not alpha:
             base = ProbEval(multiplicity)
@@ -663,29 +514,40 @@ class Game:
         best_move_seq = ((-1, -1),)
         ordered_moves = sorted(self.all_moves(), key=len)
         detailed_move_scores = {}
-        
+
         for move in ordered_moves:
             move_marker = move[0].marker
             if len(move) == 1:
                 move_eval = move[0].evaluate(-beta, -alpha)
-                move_score = -(move_eval['Evaluation'])
+                move_score = -(move_eval["Evaluation"])
                 detailed_move_scores[move_marker] = move_score
                 if (move_score, move_marker) > (best_score, best_move_seq[0]):
                     best_score = move_score
-                    best_move_seq = (move[0].taken_card,) + move_eval['Deterministic optimal moves']
+                    best_move_seq = (move[0].taken_card,) + move_eval[
+                        "Deterministic optimal moves"
+                    ]
                 alpha = max(best_score.lower_bound.eval, alpha)
             else:
                 branch_multiplicity = move[0].multiplicity
-                detailed_move_scores[move_marker] = {fd_card: ProbEval(branch_multiplicity) for fd_card in self.board.facedown_cards}
+                detailed_move_scores[move_marker] = {
+                    fd_card: ProbEval(branch_multiplicity)
+                    for fd_card in self.board.facedown_cards
+                }
                 move_score = ProbEval(multiplicity)
                 possibility_move_seqs = []
                 curr_move_best_move = False
                 for possibility in move:
-                    subalpha, subbeta = self._get_bounds(branch_multiplicity, move_score, alpha, beta)
+                    subalpha, subbeta = self._get_bounds(
+                        branch_multiplicity, move_score, alpha, beta
+                    )
                     possibility_eval = possibility.evaluate(-subbeta, -subalpha)
-                    possibility_score = -(possibility_eval['Evaluation'])
-                    possibility_move_seqs.append(possibility_eval['Deterministic optimal moves'])
-                    detailed_move_scores[move_marker][possibility.taken_card] = possibility_score
+                    possibility_score = -(possibility_eval["Evaluation"])
+                    possibility_move_seqs.append(
+                        possibility_eval["Deterministic optimal moves"]
+                    )
+                    detailed_move_scores[move_marker][possibility.taken_card] = (
+                        possibility_score
+                    )
                     move_score.update(possibility_score)
                     if (move_score, move_marker) > (best_score, best_move_seq[0]):
                         best_score = move_score
@@ -696,27 +558,38 @@ class Game:
                     if alpha > beta and not (-alpha) > (-beta):
                         break
                 if curr_move_best_move:
-                    best_move_seq = (move_marker,) + _common_prefix(possibility_move_seqs)
+                    best_move_seq = (move_marker,) + _common_prefix(
+                        possibility_move_seqs
+                    )
             if alpha > beta and not (-alpha) > (-beta):
                 break
         return {
-            'Evaluation': best_score,
-            'Deterministic optimal moves': best_move_seq,
-            'Known info for other branches': detailed_move_scores
+            "Evaluation": best_score,
+            "Deterministic optimal moves": best_move_seq,
+            "Known info for other branches": detailed_move_scores,
         }
 
     def save(self, alnum=False):
         board_str = self.board.save(alnum=alnum)
-        ordered_poss_moves = {marker: sorted(moves) for marker, moves in self.possible_moves.items()}
-        move_ind = [str(ordered_poss_moves[marker].index(move)) for marker, move in zip((self.starting_position,) + self.moves[:-1], self.moves)]
-        moves_str = ''.join(move_ind)
-        return f'{board_str}//{moves_str}'
+        ordered_poss_moves = {
+            marker: sorted(moves) for marker, moves in self.possible_moves.items()
+        }
+        move_ind = [
+            str(ordered_poss_moves[marker].index(move))
+            for marker, move in zip(
+                (self.starting_position,) + self.moves[:-1], self.moves
+            )
+        ]
+        moves_str = "".join(move_ind)
+        return f"{board_str}//{moves_str}"
 
     @classmethod
     def load(cls, save):
-        board, moves = save.rsplit('//', maxsplit=1)
+        board, moves = save.rsplit("//", maxsplit=1)
         board = Board.load(board)
-        ordered_poss_moves = {marker: sorted(moves) for marker, moves in cls.possible_moves.items()}
+        ordered_poss_moves = {
+            marker: sorted(moves) for marker, moves in cls.possible_moves.items()
+        }
         move_indexes = [int(move) for move in moves]
         position = cls.starting_position
         moves_list = []
