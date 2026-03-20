@@ -14,8 +14,10 @@ env = Environment(
 )
 
 # This is the approximate upper bound of the difference between 2 players scores
-# I think it might actually be 26, but it works alright for bounding purposes
-_SCORE_DIFFERENCE_BOUND = 25
+# Not proven, but here's two disjoint hands that achieve this
+# 31 points - [A♣, 2♣, 2♠, 3♥, 3♣, 3♠, 4♣, 4♦, 4♠, 5♣, 5♠, 6♥, 6♣, 6♠, K♥, K♣]
+# 5 points -  [A♥, A♠, 2♥, 2♦, 3♦, 4♥, 5♥, 5♦, 6♦, 7♥, 7♠, 8♥, 8♣, 8♦, 8♠]
+_SCORE_DIFFERENCE_BOUND = 26
 
 
 def _common_prefix(move_sequences):
