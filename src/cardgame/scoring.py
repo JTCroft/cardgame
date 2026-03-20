@@ -8,9 +8,7 @@ from itertools import combinations, product
 from operator import or_
 from .cards import Suit, Rank, Card
 
-# ---------------------------------------------------------------------------
-# Module-level precomputation (runs once on import, ~40ms)
-# ---------------------------------------------------------------------------
+__all__ = ("score_dp", "score_with_king_allocation")
 
 _pow5 = [5**r for r in range(8)]
 
