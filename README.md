@@ -99,8 +99,8 @@ To calculate how 'good' an outcome is for a player has some complexity due to ho
 
 To determine if a position (which may not be fully evaluated) is better for the player than another I:
 
-* Take the lower bound of the possible outcomes for the position, filling in any unevaluated branches with -25
-* Take the upper bound of the possible outcomes for the other position, filling in any unevaluated branches with +25
+* Take the lower bound of the possible outcomes for the position, filling in any unevaluated branches with -26
+* Take the upper bound of the possible outcomes for the other position, filling in any unevaluated branches with +26
 * Calculate the number of wins, draws, and losses for each of those, and the sum of the scores of all possible outcomes
 * With the win count, draw count, and cumulative score given by variables `w`, `d`, and `s` I calculate `(w + d/2, w, s)`
 * I compare the tuple calculated for each position
@@ -133,8 +133,16 @@ p1_hand, p2_hand = game.p1, game.p2
 # See the full board, including cards that have been taken
 game.board
 
+# See what the current facedown cards are
+game.board.facedown_cards
+
 # Access the move sequence in the game
 game.moves
+
+# Make a move
+from random import choice
+game = choice(game.move(3, 4)) # always a tuple of resolutions for facedown cards
+game = game.random_move()
 
 # Calculate the scores for each hand
 p1_hand.score()
@@ -142,11 +150,9 @@ p1_hand.score()
 # or the current score for the game, which is the score for p1 - the score for p2
 game.score
 
-# Find the best move from a given position using naive minimax
-best_score, best_move = game.score_walk()
-
-# evalualtions of each move from a position
-game.move_evals
+# get the detailed comparison of the different moves available from a position
+from cardgame import analyse_moves
+analyse_moves(game)
 ```
 
 ## Possible additions
