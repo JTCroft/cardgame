@@ -69,7 +69,13 @@
     }
 
     .card.taken {
-        visibility: hidden
+        border-color: transparent;
+        background: transparent;
+        box-shadow: none;
+    }
+    .card.just-taken {
+        outline: 3px solid #ffd43b;
+        box-shadow: 0 0 12px 2px rgba(255, 212, 59, 0.8);
     }
     .card.hearts, .card.diamonds {
         color: red;
@@ -105,6 +111,10 @@
     .score {
         font-size: 3em;
         font-weight: 500;
+    }
+    .hand-label {
+        font-size: 1em;
+        color: #555;
     }
     .handarray {
         display: flex;

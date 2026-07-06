@@ -13,6 +13,7 @@ pip install git+https://github.com/JTCroft/cardgame.git
 - [Usage](#usage)
 - [Position Evaluation](#position-evaluation)
 - [Other functionality](#other-functionality)
+- [Playing online](#playing-online)
 - [Possible additions](#possible-additions)
 
 ## Gameplay
@@ -154,6 +155,127 @@ game.score
 from cardgame import analyse_moves
 analyse_moves(game)
 ```
+
+## Playing online
+
+A basic Flask + Flask-SocketIO web front end is included so people can play
+against each other in a browser, in a shared "room", with moves synced to
+everyone watching live over a WebSocket as soon as they happen. Install the
+extra web dependencies:
+
+```bash
+pip install "git+https://github.com/JTCroft/cardgame.git#egg=cardgame[web]"
+```
+
+Then start the dev server:
+
+```bash
+cardgame-web
+```
+
+By default this serves on `http://127.0.0.1:5000`.
+
+- Visit the homepage to create a room (you'll be redirected to a URL like
+  `/room/ABCD`), or go directly to a room by its 4 letter code:
+  `http://127.0.0.1:5000/room/ABCD`.
+- Visiting a room makes you a spectator by default. The first time you try
+  to claim a seat, you'll be asked to pick a display name (kept in your
+  session, so it carries across rooms) — that name is what everyone else
+  sees instead of "Player 1" / "Player 2". You can change it any time from
+  the &#9881; button in the top corner.
+- Either spectator can claim a vacant "Join as Player 1/2" seat, and a
+  seated player can hand their seat back with "Leave seat", right up until
+  the first move of that game is made. Once the game is under way, seats
+  are locked in for the rest of it.
+- The `/rooms` page lists every room currently in memory — who's seated,
+  how many people are spectating, and whether it's waiting for players, in
+  progress, or finished — for matchmaking or spectating, and updates live
+  the same way as a room page does.
+- Since the board and both hands are open information in this game, the
+  card most recently added to a hand (which isn't always obvious once it's
+  sorted into that player's spread) gets a highlighted glow until the next
+  move.
+- On narrow (phone-width) screens the layout switches to smaller,
+  simplified cards — loosely adapted from the ["inText" mode](https://github.com/selfthinker/CSS-Playing-Cards)
+  of the referenced CSS-Playing-Cards project — and each hand collapses
+  into a bottom drawer you can flick open from a tab, instead of two full
+  hands competing with the board for space.
+- The game can't start until both seats are filled — a lone player just
+  sees a "waiting for another player to join" message, with no clickable
+  cells, and a direct move attempt is rejected server-side too even if
+  something bypasses the UI.
+- When a game ends, a modal pops up once for everyone watching (announcing
+  a win/loss/draw and the final score) rather than a small inline message;
+  it's dismissible and reopenable ("View result") without losing your
+  place. From there, either player can step back and forth through the
+  finished game's move history (independently per viewer — one person
+  browsing old moves doesn't affect what anyone else sees), and either can
+  request a rematch, which the other player has to accept or decline
+  before a new game actually deals. Seats free up again once a game is
+  over (whether it finished naturally or a rematch was declined), the same
+  as before a game starts.
+
+Useful environment variables:
+
+- `CARDGAME_HOST` / `CARDGAME_PORT` - interface and port to bind (default `127.0.0.1:5000`)
+- `CARDGAME_DEBUG` - set to `1` to run Flask in debug/reload mode
+- `CARDGAME_SECRET_KEY` - session signing key; set this to a fixed value if
+  you want player sessions to survive server restarts
+
+Note that game state (and the mapping of connected sockets to rooms) is
+kept in memory in a single process, which is fine for local play or a
+small demo deployment, but means state is lost on restart and won't be
+shared across multiple worker processes. The dev server here runs
+Flask-SocketIO in "threading" mode, which is the simplest way to get real
+WebSocket support without extra dependencies, but it only really scales to
+one process. For a more robust deployment: run behind a proper WSGI/ASGI
+setup with a single worker (e.g. gunicorn with an eventlet or gevent
+worker class, which Flask-SocketIO integrates with directly), or move room
+state into a shared store and configure Flask-SocketIO's `message_queue`
+option (e.g. backed by Redis) so events can be fanned out across multiple
+worker processes. Rooms also currently live forever once created (there's
+no pruning of old/abandoned rooms), so the `/rooms` list will grow
+unbounded over a long-running server's lifetime.
+
+### Architecture changes behind the above
+
+Supporting names, flexible seating, and a lobby meant reworking a few
+things rather than bolting them on:
+
+- **Seating became an explicit, revocable action instead of an automatic
+  side effect of visiting a URL.** Previously, the first two browsers to
+  open a room were permanently assigned Player 1/2 on arrival. `RoomState`
+  now tracks seats as a plain `{1: player_id, 2: player_id}` mapping that's
+  only mutated by explicit `claim_seat` / `vacate_seat` actions (locked to
+  before the first move), with a room's connected sockets always defaulting
+  to spectator. This is what makes "leave your seat" / "spectator claims a
+  vacant seat" possible at all, and it's also what let the name prompt
+  attach naturally to the moment you try to claim a seat, rather than
+  needing its own separate flow.
+- **Player identity now has two parts.** `player_id` (an anonymous
+  per-browser id) is unchanged, but there's now also a `player_name`, kept
+  in the same session cookie so it persists across every room you visit in
+  that browser. Each room keeps its own small `player_id -> name` cache
+  (`RoomState.player_names`) purely so it can render *other* people's names
+  to everyone watching; the session copy is the source of truth for "your"
+  name.
+- **A lobby subsystem sits alongside the per-room state.** Every room's
+  live state is personalised per viewer (your own seat, whether you can
+  join a vacant one, etc.), so it's pushed individually to each connected
+  socket rather than broadcast. The `/rooms` listing has no such
+  personalisation — everyone sees the same table — so it uses a real
+  Flask-SocketIO broadcast group ("lobby") instead, refreshed whenever any
+  room's seats, name, or game state changes.
+- **The shared rendering macros gained a couple of backward-compatible
+  hooks** rather than being copied and modified: `draw_card` takes an
+  optional `highlight` flag, and `draw_board` takes optional
+  `legal_moves`/`move_handler` params for turning cells into buttons -
+  existing callers (including the Jupyter notebook `_repr_html_` output)
+  are unaffected since the new parameters all default to off.
+- **The base template now owns one shared Socket.IO connection and the name
+  modal** for every page (home, room, lobby), instead of each page wiring
+  up its own; page-specific handlers (board updates, lobby updates) hook
+  into that same connection via a Jinja block.
 
 ## Possible additions
 

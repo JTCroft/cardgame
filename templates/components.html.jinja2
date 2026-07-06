@@ -1,42 +1,43 @@
-{% macro draw_card(card, marker=False) %}
-  
-    <div class="{% if marker %}marker {% endif %}{% if card %}card {% if card.facedown %}facedown{% else %}{{ card.suit_name }}{% endif %}">
-      {% if not card.facedown %}
-        <div class="corner top-left">
-          <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
-        </div>
-        <div class="suit">{{ card.suit }}</div>
-        <div class="corner bottom-right">
-          <span>{{ card.rank }}</span><br><span>{{ card.suit }}</span>
-        </div>
-      {% endif %}
-      {% else %}">
-      {% endif %}
-    </div>
+{% macro draw_card(card, marker=False, highlight=False) %}
+<div class="card{% if marker %} marker{% endif %}{% if highlight %} just-taken{% endif %}{% if card is none %} taken{% elif card.facedown %} facedown{% else %} {{ card.suit_name }}{% endif %}">
+    {% if card and not card.facedown %}
+    <div class="corner top-left"><span>{{ card.rank }}</span><br><span>{{ card.suit }}</span></div>
+    <div class="suit">{{ card.suit }}</div>
+    <div class="corner bottom-right"><span>{{ card.rank }}</span><br><span>{{ card.suit }}</span></div>
+    {% endif %}
+</div>
 {% endmacro %}
 
-{% macro draw_board(board, move_sequence=None, marker_pos=False) %}
+{% macro draw_board(board, move_sequence=None, marker_pos=False, legal_moves=None, move_handler="sendMove") %}
 <div class="board">
     {% for row in board %}
         {% set row_index = loop.index0 %}
         {% for card in row %}
-            {% set marker = (row_index, loop.index0)==marker_pos %}
-            {% set card = card if not move_sequence else (None if ((row_index, loop.index0) in move_sequence) else card) %}
-            {{ draw_card(card, marker=marker) }}
+            {% set col_index = loop.index0 %}
+            {% set marker = (row_index, col_index) == marker_pos %}
+            {% set display_card = card if not move_sequence else (None if ((row_index, col_index) in move_sequence) else card) %}
+            {% if legal_moves and ((row_index, col_index) in legal_moves) %}
+            <button type="button" class="cell-button" onclick="{{ move_handler }}({{ row_index }}, {{ col_index }})" aria-label="Move to row {{ row_index }}, column {{ col_index }}">
+                {{ draw_card(display_card, marker=marker) }}
+            </button>
+            {% else %}
+                {{ draw_card(display_card, marker=marker) }}
+            {% endif %}
         {% endfor %}
     {% endfor %}
 </div>
 {% endmacro %}
 
-{% macro draw_hand(hand, turn_indicator=False) %}
+{% macro draw_hand(hand, turn_indicator=False, label=None, highlight_card=None) %}
 <div>
+    {% if label %}<div class="hand-label">{{ label }}</div>{% endif %}
     <div class="score">{{ hand.score() }} points{% if turn_indicator %}<span class="turnmarker"></span>{% endif %}</div>
     <div class="handarray">
         {% for suit in hand.cards_for_display %}
             <div class="hand">
                 {% for card in suit %}
                     {% if card %}
-                        {{ draw_card(card) }}
+                        {{ draw_card(card, highlight=(highlight_card is not none and card == highlight_card)) }}
                     {% else %}
                         <div></div>
                     {% endif %}

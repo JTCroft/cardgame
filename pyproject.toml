@@ -8,8 +8,16 @@ dependencies = [
     "jinja2>=3.1.6",
 ]
 
+[project.optional-dependencies]
+web = [
+    "flask>=3.0",
+    "flask-socketio>=5.3",
+    "simple-websocket>=1.0",
+]
+
 [project.scripts]
 cardgame = "cardgame:main"
+cardgame-web = "cardgame.web.app:main"
 
 [build-system]
 requires = ["hatchling"]

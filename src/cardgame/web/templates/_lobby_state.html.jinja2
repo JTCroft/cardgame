@@ -1,0 +1,28 @@
+{% if not rooms %}
+<p>No rooms yet. <a href="{{ url_for('index') }}">Create one!</a></p>
+{% else %}
+<table class="room-list">
+    <thead>
+        <tr>
+            <th>Room</th>
+            <th>Player 1</th>
+            <th>Player 2</th>
+            <th>Status</th>
+            <th>Spectators</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for room in rooms %}
+        <tr>
+            <td><span class="room-code">{{ room.code }}</span></td>
+            <td>{{ room.p1_name or "— vacant —" }}{% if room.p1_score is not none %} ({{ room.p1_score }}){% endif %}</td>
+            <td>{{ room.p2_name or "— vacant —" }}{% if room.p2_score is not none %} ({{ room.p2_score }}){% endif %}</td>
+            <td>{{ room.status }}</td>
+            <td>{{ room.spectators }}</td>
+            <td><a class="button" href="{{ url_for('room_view', code=room.code) }}">Open</a></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}

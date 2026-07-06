@@ -66,16 +66,13 @@ class Card(tuple):
         return self.template.render(card=self)
 
     @classmethod
-    @property
     def deck(cls):
         return tuple(cls(rank=rank, suit=suit) for suit in Suit for rank in Rank)
 
     @classmethod
-    @property
     def kings(cls):
         return {cls(rank=Rank.K, suit=suit) for suit in Suit}
 
     @classmethod
-    @property
     def nonkings(cls):
-        return set(cls.deck) - cls.kings
+        return set(cls.deck()) - cls.kings()

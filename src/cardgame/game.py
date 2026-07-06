@@ -64,7 +64,7 @@ class Board(tuple):
 
     @classmethod
     def deal(cls):
-        deck = list(Card.deck)
+        deck = list(Card.deck())
         shuffle(deck)
         facedown_cards = itemgetter(*cls.facedown_indices)(deck)
         facedown_card = Card(facedown=True)
@@ -128,7 +128,7 @@ class Hand(tuple):
 
     @property
     def num_kings(self):
-        return len(set(self) & Card.kings)
+        return len(set(self) & Card.kings())
 
     @property
     def ranks(self):
