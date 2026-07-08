@@ -4,6 +4,7 @@
     <div class="corner top-left"><span>{{ card.rank }}</span><br><span>{{ card.suit }}</span></div>
     <div class="suit">{{ card.suit }}</div>
     <div class="corner bottom-right"><span>{{ card.rank }}</span><br><span>{{ card.suit }}</span></div>
+    <div class="simple-label" style="display: none;"><span>{{ card.rank }}</span><span>{{ card.suit }}</span></div>
     {% endif %}
 </div>
 {% endmacro %}
@@ -28,10 +29,10 @@
 </div>
 {% endmacro %}
 
-{% macro draw_hand(hand, turn_indicator=False, label=None, highlight_card=None) %}
+{% macro draw_hand(hand, turn_indicator=False, label=None, highlight_card=None, winner=False) %}
 <div>
     {% if label %}<div class="hand-label">{{ label }}</div>{% endif %}
-    <div class="score">{{ hand.score() }} points{% if turn_indicator %}<span class="turnmarker"></span>{% endif %}</div>
+    <div class="score">{{ hand.score() }} points{% if winner %}<span class="trophy">&#127942;</span>{% elif turn_indicator %}<span class="turnmarker"></span>{% endif %}</div>
     <div class="handarray">
         {% for suit in hand.cards_for_display %}
             <div class="hand">
@@ -39,7 +40,7 @@
                     {% if card %}
                         {{ draw_card(card, highlight=(highlight_card is not none and card == highlight_card)) }}
                     {% else %}
-                        <div></div>
+                        <div class="card-slot"></div>
                     {% endif %}
                 {% endfor %}
             </div>

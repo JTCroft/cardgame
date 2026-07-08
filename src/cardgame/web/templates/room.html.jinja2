@@ -1,85 +1,27 @@
 {% extends "base.html.jinja2" %}
-{% block title %}Room {{ code }} - Cross Kings{% endblock %}
+{% block title %}{% if review_entry_id %}Reviewing room {{ code }}{% else %}Room {{ code }}{% endif %} - Cross Kings{% endblock %}
+{% block nav_extra %}
+<span class="room-code">{{ code }}</span>
+{% endblock %}
 {% block content %}
-<header class="top">
-    <span>Room</span>
-    <span class="room-code">{{ code }}</span>
-</header>
-
-<p>Share this page's link with your opponent so they can join room <strong>{{ code }}</strong>.
-<a href="{{ url_for('rooms_view') }}">Browse other rooms &rarr;</a></p>
-
 <div id="game-state">
-    {% include "_game_state.html.jinja2" %}
+    <p>Loading...</p>
 </div>
-
-<p><a href="{{ url_for('index') }}">&larr; Back to home</a></p>
 {% endblock %}
 
 {% block scripts %}
 <script>
-    const ROOM_CODE = {{ code | tojson }};
+    ROOM_KEY = {{ code | tojson }};
+    REVIEW_ENTRY_ID = {{ (review_entry_id or none) | tojson }};
 
-    socket.on("connect", () => {
-        socket.emit("join", { code: ROOM_CODE });
-    });
-
-    socket.on("state", (payload) => {
-        document.getElementById("game-state").innerHTML = payload.html;
-    });
-
-    socket.on("disconnect", () => {
-        const el = document.getElementById("flash-container");
-        el.innerHTML = "<div class=\"flash\">Connection lost, trying to reconnect...</div>";
-    });
-
-    function sendMove(row, col) {
-        socket.emit("move", { code: ROOM_CODE, row: row, col: col });
-    }
-
-    function requestRematch() {
-        socket.emit("request_rematch", { code: ROOM_CODE });
-    }
-
-    function respondRematch(accept) {
-        socket.emit("respond_rematch", { code: ROOM_CODE, accept: accept });
-    }
-
-    function historyStep(delta) {
-        socket.emit("history_step", { code: ROOM_CODE, delta: delta });
-    }
-
-    function historyGoto(index) {
-        socket.emit("history_goto", { code: ROOM_CODE, index: index });
-    }
-
-    function openGameOverModal() {
-        const el = document.getElementById("game-over-modal");
-        if (el) el.classList.add("open");
-    }
-
-    function closeGameOverModal() {
-        const el = document.getElementById("game-over-modal");
-        if (el) el.classList.remove("open");
-    }
-
+    // Claiming/leaving a seat is a room-only concept - a solo game's seats
+    // are always both already filled (you and the computer), so
+    // play.html.jinja2 never needs these.
     function claimSeat(seat) {
-        requireNameThen("claim_seat", { code: ROOM_CODE, seat: seat });
+        requireNameThen("claim_seat", { code: ROOM_KEY, seat: seat });
     }
-
     function leaveSeat() {
-        socket.emit("vacate_seat", { code: ROOM_CODE });
-    }
-
-    // Mobile bottom-tab hand drawers: tapping a tab slides that player's
-    // hand up from the bottom; tapping it again (or the other tab) closes it.
-    function toggleDrawer(seat) {
-        const el = document.getElementById("hand-slot-" + seat);
-        const other = document.getElementById("hand-slot-" + (seat === 1 ? 2 : 1));
-        if (!el) return;
-        const isOpen = el.classList.contains("open");
-        if (other) other.classList.remove("open");
-        el.classList.toggle("open", !isOpen);
+        socket.emit("vacate_seat", withIdentity({ code: ROOM_KEY }));
     }
 </script>
 {% endblock %}

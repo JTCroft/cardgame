@@ -1,7 +1,11 @@
 {% import "components.html.jinja2" as macros %}
 
 {% macro rematch_controls() %}
-    {% if is_spectator %}
+    {% if vs_computer and not is_spectator %}
+        <button type="button" onclick="requestRematch()">New game</button>
+    {% elif vs_computer %}
+        {# Spectating someone else's solo game - only the owner can start a new one. #}
+    {% elif is_spectator %}
         {% if rematch_pending %}
             <p>Waiting for the players to decide on a rematch...</p>
         {% endif %}
@@ -18,28 +22,17 @@
     {% endif %}
 {% endmacro %}
 
-<div class="status-bar">
-    {% if is_spectator %}
-        <span>You are <span class="you">spectating</span> ({{ seats_taken }}/2 seats filled).</span>
-    {% else %}
-        <span>You are <span class="you">{{ my_name or ("Player " ~ my_seat) }}</span> (Player {{ my_seat }}).</span>
-    {% endif %}
-    {% if game_over %}
-        <span>
-            Game finished ({{ p1_score }} - {{ p2_score }}).
-            <button type="button" class="small" onclick="openGameOverModal()">View result</button>
-        </span>
-    {% elif not both_seated %}
-        <span>Waiting for another player to join before the game can start.</span>
-    {% elif your_turn %}
-        <strong>Your move.</strong>
-    {% elif is_spectator %}
-        {% set mover_name = p1_name if game.is_p1_turn else p2_name %}
-        <span>{{ mover_name or ("Player " ~ (1 if game.is_p1_turn else 2)) }} to move.</span>
-    {% else %}
-        <span>Waiting for the other player to move...</span>
-    {% endif %}
-</div>
+{% if is_spectator and not review %}
+<div class="role-badge">Spectating ({{ seats_taken }}/2 seated)</div>
+{% endif %}
+
+{# Whether the *currently displayed* position is terminal - not the same as
+   game_over, which is true for the room as a whole even while scrubbing
+   back through history to a non-final move (e.g. reviewing a finished
+   game, or stepping through one that just ended). Using game.legal_moves
+   directly means the trophy only shows at the actual final position, and
+   the turn indicator is restored at every earlier one. #}
+{% set position_over = not game.legal_moves %}
 
 <div class="game-container">
     {{ macros.draw_board(game.board, game.moves, marker_pos=game.marker, legal_moves=legal_moves if your_turn else None) }}
@@ -47,9 +40,9 @@
         <div class="hand-slot" id="hand-slot-1">
             <div class="seat-header">
                 <span class="hand-label">
-                    {{ p1_name or "Player 1" }}{% if both_seated and not game_over and game.is_p1_turn %}<span class="turnmarker"></span>{% endif %}
+                    {{ p1_name or "Player 1" }}{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="trophy">&#127942;</span>{% endif %}
                 </span>
-                {% if my_seat == 1 and not seats_locked %}
+                {% if my_seat == 1 and not seats_locked and not vs_computer %}
                     <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
                 {% elif is_spectator and not p1_seated and not seats_locked %}
                     <button type="button" class="small" onclick="claimSeat(1)">Join as Player 1</button>
@@ -60,9 +53,9 @@
         <div class="hand-slot" id="hand-slot-2">
             <div class="seat-header">
                 <span class="hand-label">
-                    {{ p2_name or "Player 2" }}{% if both_seated and not game_over and game.is_p2_turn %}<span class="turnmarker"></span>{% endif %}
+                    {{ p2_name or "Player 2" }}{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="trophy">&#127942;</span>{% endif %}
                 </span>
-                {% if my_seat == 2 and not seats_locked %}
+                {% if my_seat == 2 and not seats_locked and not vs_computer %}
                     <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
                 {% elif is_spectator and not p2_seated and not seats_locked %}
                     <button type="button" class="small" onclick="claimSeat(2)">Join as Player 2</button>
@@ -70,29 +63,39 @@
             </div>
             {{ macros.draw_hand(game.p2, highlight_card=taken_card) }}
         </div>
+        {% if game_over %}
+        {# Desktop only - underneath player 2's hand, where it sits in the
+           .hands column. Mobile gets its own copy below the history
+           stepper instead, since .hands collapses to a fixed drawer there
+           and this position wouldn't make sense. #}
+        <div class="rematch-controls rematch-controls-desktop">
+            {{ rematch_controls() }}
+        </div>
+        {% endif %}
     </div>
 </div>
 
 {% if game_over %}
 <div class="history-stepper">
-    <button type="button" onclick="historyGoto(0)" {% if history_index == 0 %}disabled{% endif %}>|&lt; Start</button>
-    <button type="button" onclick="historyStep(-1)" {% if history_index == 0 %}disabled{% endif %}>&lt; Prev</button>
-    <span>Move {{ history_index }} / {{ history_total }}</span>
-    <button type="button" onclick="historyStep(1)" {% if history_index == history_total %}disabled{% endif %}>Next &gt;</button>
-    <button type="button" onclick="historyGoto(history_total)" {% if history_index == history_total %}disabled{% endif %}>End &gt;|</button>
+    <button type="button" onclick="historyGoto(0)" {% if history_index == 0 %}disabled{% endif %} aria-label="Go to start">|&lt;</button>
+    <button type="button" onclick="historyStep(-1)" {% if history_index == 0 %}disabled{% endif %} aria-label="Previous move">&lt;</button>
+    <span class="history-count">{{ history_index }} / {{ history_total }}</span>
+    <button type="button" onclick="historyStep(1)" {% if history_index == history_total %}disabled{% endif %} aria-label="Next move">&gt;</button>
+    <button type="button" onclick="historyGoto({{ history_total }})" {% if history_index == history_total %}disabled{% endif %} aria-label="Go to end">&gt;|</button>
 </div>
-{% if viewing_history %}
-<p><em>Viewing move {{ history_index }} of {{ history_total }} - not the final position.</em></p>
-{% endif %}
 
-<div class="rematch-controls">
+<div class="rematch-controls rematch-controls-mobile">
     {{ rematch_controls() }}
 </div>
 {% endif %}
 
 <div class="mobile-hand-tabs">
-    <button type="button" onclick="toggleDrawer(1)">{{ p1_name or "Player 1" }}'s hand</button>
-    <button type="button" onclick="toggleDrawer(2)">{{ p2_name or "Player 2" }}'s hand</button>
+    <button type="button" id="hand-tab-1" onclick="selectHand(1)">
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="trophy">&#127942;</span>{% endif %}</span>{{ p1_name or "Player 1" }} ({{ game.p1.score() }})
+    </button>
+    <button type="button" id="hand-tab-2" onclick="selectHand(2)">
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="trophy">&#127942;</span>{% endif %}</span>{{ p2_name or "Player 2" }} ({{ game.p2.score() }})
+    </button>
 </div>
 
 {% if game_over %}

@@ -8,8 +8,10 @@ __all__ = (
     "Suit",
     "Card",
     "analyse_moves",
+    "choose_move",
 )
 
 from .game import Board, Hand, Game, ProbEval, Eval
 from .cards import Rank, Suit, Card
 from .analysis import analyse_moves
+from .ai import choose_move

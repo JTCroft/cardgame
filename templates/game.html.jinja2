@@ -1,10 +1,13 @@
 {% extends "base.html.jinja2" %}
 {% block content %}
 <div class="game-container">
+    {% set game_over = not game.legal_moves %}
+    {% set p1_score = game.p1.score() %}
+    {% set p2_score = game.p2.score() %}
     {{ macros.draw_board(game.board, game.moves, marker_pos=game.marker) }}
     <div class="hands">
-        {{ macros.draw_hand(game.p1, turn_indicator=game.is_p1_turn, highlight_card=(game.taken_card if game.moves else none)) }}
-        {{ macros.draw_hand(game.p2, turn_indicator=game.is_p2_turn, highlight_card=(game.taken_card if game.moves else none)) }}
+        {{ macros.draw_hand(game.p1, turn_indicator=game.is_p1_turn, highlight_card=(game.taken_card if game.moves else none), winner=(game_over and p1_score > p2_score)) }}
+        {{ macros.draw_hand(game.p2, turn_indicator=game.is_p2_turn, highlight_card=(game.taken_card if game.moves else none), winner=(game_over and p2_score > p1_score)) }}
     </div>
 </div>
 {% endblock %}

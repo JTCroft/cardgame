@@ -1,5 +1,7 @@
+<h2>Ongoing games</h2>
 {% if not rooms %}
-<p>No rooms yet. <a href="{{ url_for('index') }}">Create one!</a></p>
+<p>No ongoing games yet. <a href="{{ url_for('index') }}">Create a room</a> or
+<a href="{{ url_for('play') }}">play vs computer</a>.</p>
 {% else %}
 <table class="room-list">
     <thead>
@@ -13,14 +15,42 @@
         </tr>
     </thead>
     <tbody>
-        {% for room in rooms %}
+        {% for game in rooms %}
         <tr>
-            <td><span class="room-code">{{ room.code }}</span></td>
-            <td>{{ room.p1_name or "— vacant —" }}{% if room.p1_score is not none %} ({{ room.p1_score }}){% endif %}</td>
-            <td>{{ room.p2_name or "— vacant —" }}{% if room.p2_score is not none %} ({{ room.p2_score }}){% endif %}</td>
-            <td>{{ room.status }}</td>
-            <td>{{ room.spectators }}</td>
-            <td><a class="button" href="{{ url_for('room_view', code=room.code) }}">Open</a></td>
+            <td><span class="room-code">{{ "Solo" if game.is_solo else game.code }}</span></td>
+            <td>{{ game.p1_name or "— vacant —" }}{% if game.p1_score is not none %} ({{ game.p1_score }}){% endif %}</td>
+            <td>{{ game.p2_name or "— vacant —" }}{% if game.p2_score is not none %} ({{ game.p2_score }}){% endif %}</td>
+            <td>{{ game.status }}</td>
+            <td>{{ game.spectators }}</td>
+            <td>
+                <a class="button" href="{{ url_for('spectate_solo', player_id=game.code) if game.is_solo else url_for('room_view', code=game.code) }}">{{ "Join" if (not game.is_solo and game.status == "waiting for players") else "Spectate" }}</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if finished_games %}
+<h2>Recently finished games</h2>
+<table class="room-list">
+    <thead>
+        <tr>
+            <th>Room</th>
+            <th>Player 1</th>
+            <th>Player 2</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for game in finished_games %}
+        <tr>
+            <td><span class="room-code">{{ "Solo" if game.is_solo else game.code }}</span></td>
+            <td>{{ game.p1_name or "— vacant —" }}{% if game.p1_score is not none %} ({{ game.p1_score }}){% endif %}</td>
+            <td>{{ game.p2_name or "— vacant —" }}{% if game.p2_score is not none %} ({{ game.p2_score }}){% endif %}</td>
+            <td>
+                <a class="button" href="{{ url_for('review_solo', entry_id=game.id) if game.is_solo else url_for('review_room', entry_id=game.id) }}">Review</a>
+            </td>
         </tr>
         {% endfor %}
     </tbody>

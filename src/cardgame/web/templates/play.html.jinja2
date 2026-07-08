@@ -1,0 +1,17 @@
+{% extends "base.html.jinja2" %}
+{% block title %}{% if review_entry_id %}Reviewing a finished game{% elif spectate_player_id %}Spectating{% else %}Play vs Computer{% endif %} - Cross Kings{% endblock %}
+{% block content %}
+<div id="game-state">
+    <p>Loading...</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // A solo game is just a room keyed by the owner's own player id rather
+    // than a 4-letter code (see app.py's module docstring) - spectating
+    // someone else's means using *their* id as ROOM_KEY instead of yours.
+    ROOM_KEY = {{ (spectate_player_id or none) | tojson }} || PLAYER_ID;
+    REVIEW_ENTRY_ID = {{ (review_entry_id or none) | tojson }};
+</script>
+{% endblock %}

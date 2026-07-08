@@ -9,6 +9,10 @@ or join a room someone shared with you.</p>
     <button type="submit">Create a new room</button>
 </form>
 
+<h2>Play against the computer</h2>
+<p>Play solo against a basic computer opponent.</p>
+<a href="{{ url_for('play') }}"><button type="button">Play vs computer</button></a>
+
 <h2>Join a room</h2>
 <form method="post" action="{{ url_for('join_room_form') }}">
     <input type="text" class="room-code-input" name="code" maxlength="4" placeholder="ABCD" required pattern="[A-Za-z]{4}">
