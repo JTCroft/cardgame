@@ -94,6 +94,7 @@ def _centrality_sum(hand):
     return total
 
 
+
 # Cards pre-encoded for the leaf potential loop: a king is -1, anything else
 # is its Hand.as_int bit. The remaining-card multiset is threaded down the
 # search as a tuple of these tokens, shrinking by the taken card each ply.
@@ -180,6 +181,11 @@ class SearchParams:
     potential_weight: float = 0.238
     centrality_weight: float = 7.562
     mobility_weight: float = 0.378
+    # (Empirical per-rank-class material and same-suit proximity features
+    # were tried here and removed: arena-refuted / no fit gain - the DP
+    # potential and centrality terms already carry that information from
+    # better sources. Measured tables live in the 2026-07 analysis notes
+    # and git history.)
     # Constant added to every heuristic leaf: the value of being on move
     # (the mover takes the best remaining card first). Affects only
     # comparisons against terminal values, where it correctly encodes
