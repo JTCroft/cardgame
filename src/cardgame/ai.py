@@ -318,7 +318,7 @@ class AlphaBetaBot:
         return resolutions
 
     def _chance_value(
-        self, resolutions, depth, alpha, beta, me, opp, remaining, deadline
+        self, resolutions, depth, alpha, beta, me, opp, remaining, mask, deadline
     ):
         """Expected value over equally-likely face-down resolutions (Star1):
         each child is searched only in the window of contributions that could
@@ -339,7 +339,7 @@ class AlphaBetaBot:
             child_me = _add_card(me, card)
             total -= self._search(
                 child, depth - 1, -hi, -lo, opp, child_me,
-                _without(remaining, _TOKEN[card]), deadline,
+                _without(remaining, _TOKEN[card]), mask, deadline,
             )
             upper = (total + spread) / n
             if upper <= alpha:
@@ -364,17 +364,46 @@ class AlphaBetaBot:
             self._exact_cache[game.moves] = value
         return value
 
-    def _search(self, game, depth, alpha, beta, me, opp, remaining, deadline):
+    def _search(self, game, depth, alpha, beta, me, opp, remaining, mask, deadline):
         if time.perf_counter() > deadline:
             raise _Timeout
         if not game.legal_moves:
             return self._terminal_value(me, opp)
         if 36 - len(game.moves) <= self.params.exact_leaf_cards:
             return self._exact_leaf(game)
+        # Transposition probe. `mask` is the taken-cell bitmask; with the
+        # marker and both hands it fully determines the subgame (hands alone
+        # don't - the same revealed card can have come from different
+        # face-down cells). Entries are (depth, flag, value, best_marker)
+        # with flag 0 exact / 1 lower bound / -1 upper bound (fail-soft);
+        # a shallower entry can't answer for a deeper request but its best
+        # move still improves ordering, which is where an iterative
+        # deepener earns most of its table hits.
+        key = (mask, game.moves[-1], me, opp)
+        entry = self._tt.get(key)
+        tt_move = None
+        if entry is not None:
+            tt_depth, flag, value, tt_move = entry
+            if tt_depth >= depth and (
+                flag == 0
+                or (flag == 1 and value >= beta)
+                or (flag == -1 and value <= alpha)
+            ):
+                self._tt_cuts += 1
+                return value
         if depth == 0:
             return self._evaluate_leaf(game, me, opp, remaining)
+        markers = self._ordered_markers(game, me, opp)
+        if tt_move is not None and markers[0][0] != tt_move:
+            for i, item in enumerate(markers):
+                if item[0] == tt_move:
+                    markers.insert(0, markers.pop(i))
+                    break
+        alpha0 = alpha
         best = -self.params.value_bound
-        for marker, facedown in self._ordered_markers(game, me, opp):
+        best_marker = None
+        for marker, facedown in markers:
+            child_mask = mask | (1 << (marker[0] * 6 + marker[1]))
             resolutions = self._resolutions(game, marker, facedown)
             if len(resolutions) == 1:
                 child = resolutions[0]
@@ -382,24 +411,34 @@ class AlphaBetaBot:
                 child_me = _add_card(me, card)
                 value = -self._search(
                     child, depth - 1, -beta, -alpha, opp, child_me,
-                    _without(remaining, _TOKEN[card]), deadline,
+                    _without(remaining, _TOKEN[card]), child_mask, deadline,
                 )
             else:
                 value = self._chance_value(
-                    resolutions, depth, alpha, beta, me, opp, remaining, deadline
+                    resolutions, depth, alpha, beta, me, opp, remaining,
+                    child_mask, deadline,
                 )
             if value > best:
                 best = value
+                best_marker = marker
                 if value > alpha:
                     alpha = value
                 if alpha >= beta:
                     break
+        if entry is None or entry[0] <= depth:
+            flag = -1 if best <= alpha0 else (1 if best >= beta else 0)
+            self._tt[key] = (depth, flag, best, best_marker)
         return best
 
     def _search_root(self, game):
         params = self.params
         bound = params.value_bound
         self._exact_cache = {}
+        # Fresh table per root search: keys are per-deal (card -> cell
+        # mappings differ between deals) and per-position entries go stale
+        # as the game advances anyway (the taken-cell mask only grows).
+        self._tt = {}
+        self._tt_cuts = 0
         start = time.perf_counter()
         deadline = start + self.time_budget
         if len(game.moves) % 2 == 0:
@@ -408,6 +447,9 @@ class AlphaBetaBot:
             me, opp = game.p2.as_int, game.p1.as_int
 
         remaining = tuple(_TOKEN[card] for card in _remaining_cards(game))
+        mask = 0
+        for row, col in game.moves:
+            mask |= 1 << (row * 6 + col)
         # The root is one node: materialise its children once and reuse
         # them across every deepening iteration.
         moves = [
@@ -425,18 +467,19 @@ class AlphaBetaBot:
             scores = {}
             try:
                 for marker, resolutions in moves:
+                    child_mask = mask | (1 << (marker[0] * 6 + marker[1]))
                     if len(resolutions) == 1:
                         child = resolutions[0]
                         card = child.taken_card
                         child_me = _add_card(me, card)
                         value = -self._search(
                             child, depth - 1, -bound, -alpha, opp, child_me,
-                            _without(remaining, _TOKEN[card]), deadline,
+                            _without(remaining, _TOKEN[card]), child_mask, deadline,
                         )
                     else:
                         value = self._chance_value(
                             resolutions, depth, alpha, bound, me, opp,
-                            remaining, deadline,
+                            remaining, child_mask, deadline,
                         )
                     scores[marker] = value
                     if value > alpha:
@@ -463,6 +506,8 @@ class AlphaBetaBot:
             "completed_depth": completed_depth,
             "interrupted": interrupted,
             "elapsed": time.perf_counter() - start,
+            "tt_entries": len(self._tt),
+            "tt_cuts": self._tt_cuts,
         }
         return best_marker
 
