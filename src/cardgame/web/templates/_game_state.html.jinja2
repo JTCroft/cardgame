@@ -84,6 +84,69 @@
     <button type="button" onclick="historyGoto({{ history_total }})" {% if history_index == history_total %}disabled{% endif %} aria-label="Go to end">&gt;|</button>
 </div>
 
+{% if move_analysis %}
+<div class="move-analysis">
+    {% if move_analysis.pending %}
+        <p class="analysis-note">Move comparison for this position is still being computed&hellip;</p>
+    {% else %}
+        {% macro analysis_card(row) %}
+            {%- if row.card.facedown -%}
+                Face-down (row {{ row.marker[0] + 1 }}, col {{ row.marker[1] + 1 }}){% if row.revealed %} &rarr; <span class="cardtext{% if row.revealed.suit_name in ("hearts", "diamonds") %} red{% endif %}">{{ row.revealed }}</span>{% endif %}
+            {%- else -%}
+                <span class="cardtext{% if row.card.suit_name in ("hearts", "diamonds") %} red{% endif %}">{{ row.card }}</span>
+            {%- endif -%}
+        {% endmacro %}
+        <h3>Move comparison <span class="analysis-sub">{{ move_analysis.mover_name }} to move</span></h3>
+        <div class="outcome-heatmap">
+            {% set columns = "repeat(" ~ move_analysis.heatmap.cells|length ~ ", 1fr)" %}
+            <div class="outcome-heatmap-row" style="grid-template-columns: {{ columns }};">
+                {% for cell in move_analysis.heatmap.cells %}
+                <div class="outcome-heatmap-cell{% if cell.zero %} outcome-heatmap-cell-zero{% endif %}"
+                     style="background-color: {{ cell.color }}; color: {{ cell.text_color }};"
+                     title="{{ cell.label }} pts: {{ "%.0f"|format(cell.pct) }}% of outcomes">{{ "%.0f"|format(cell.pct) }}%</div>
+                {% endfor %}
+            </div>
+            <div class="outcome-heatmap-ticks" style="grid-template-columns: {{ columns }};">
+                {% for cell in move_analysis.heatmap.cells %}
+                <span class="outcome-heatmap-tick">{% if cell.zero %}Draw{% else %}{{ cell.label }}{% endif %}</span>
+                {% endfor %}
+            </div>
+            <div class="outcome-heatmap-names">
+                <span>{{ p2_name or "Player 2" }}</span>
+                <span>{{ p1_name or "Player 1" }}</span>
+            </div>
+        </div>
+        <div class="analysis-table-wrap">
+            <table class="analysis-table">
+                <thead>
+                    <tr>
+                        <th>Take</th>
+                        <th title="Swing in ({{ move_analysis.mover_name }} - {{ move_analysis.opponent_name }}) vs the best move">Swing</th>
+                        <th title="Change in {{ move_analysis.mover_name }}'s own average points vs the best move">{{ move_analysis.mover_name }}</th>
+                        <th title="Change in {{ move_analysis.opponent_name }}'s average points vs the best move (positive = they score more)">{{ move_analysis.opponent_name }}</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in move_analysis.rows %}
+                    <tr class="{% if row.played %}analysis-played{% endif %}">
+                        <td>{{ analysis_card(row) }}</td>
+                        <td class="num">{{ "%+.2f"|format(row.combined) }}</td>
+                        <td class="num">{{ "%+.2f"|format(row.defensive) }}</td>
+                        <td class="num">{{ "%+.2f"|format(row.offensive) }}</td>
+                        <td class="badges">
+                            {%- if row.best %}<span class="badge badge-best">best</span>{% endif -%}
+                            {%- if row.played %}<span class="badge badge-played">played</span>{% endif -%}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% endif %}
+</div>
+{% endif %}
+
 <div class="rematch-controls rematch-controls-mobile">
     {{ rematch_controls() }}
 </div>

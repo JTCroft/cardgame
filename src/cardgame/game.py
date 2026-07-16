@@ -4,6 +4,7 @@ from operator import itemgetter, lt, le, gt, ge, eq
 from itertools import groupby
 from math import factorial
 from collections import Counter
+from functools import lru_cache
 from .scoring import score_dp, score_with_king_allocation
 from .cards import Card, Rank
 
@@ -18,6 +19,14 @@ env = Environment(
 # 31 points - [A♣, 2♣, 2♠, 3♥, 3♣, 3♠, 4♣, 4♦, 4♠, 5♣, 5♠, 6♥, 6♣, 6♠, K♥, K♣]
 # 5 points -  [A♥, A♠, 2♥, 2♦, 3♦, 4♥, 5♥, 5♦, 6♦, 7♥, 7♠, 8♥, 8♣, 8♦, 8♠]
 _SCORE_DIFFERENCE_BOUND = 26
+
+# Scoring dominates the tree search (terminal positions outnumber interior
+# ones several-fold and each used to pay two uncached DP solves), and
+# transpositions make hands recur constantly, so a big cache pays for
+# itself many times over. Hand.score routes through this too.
+_cached_score = lru_cache(maxsize=1 << 20)(score_dp)
+
+_FACTORIAL = tuple(factorial(n) for n in range(13))
 
 
 def _common_prefix(move_sequences):
@@ -79,15 +88,18 @@ class Board(tuple):
         return self.template.render(board=self)
 
     def resolve(self, row, col):
-        current_board = list(self)
-        row_to_change = list(current_board[row])
-        for i, card in enumerate(self.facedown_cards):
-            row_to_change[col] = card
-            current_board[row] = tuple(row_to_change)
-            yield self.__class__(
-                tuple(current_board),
-                self.facedown_cards[:i] + self.facedown_cards[i + 1 :],
+        # Reuses the five unchanged row tuples and bypasses __new__'s
+        # re-tupling walk - this runs once per possibility of every chance
+        # node in the search.
+        before, target, after = self[:row], self[row], self[row + 1 :]
+        left, right = target[:col], target[col + 1 :]
+        facedown_cards = self.facedown_cards
+        for i, card in enumerate(facedown_cards):
+            board = tuple.__new__(
+                self.__class__, before + (left + (card,) + right,) + after
             )
+            board.facedown_cards = facedown_cards[:i] + facedown_cards[i + 1 :]
+            yield board
 
 
 class Hand(tuple):
@@ -119,7 +131,7 @@ class Hand(tuple):
     def score(self, king_info=False):
         hand_int, number_of_kings = self.as_int
         if not king_info:
-            return score_dp(hand_int, number_of_kings)
+            return _cached_score(hand_int, number_of_kings)
         best_score, king_cards = score_with_king_allocation(hand_int, number_of_kings)
         return best_score, king_cards
 
@@ -246,6 +258,25 @@ class ProbEval(Counter):
         s = sum(k * v for k, v in self.items())
         return w, d, s
 
+    def _bound_evals(self):
+        """(lower_bound.eval, upper_bound.eval) in a single pass with no
+        Counter copies - equivalent to self.bound(-26).eval /
+        self.bound(+26).eval, which the search consults constantly."""
+        w = d = s = observed = 0
+        for k, v in self.items():
+            observed += v
+            if k > 0:
+                w += v
+            elif k == 0:
+                d += v
+            s += k * v
+        remaining = self.multiplicity - observed
+        filled = _SCORE_DIFFERENCE_BOUND * remaining
+        return (
+            Eval(self.multiplicity, w, d, s - filled),
+            Eval(self.multiplicity, w + remaining, d, s + filled),
+        )
+
     def copy(self):
         return ProbEval(multiplicity=self.multiplicity, initial_counts=dict(self))
 
@@ -282,16 +313,16 @@ class ProbEval(Counter):
         return inst
 
     def __lt__(self, other):
-        return self.upper_bound.eval < other.lower_bound.eval
+        return self._bound_evals()[1] < other._bound_evals()[0]
 
     def __lte__(self, other):
-        return self.upper_bound.eval <= other.lower_bound.eval
+        return self._bound_evals()[1] <= other._bound_evals()[0]
 
     def __gt__(self, other):
-        return self.lower_bound.eval > other.upper_bound.eval
+        return self._bound_evals()[0] > other._bound_evals()[1]
 
     def __gte__(self, other):
-        return self.lower_bound.eval >= other.upper_bound.eval
+        return self._bound_evals()[0] >= other._bound_evals()[1]
 
     def __eq__(self, other):
         return bool(
@@ -334,7 +365,13 @@ class Game:
 
     @property
     def legal_moves(self):
-        return self.possible_moves[self.marker] - set(self.moves)
+        # Memoised: games are immutable, and the search consults this
+        # several times per node.
+        try:
+            return self._legal_moves_cache
+        except AttributeError:
+            self._legal_moves_cache = self.possible_moves[self.marker] - set(self.moves)
+            return self._legal_moves_cache
 
     def all_moves(self):
         for row, col in self.legal_moves:
@@ -378,7 +415,7 @@ class Game:
 
     @property
     def multiplicity(self):
-        return factorial(len(self.board.facedown_cards))
+        return _FACTORIAL[len(self.board.facedown_cards)]
 
     @property
     def p1(self):
@@ -430,6 +467,36 @@ class Game:
         row, col = self.marker
         return self.board[row][col]
 
+    def _hand_state(self):
+        """Both hands as scoring ints, mover first: (mover_int,
+        mover_kings, other_int, other_kings), in Hand.as_int's encoding.
+        Threaded incrementally through evaluate so terminals score from
+        the cache with no Hand construction."""
+        hands = [[0, 0], [0, 0]]
+        board = self.board
+        for i, (row, col) in enumerate(self.moves):
+            card = board[row][col]
+            if card[0] is Rank.K:
+                hands[i % 2][1] += 1
+            else:
+                hands[i % 2][0] |= 1 << ((card[1] * 8) + card[0] - 1)
+        mover = len(self.moves) % 2
+        return (*hands[mover], *hands[1 - mover])
+
+    @staticmethod
+    def _child_hand_state(state, card):
+        """_hand_state after the mover takes `card`: the perspectives swap
+        and the card joins what is now the opponent's hand."""
+        mover_int, mover_kings, other_int, other_kings = state
+        if card[0] is Rank.K:
+            return (other_int, other_kings, mover_int, mover_kings + 1)
+        return (
+            other_int,
+            other_kings,
+            mover_int | (1 << ((card[1] * 8) + card[0] - 1)),
+            mover_kings,
+        )
+
     @property
     def move_evals(self):
         move_evals = {}
@@ -450,17 +517,31 @@ class Game:
                 ]["resolved_evals"][move[0].taken_card]
         return move_evals
 
-    def score_walk(self):
+    def score_walk(self, _state=None):
+        # _state is the same threaded (mover_int, mover_kings, other_int,
+        # other_kings) evaluate uses, so terminals score from the cache
+        # with no Hand construction.
+        if _state is None:
+            _state = self._hand_state()
         if not self.legal_moves:
             multiplicity = self.multiplicity
+            diff = _cached_score(_state[0], _state[1]) - _cached_score(
+                _state[2], _state[3]
+            )
             return ProbEval(
                 multiplicity=multiplicity,
-                initial_counts={self.negamax_score: multiplicity},
+                initial_counts={diff: multiplicity},
             ), (-1, -1)
+        child_state = self._child_hand_state
         best_score = max(
             (
                 -ProbEval.combine(
-                    [move_possibility.score_walk()[0] for move_possibility in move]
+                    [
+                        move_possibility.score_walk(
+                            child_state(_state, move_possibility.taken_card)
+                        )[0]
+                        for move_possibility in move
+                    ]
                 ),
                 move[0].marker,
             )
@@ -470,57 +551,84 @@ class Game:
 
     @staticmethod
     def _get_bounds(branch_multiplicity, move_score, alpha, beta):
-        # How good does the branch evaluation have to be
-        # So that the LOWER BOUND of the combined eval with the move score
-        # would be ABOVE beta
+        # Same arithmetic as the original Counter-copy formulation, one
+        # pass and no allocation: filling the remaining unevaluated mass
+        # at -26 adds (0, 0, -26*rem) to the observed (w, d, s); at +26 it
+        # adds (rem, 0, +26*rem).
+        w, d, s = move_score.observed_wds
         remaining_unevaled_after_branch = (
             move_score.multiplicity - move_score.observed - branch_multiplicity
         )
-        ms_copy = move_score.copy()
-        ms_copy[-_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
+        filled = _SCORE_DIFFERENCE_BOUND * remaining_unevaled_after_branch
+        # How good does the branch evaluation have to be
+        # So that the LOWER BOUND of the combined eval with the move score
+        # would be ABOVE beta
         subbeta = Eval(
-            branch_multiplicity, *(b - m for b, m in zip(beta, ms_copy.observed_wds))
+            branch_multiplicity, beta[0] - w, beta[1] - d, beta[2] - (s - filled)
         )
         # How bad does the branch evaluation have to be
         # So that the UPPER BOUND of the combined eval with the move score
         # would be BELOW alpha
-        ms_copy = move_score.copy()
-        ms_copy[_SCORE_DIFFERENCE_BOUND] += remaining_unevaled_after_branch
         subalpha = Eval(
-            branch_multiplicity, *(a - m for a, m in zip(alpha, ms_copy.observed_wds))
+            branch_multiplicity,
+            alpha[0] - (w + remaining_unevaled_after_branch),
+            alpha[1] - d,
+            alpha[2] - (s + filled),
         )
 
-        base = ProbEval(branch_multiplicity)
-        lb = base.lower_bound.eval
-        ub = base.upper_bound.eval
+        branch_bound = _SCORE_DIFFERENCE_BOUND * branch_multiplicity
+        lb = Eval(branch_multiplicity, 0, 0, -branch_bound)
+        ub = Eval(branch_multiplicity, branch_multiplicity, 0, branch_bound)
         if subalpha < lb:
             subalpha = lb
         if subbeta > ub:
             subbeta = ub
         return subalpha, subbeta
 
-    def evaluate(self, alpha=None, beta=None):
+    def evaluate(self, alpha=None, beta=None, _state=None):
+        # Note: unexplored-branch placeholders here deliberately use the
+        # loose global ±26. Tighter per-position bounds (from scoring's
+        # monotonicity: a hand vs the hand plus everything left on the
+        # board) were tried and are provably sound, but this engine's
+        # fail-soft bookkeeping folds the observed mass of partially
+        # evaluated moves into complete results, which is only safe when a
+        # chance move is abandoned under the most optimistic completion
+        # possible anywhere - tightening the abandonment check corrupts
+        # evaluations (found by counterexample), and tightening the other
+        # fill sites measurably prunes nothing. Such bounds suit search
+        # schemes with explicit per-node intervals instead.
         multiplicity = self.multiplicity
         if not self.legal_moves:
+            # _state is the incrementally threaded (mover_int, mover_kings,
+            # other_int, other_kings) - equal to negamax_score, minus the
+            # Hand construction, with the scoring DP cached.
+            if _state is None:
+                _state = self._hand_state()
+            diff = _cached_score(_state[0], _state[1]) - _cached_score(
+                _state[2], _state[3]
+            )
             return {
-                "Evaluation": ProbEval(
-                    multiplicity, {self.negamax_score: multiplicity}
-                ),
+                "Evaluation": ProbEval(multiplicity, {diff: multiplicity}),
                 "Deterministic optimal moves": tuple(),
             }
+        if _state is None:
+            _state = self._hand_state()
         if not alpha:
-            base = ProbEval(multiplicity)
-            alpha = base.lower_bound.eval
-            beta = base.upper_bound.eval
+            bound_sum = _SCORE_DIFFERENCE_BOUND * multiplicity
+            alpha = Eval(multiplicity, 0, 0, -bound_sum)
+            beta = Eval(multiplicity, multiplicity, 0, bound_sum)
         best_score = ProbEval(multiplicity).lower_bound
         best_move_seq = ((-1, -1),)
         ordered_moves = sorted(self.all_moves(), key=len)
         detailed_move_scores = {}
+        child_state = self._child_hand_state
 
         for move in ordered_moves:
             move_marker = move[0].marker
             if len(move) == 1:
-                move_eval = move[0].evaluate(-beta, -alpha)
+                move_eval = move[0].evaluate(
+                    -beta, -alpha, _state=child_state(_state, move[0].taken_card)
+                )
                 move_score = -(move_eval["Evaluation"])
                 detailed_move_scores[move_marker] = move_score
                 if (move_score, move_marker) > (best_score, best_move_seq[0]):
@@ -528,7 +636,7 @@ class Game:
                     best_move_seq = (move[0].taken_card,) + move_eval[
                         "Deterministic optimal moves"
                     ]
-                alpha = max(best_score.lower_bound.eval, alpha)
+                alpha = max(best_score._bound_evals()[0], alpha)
             else:
                 branch_multiplicity = move[0].multiplicity
                 detailed_move_scores[move_marker] = {
@@ -542,7 +650,11 @@ class Game:
                     subalpha, subbeta = self._get_bounds(
                         branch_multiplicity, move_score, alpha, beta
                     )
-                    possibility_eval = possibility.evaluate(-subbeta, -subalpha)
+                    possibility_eval = possibility.evaluate(
+                        -subbeta,
+                        -subalpha,
+                        _state=child_state(_state, possibility.taken_card),
+                    )
                     possibility_score = -(possibility_eval["Evaluation"])
                     possibility_move_seqs.append(
                         possibility_eval["Deterministic optimal moves"]
@@ -554,9 +666,13 @@ class Game:
                     if (move_score, move_marker) > (best_score, best_move_seq[0]):
                         best_score = move_score
                         curr_move_best_move = True
-                    if move_score.upper_bound.eval < alpha:
+                    move_lower, move_upper = move_score._bound_evals()
+                    if move_upper < alpha:
                         break
-                    alpha = max(best_score.lower_bound.eval, alpha)
+                    if best_score is move_score:
+                        alpha = max(move_lower, alpha)
+                    else:
+                        alpha = max(best_score._bound_evals()[0], alpha)
                     if alpha > beta and not (-alpha) > (-beta):
                         break
                 if curr_move_best_move:

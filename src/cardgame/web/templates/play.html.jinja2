@@ -4,6 +4,17 @@
 <div id="game-state">
     <p>Loading...</p>
 </div>
+{% if live_eval %}
+{# Deliberately outside #game-state: board re-renders replace that div
+   wholesale, and the live-eval panel updates on its own (faster) cadence
+   over the "live_eval" socket event. #}
+<div id="live-eval">
+    <div class="move-analysis live-eval-panel">
+        <h3>Live evaluation</h3>
+        <p class="analysis-note">The search starts with the first update&hellip;</p>
+    </div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
@@ -13,5 +24,6 @@
     // someone else's means using *their* id as ROOM_KEY instead of yours.
     ROOM_KEY = {{ (spectate_player_id or none) | tojson }} || PLAYER_ID;
     REVIEW_ENTRY_ID = {{ (review_entry_id or none) | tojson }};
+    LIVE_EVAL = {{ (live_eval or false) | tojson }};
 </script>
 {% endblock %}

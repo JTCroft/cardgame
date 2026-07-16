@@ -10,8 +10,12 @@ or join a room someone shared with you.</p>
 </form>
 
 <h2>Play against the computer</h2>
-<p>Play solo against a basic computer opponent.</p>
+<p>Play solo against the computer opponent.</p>
 <a href="{{ url_for('play') }}"><button type="button">Play vs computer</button></a>
+<p>Or with a live evaluation panel: the engine analyses the current
+position continuously while you think, showing its best-to-worst move
+ranking as bounds tighten and moves get ruled out.</p>
+<a href="{{ url_for('play_live') }}"><button type="button">Play vs computer (live eval)</button></a>
 
 <h2>Join a room</h2>
 <form method="post" action="{{ url_for('join_room_form') }}">

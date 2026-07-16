@@ -189,6 +189,115 @@
         text-align: center;
         white-space: nowrap;
     }
+    .move-analysis {
+        width: 650px;
+        max-width: 100%;
+        margin: 10px 0;
+        background: #2b2b2b;
+        border: 1px solid #4a4a4a;
+        border-radius: 8px;
+        padding: 10px 14px;
+    }
+    .move-analysis h3 {
+        margin: 4px 0 6px;
+        font-size: 1.05em;
+    }
+    .analysis-sub {
+        color: #aaa;
+        font-weight: normal;
+        font-size: 0.85em;
+        margin-left: 6px;
+    }
+    .analysis-note {
+        color: #bbb;
+        font-size: 0.85em;
+        margin: 4px 0 8px;
+    }
+    .analysis-table-wrap {
+        overflow-x: auto;
+    }
+    .analysis-table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 0.9em;
+    }
+    .analysis-table th, .analysis-table td {
+        text-align: left;
+        padding: 4px 10px 4px 0;
+        border-bottom: 1px solid #3d3d3d;
+        white-space: nowrap;
+    }
+    .analysis-table th {
+        color: #999;
+        font-weight: normal;
+        cursor: default;
+    }
+    .analysis-table tr:last-child td { border-bottom: none; }
+    .analysis-table td.num {
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+    }
+    .analysis-table th:nth-child(n+2) { text-align: right; }
+    .analysis-table .badges { text-align: right; }
+    .analysis-played td { background: rgba(124, 184, 255, 0.08); }
+    .cardtext { font-weight: bold; }
+    .cardtext.red { color: #ff7a7a; }
+    .badge {
+        display: inline-block;
+        font-size: 0.75em;
+        padding: 1px 8px;
+        border-radius: 999px;
+        margin-left: 4px;
+    }
+    .badge-best { background: #2e5c34; color: #b8f0c0; }
+    .badge-played { background: #2e4a6b; color: #bcd9ff; }
+    .badge-out { background: #4a4a4a; color: #aaa; }
+    .analysis-out td { opacity: 0.55; }
+    .outcome-heatmap {
+        margin: 10px 0 14px;
+    }
+    .outcome-heatmap-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 10px;
+        margin-bottom: 6px;
+        font-size: 0.85em;
+    }
+    .outcome-heatmap-title { color: #aaa; }
+    .outcome-heatmap-mode { font-weight: bold; white-space: nowrap; }
+    .outcome-heatmap-row {
+        display: grid;
+        gap: 2px;
+        height: 34px;
+    }
+    .outcome-heatmap-cell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 3px;
+        font-size: 0.72em;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+    }
+    .outcome-heatmap-cell-zero {
+        box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.55);
+    }
+    .outcome-heatmap-ticks {
+        display: grid;
+        gap: 2px;
+        margin-top: 4px;
+        font-size: 0.72em;
+        color: #999;
+        text-align: center;
+    }
+    .outcome-heatmap-names {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 2px;
+        font-size: 0.8em;
+        color: #bbb;
+    }
     .rematch-controls {
         display: flex;
         align-items: center;
@@ -436,6 +545,18 @@
         .history-count {
             min-width: 3.5em;
             font-size: 0.85em;
+        }
+        .move-analysis {
+            width: 100%;
+            margin: 10px auto;
+            padding: 8px 10px;
+            font-size: 0.95em;
+        }
+        .outcome-heatmap-cell {
+            font-size: 0.6em;
+        }
+        .outcome-heatmap-ticks {
+            font-size: 0.6em;
         }
         .rematch-controls-desktop { display: none; }
         .rematch-controls-mobile {

@@ -56,6 +56,7 @@ multiple workers):
 import os
 import random
 import secrets
+import threading
 
 from flask import (
     Flask,
@@ -70,10 +71,12 @@ from flask_socketio import leave_room as sio_leave_room
 from jinja2 import ChoiceLoader, PackageLoader
 
 from ..game import Game
-from .extensions import socketio
+from .extensions import app_holder, socketio
 from .identity import _MAX_NAME_LENGTH, _normalize_player_id
 from .rooms import (
     _broadcast_state,
+    _ensure_analysis_worker,
+    _ensure_live_eval,
     _finished_rooms_lock,
     _find_finished_room_entry,
     _get_or_create_room,
@@ -161,6 +164,15 @@ def create_app():
         # this loads.
         return render_template("play.html.jinja2")
 
+    @app.get("/play/live")
+    def play_live():
+        # Same solo-vs-computer game as /play, but with the anytime search
+        # (cardgame.search_alt) continuously evaluating the current
+        # position and streaming a live move ranking to the page. The mode
+        # flag travels with the page's "join" (see handler below) since the
+        # room itself is only resolved/created there.
+        return render_template("play.html.jinja2", live_eval=True)
+
     @app.get("/play/<player_id>")
     def spectate_solo(player_id):
         target_id = _normalize_player_id(player_id)
@@ -201,6 +213,9 @@ def create_app():
 
 app = create_app()
 socketio.init_app(app, async_mode="threading")
+# Background threads in rooms.py render templates; they need the app to
+# enter an app context (see extensions.app_holder).
+app_holder["app"] = app
 
 
 @socketio.on("join")
@@ -239,6 +254,11 @@ def handle_join(data):
     sid = request.sid
     with room.lock:
         room.sid_players[sid] = player_id
+        # Live-eval mode is an owner's choice of entry point (/play/live vs
+        # /play) for their own solo room; other pages send no flag at all
+        # and leave the mode as it is.
+        if room.computer_seat is not None and code == player_id and "live_eval" in data:
+            room.live_eval = bool(data.get("live_eval"))
         # Pick up this player's client-stored name (if any), in case they
         # set it while visiting a different room.
         if name:
@@ -278,6 +298,8 @@ def handle_join(data):
         socketio.emit("need_name", {}, to=sid)
     else:
         _broadcast_state(code, room)
+    _ensure_live_eval(code, room)
+    _ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
 
@@ -418,6 +440,7 @@ def handle_move(data):
     _broadcast_state(code, room)
     _broadcast_lobby()
     _maybe_play_computer_move(code, room)
+    _ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
 
@@ -436,6 +459,11 @@ def handle_history_step(data):
     if review_entry_id:
         entry = _find_finished_room_entry(review_entry_id)
         if entry is None:
+            socketio.emit(
+                "error_message",
+                {"message": "That finished game could no longer be found."},
+                to=request.sid,
+            )
             return
         with _finished_rooms_lock:
             total = len(entry["game"].moves)
@@ -474,6 +502,11 @@ def handle_history_goto(data):
     if review_entry_id:
         entry = _find_finished_room_entry(review_entry_id)
         if entry is None:
+            socketio.emit(
+                "error_message",
+                {"message": "That finished game could no longer be found."},
+                to=request.sid,
+            )
             return
         with _finished_rooms_lock:
             total = len(entry["game"].moves)
@@ -526,12 +559,18 @@ def handle_request_rematch(data):
             room.rematch_requested_by = None
             room.history_index.clear()
             room.game_over_seen.clear()
+            room.analysis = None
+            room.analysis_inflight = set()
+            room.analysis_abort = threading.Event()
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
             room.game = Game.deal()
             room.rematch_requested_by = None
             room.history_index.clear()
             room.game_over_seen.clear()
+            room.analysis = None
+            room.analysis_inflight = set()
+            room.analysis_abort = threading.Event()
         else:
             room.rematch_requested_by = player_id
 
@@ -562,6 +601,9 @@ def handle_respond_rematch(data):
             room.game = Game.deal()
             room.history_index.clear()
             room.game_over_seen.clear()
+            room.analysis = None
+            room.analysis_inflight = set()
+            room.analysis_abort = threading.Event()
         room.rematch_requested_by = None
 
     _broadcast_state(code, room)

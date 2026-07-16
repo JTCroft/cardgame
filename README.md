@@ -156,6 +156,81 @@ from cardgame import analyse_moves
 analyse_moves(game)
 ```
 
+### Iterative bounded search with live rankings
+
+`Game.evaluate` is depth-first, so it can say almost nothing until it is
+nearly finished. `cardgame.search_alt` runs the *same* evaluation - the
+identical &plusmn;26 unknown-outcome fills, sub-window arithmetic, move
+abandonment, and fail-high guard, so its results provably match - but
+resumably, one quantum at a time, with moves revisitable in any order.
+That turns the solver into an anytime search: at every step the root can
+report each move's partial outcome distribution, a best-to-worst ranking
+(ordered by the average of each move's already-resolved outcomes - nearby
+leaves correlate, so the resolved share is representative), the incumbent
+best move, and whether that move is already *proven* best (every rival
+abandoned or completed worse) - which can happen before its exact value
+is known, a stop the all-or-nothing depth-first solver cannot make.
+Subtrees small enough for the calibrated exact gate are solved by
+`Game.evaluate` directly, under the search's current window. Children are
+instantiated lazily and deleted as soon as they are merged, abandoned, or
+resolved, so live memory stays at a few dozen nodes even after tens of
+thousands of leaf solves. Benchmarked at 12-14 cards it runs at parity
+with a bare `Game.evaluate` call.
+
+```python
+from cardgame import live_search, format_snapshot
+
+for snapshot in live_search(game, budget=30):
+    print(format_snapshot(snapshot))   # live best-to-worst, updating
+
+# or drive the node iterator directly (the spec in search_alt's docstring)
+from cardgame import move_search_iterator
+root = move_search_iterator(game)
+for _ in root:
+    ...   # root.best_move, root.proven, per-move partials, at any point
+print(root.result)  # exact Evaluation, identical to Game.evaluate's
+```
+
+Displayed intervals for rival moves are window-relative, as in any
+alpha-beta engine: a rival cut off early shows "no better than" bounds
+rather than its exact value. `cardgame.search.BestFirstSearch` is an
+earlier variant of the same idea that keeps fully sound two-sided
+distribution bounds for every move (no window truncation) at the cost of
+substantially slower proving; it remains useful when honest two-sided
+bounds on *every* move matter more than speed.
+
+### Bot development and strength testing
+
+The computer opponent (`cardgame.ai`) is an `AlphaBetaBot`: iterative-deepening
+expectiminimax with Star1 chance-node cutoffs and a heuristic leaf evaluation
+in the midgame, deferring to the exact solver once the endgame is small
+enough. Every tunable (evaluation weights, value bound, resolution sampling,
+time management) lives in a `SearchParams` dataclass, so differently
+configured bots can be built side by side:
+
+```python
+from cardgame import AlphaBetaBot, SearchParams
+bot = AlphaBetaBot(time_budget=2.0, params=SearchParams(potential_weight=0.5))
+move = bot.choose_move(game)   # module-level choose_move(game) uses defaults
+```
+
+Any change to the bot (or its parameters) should be validated with a
+duplicate-deal match in `cardgame.arena` before it is kept:
+
+```bash
+python -m cardgame.arena --old HEAD --new current --deals 50 --budget 0.3 --jobs 4
+```
+
+Each deal is played twice with seats swapped on the same board *and* the same
+hidden-card placement, so deal luck cancels within the pair; results are
+reported per game (W/D/L, score percentage, Elo estimate) and per pair (the
+challenger's combined margin over both seatings, with an exact two-sided sign
+test). Bots are specified as `current` (working tree), any git rev (that
+revision's `ai.py` imported against the current package), or `file:<path>`
+for an arbitrary saved variant. Reduced per-move budgets (0.2-0.5s) are the
+intended testing regime — relative strength transfers well, and 50 pairs
+finish in minutes with `--jobs`.
+
 ## Playing online
 
 A basic Flask + Flask-SocketIO web front end is included so people can play
@@ -214,6 +289,40 @@ By default this serves on `http://127.0.0.1:5000`.
   before a new game actually deals. Seats free up again once a game is
   over (whether it finished naturally or a rematch was declined), the same
   as before a game starts.
+- A second solo mode, **Play vs computer (live eval)** (`/play/live`),
+  runs the anytime search (`cardgame.search_alt`) continuously on
+  whatever the current position is, streaming a live move-ranking panel
+  to the page: each move's average outcome over the lines resolved so
+  far, bounds on its final score margin, how much of it has been
+  explored, and best/out badges as moves get proven or ruled out. The
+  search restarts whenever a move changes the position and pauses at a
+  per-position time/work cap (early positions are far too big to finish -
+  the panel just shows how far it got), and the background thread stops
+  whenever nobody is connected. Rival moves' ranges are window-relative,
+  as in any alpha-beta engine.
+- While stepping back through a finished game, positions near the end
+  also show a **Move comparison** panel — the same analysis as
+  `analyse_moves` (see `examples/Move comparison.ipynb`): every move
+  available from that position, ranked by how much it swings the average
+  final score relative to the best move under optimal play from both
+  sides, split into the effect on each player's own total, with the best
+  move and the move actually played badged. Computing this means walking
+  the entire remaining game tree with no pruning, so the work starts
+  *during* the game: each position is fixed the moment its move is made,
+  so once the game reaches a sensible starting point a background worker
+  (one per room, one position at a time) analyses the already-played
+  positions while the players think - and when it has caught up, it
+  keeps backtracking one position deeper with no ceiling at all, the
+  running game itself being the budget: a long, thoughtful game buys
+  itself review depth no fixed cutoff could. An analysis still in flight
+  when the game ends is abandoned cooperatively rather than left burning
+  CPU. At game end a drain fills the cheap tail immediately (skipping
+  anything the live worker finished), walking backwards adaptively
+  within a calibrated ceiling and time budget. Positions deeper than the
+  work ever reached simply don't show the panel.
+  The panel appears in both a room's own post-game history stepping and
+  the frozen "Recently finished games" review pages, computed once and
+  shared.
 
 Useful environment variables:
 

@@ -24,13 +24,18 @@ import re
 import secrets
 import string
 import threading
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 from flask import render_template
 
 from ..ai import choose_move
+from ..analysis import AnalysisAborted, analyse_moves
 from ..game import Game
-from .extensions import socketio
+from ..search_alt import _snapshot as _search_snapshot
+from ..search_alt import move_search_iterator
+from .extensions import app_holder, socketio
 from .identity import _normalize_player_id
 
 _CODE_RE = re.compile(r"^[A-Za-z]{4}$")
@@ -91,6 +96,39 @@ class RoomState:
     # (rather than re-appearing every time they step through history).
     # Cleared whenever a new game is dealt.
     game_over_seen: set = field(default_factory=set)
+    # Post-game move-comparison analyses, {move_index: analyse_moves(...)}.
+    # Filled from two cooperating sources sharing this dict: a live worker
+    # that analyses already-played positions *during* the game (each
+    # position is fixed the moment its move is made, and a long game
+    # donates its thinking time to the deep, expensive ones - see
+    # _live_analysis_loop), and the post-game drain that fills the cheap
+    # tail at game end (_precompute_analysis). Shared with the frozen
+    # _finished_rooms entry recorded at game end - same dict object, so
+    # late-finishing live analyses still land in the review. Reset to None
+    # on a fresh deal (the frozen entry keeps the old dict).
+    analysis: dict | None = None
+    # Move indices currently being analysed by the live worker, so the
+    # post-game drain doesn't duplicate a minutes-long computation.
+    # Replaced (not cleared) on a fresh deal, since the frozen entry
+    # shares the old set.
+    analysis_inflight: set = field(default_factory=set)
+    # Guard so at most one live analysis worker runs per room.
+    analysis_running: bool = False
+    # Cooperative abort for the live worker's current analysis: set when
+    # the game ends (see _record_room_finished_locked) so an unbounded
+    # backtracking analysis stops burning CPU on a game nobody is playing
+    # any more. Replaced with a fresh event on a new deal.
+    analysis_abort: threading.Event = field(default_factory=threading.Event)
+    # Whether this (solo) room is in "live eval" mode: a background thread
+    # runs the anytime search (cardgame.search_alt) on whatever the current
+    # position is, pushing a continuously-updating move ranking to every
+    # connected socket. Set by the owner's entry point (/play/live vs
+    # /play) at join time.
+    live_eval: bool = False
+    # Guard so at most one live-eval thread runs per room; the thread
+    # clears it when it exits (no viewers / mode switched off) so a later
+    # join can start a fresh one.
+    live_eval_running: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def seat_of(self, player_id):
@@ -198,6 +236,180 @@ _finished_rooms: list[dict] = []
 _finished_rooms_lock = threading.Lock()
 
 
+# Total background time spent analysing any one finished game. Positions
+# are analysed newest-first with monotonically growing cost (going
+# backwards only ever adds cards and unknowns) - observed growth is
+# roughly 3-15x per ply, so the walk stops once the next (costlier)
+# position can no longer plausibly fit the remaining budget.
+_ANALYSIS_TIME_CAP = 120.0
+_ANALYSIS_GROWTH_FACTOR = 6
+
+
+def _analysis_feasible(game):
+    """Hard ceiling on which positions `analyse_moves` may even attempt -
+    calibrated against worst cases over sampled random games (recalibrated
+    2026-07 after the cached-scoring / single-pass-walk optimisations,
+    which bought roughly 8-30x here). The adaptive soft stop in
+    _precompute_analysis does the fine-grained cost control; this only
+    rules out the combinations whose worst cases run into minutes. It
+    walks the full remaining tree with no pruning, so it's viable only
+    near the end of the game; as with Game.evaluate, the chance-node
+    branching from face-down cards is the main cost driver.
+    """
+    # The next combinations out - (14, 5), (15, 4), (16, 4), (17, 3) -
+    # were measured at 100-336s for a single position, past any sensible
+    # budget; this ceiling sits exactly at that cliff edge.
+    cards_left = 36 - len(game.moves)
+    facedown = len(game.board.facedown_cards)
+    if cards_left <= 9:
+        return True
+    if cards_left <= 10:
+        return facedown <= 7
+    if cards_left <= 11:
+        return facedown <= 6
+    if cards_left <= 13:
+        return facedown <= 5
+    if cards_left <= 14:
+        return facedown <= 4
+    if cards_left <= 16:
+        return facedown <= 3
+    return False
+
+
+def _analysis_attemptable(game):
+    """The live worker's wider ceiling: during play there are minutes of
+    thinking time rather than a post-game budget, so it may attempt one
+    ring beyond _analysis_feasible - the combinations measured in the
+    ~2-6 minute range ((14,5): 104s, (15,4): 100s, (16,4): 336s,
+    (17,3): 319s). Anything deeper runs into tens of minutes.
+    """
+    if _analysis_feasible(game):
+        return True
+    cards_left = 36 - len(game.moves)
+    facedown = len(game.board.facedown_cards)
+    if cards_left <= 14:
+        return facedown <= 5
+    if cards_left <= 16:
+        return facedown <= 4
+    if cards_left <= 17:
+        return facedown <= 3
+    return False
+
+
+def _precompute_analysis(game, cache, inflight=frozenset(), on_done=None):
+    """Fill `cache[move_index]` with `analyse_moves` of the position after
+    `move_index` moves, walking backwards from the last move played until
+    a position is past the hard ceiling, the previous position already
+    took long enough that the next (always costlier) one shouldn't be
+    started, or the total budget is spent. Skips indices already analysed
+    (typically by the live worker during the game) or currently in flight
+    there. Runs on a background thread - see _record_room_finished_locked.
+    """
+    deadline = time.monotonic() + _ANALYSIS_TIME_CAP
+    total = len(game.moves)
+    for index in range(total - 1, -1, -1):
+        if index in cache or index in inflight:
+            continue
+        position = game.undo(total - index)
+        if not _analysis_feasible(position):
+            break
+        position_start = time.monotonic()
+        cache[index] = analyse_moves(position)
+        now = time.monotonic()
+        if now >= deadline or (now - position_start) * _ANALYSIS_GROWTH_FACTOR > deadline - now:
+            break
+    if on_done is not None:
+        on_done()
+
+
+def _live_analysis_loop(code, room):
+    """Analyse the current game's already-played positions while it is
+    still being played: every position is fixed the moment its move is
+    made. _analysis_attemptable decides where the work *starts*; once
+    every position inside that band is done, the worker backtracks one
+    position deeper at a time with no ceiling at all - the running game
+    itself is the budget, so a long, thoughtful game buys itself review
+    depth a fixed gate never could. Results go into the same cache the
+    post-game review reads; a backtracking analysis still in flight when
+    the game ends is aborted cooperatively (room.analysis_abort, set at
+    game end) rather than left burning CPU. Exits when the game ends (the
+    post-game drain in _precompute_analysis owns the tail) or the room
+    empties."""
+    try:
+        while True:
+            with room.lock:
+                if not room.sid_players:
+                    return
+                game = room.game
+                if room.analysis is None:
+                    room.analysis = {}
+                cache = room.analysis
+                inflight = room.analysis_inflight
+                abort = room.analysis_abort
+            if not game.legal_moves:
+                return
+            total = len(game.moves)
+            done = cache.keys() | inflight
+            candidates = [k for k in range(total + 1) if k not in done]
+            index = None
+            # Newest attemptable position first: the band's members are all
+            # cheap (minutes at worst), so clear them before going deeper.
+            for k in reversed(candidates):
+                if _analysis_attemptable(game.undo(total - k)):
+                    index = k
+                    break
+            if index is None and done:
+                # Band finished - backtrack one position deeper, unbounded.
+                frontier = min(done)
+                if frontier > 0 and frontier - 1 in candidates:
+                    index = frontier - 1
+            if index is None:
+                # Either the game hasn't reached the sensible starting
+                # point yet, or every position back to the deal is done.
+                time.sleep(1.0)
+                continue
+            position = game.undo(total - index)
+            with room.lock:
+                inflight.add(index)
+            try:
+                cache[index] = analyse_moves(position, abort=abort)
+            except AnalysisAborted:
+                pass
+            finally:
+                with room.lock:
+                    inflight.discard(index)
+    finally:
+        with room.lock:
+            room.analysis_running = False
+
+
+def _ensure_analysis_worker(code, room):
+    """Start the room's live analysis worker if the game is in progress,
+    someone is watching, and none is running. Callers invoke this after
+    joins and moves; it's a cheap no-op otherwise."""
+    with room.lock:
+        if (
+            room.analysis_running
+            or not room.sid_players
+            or not room.game.legal_moves
+            or not room.game.moves
+        ):
+            return
+        room.analysis_running = True
+    threading.Thread(target=_live_analysis_loop, args=(code, room), daemon=True).start()
+
+
+def _in_app_context(fn):
+    """Run fn inside the Flask app's context - required for
+    render_template on a background thread. A no-op if the app hasn't been
+    constructed (unit tests poking internals directly)."""
+    app = app_holder.get("app")
+    if app is None:
+        return
+    with app.app_context():
+        fn()
+
+
 def _record_room_finished_locked(code, room):
     """Freeze this room's just-finished result into history. Caller must
     already hold room.lock, so the snapshot (game object included)
@@ -207,6 +419,29 @@ def _record_room_finished_locked(code, room):
     entry["id"] = secrets.token_hex(8)
     entry["game"] = room.game
     entry["history_index"] = {}
+    # One shared cache for the room's own post-game review and this frozen
+    # entry's /review page - usually already largely filled by the live
+    # worker during the game; the drain adds the cheap tail (skipping
+    # anything the worker finished or is still finishing). Viewers already
+    # scrubbing get a refresh when it's done; anyone arriving later just
+    # finds it ready.
+    if room.analysis is None:
+        room.analysis = {}
+    # Stop any unbounded backtracking analysis still in flight - the game
+    # it was buying time for is over. The cheap drain below takes over.
+    room.analysis_abort.set()
+    cache = room.analysis
+    entry["analysis"] = cache
+    entry["analysis_inflight"] = room.analysis_inflight
+    threading.Thread(
+        target=_precompute_analysis,
+        args=(entry["game"], cache),
+        kwargs={
+            "inflight": room.analysis_inflight,
+            "on_done": lambda: _in_app_context(lambda: _broadcast_state(code, room)),
+        },
+        daemon=True,
+    ).start()
     with _finished_rooms_lock:
         _finished_rooms.append(entry)
         while len(_finished_rooms) > _MAX_FINISHED_ENTRIES:
@@ -275,6 +510,126 @@ def _resolve_or_create_room_for_join(raw_code, player_id):
     return target_id, room, None
 
 
+# Sequential ramp for the outcome heatmap's cells: dark (0% of outcomes,
+# matching .move-analysis's own background so an empty cell reads as
+# "nothing here") up to this site's existing accent blue (100%). A single
+# hue carries likelihood; which side of the axis a cell sits on is what
+# carries who it favours, so the two are never conflated in one channel.
+_HEATMAP_BASE_RGB = (0x2B, 0x2B, 0x2B)
+_HEATMAP_ACCENT_RGB = (0x7C, 0xB8, 0xFF)
+
+
+def _heatmap_style(pct):
+    """The cell's background - interpolated along the sequential ramp - and
+    a text color for the percentage label printed on top of it, picked by
+    the background's luminance so the label stays legible at both ends."""
+    t = min(1.0, max(0.0, pct / 100))
+    r, g, b = (
+        round(base + (accent - base) * t)
+        for base, accent in zip(_HEATMAP_BASE_RGB, _HEATMAP_ACCENT_RGB)
+    )
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    text = "#161616" if luminance > 140 else "#f2f2f2"
+    return f"#{r:02x}{g:02x}{b:02x}", text
+
+
+# The heatmap's axis is fixed rather than sized to each position's actual
+# range, so positions can be compared at a glance instead of each drawing
+# its own scale. Outcomes beyond it collapse into the two end cells.
+_HEATMAP_RANGE = 4
+
+
+def _outcome_heatmap(distribution, mover_seat):
+    """Turn a move's {mover_diff: weight} distribution (see analyse_moves)
+    into the "who's winning" heatmap's template context: a fixed row of
+    cells from -_HEATMAP_RANGE to +_HEATMAP_RANGE (P1 - P2), each annotated
+    with its likelihood, plus two end cells pooling everything beyond that
+    range - and the single most likely outcome, called out as the headline
+    text. Face-down cards mean even optimal play from a fixed position can
+    end in a spread of scores, not one number, which is what this is for.
+    """
+    total = sum(distribution.values())
+    # distribution is in the mover's own perspective (self - opponent);
+    # flip it onto the fixed P1 - P2 axis the template renders.
+    sign = 1 if mover_seat == 1 else -1
+    p1_distribution = Counter({sign * diff: weight for diff, weight in distribution.items()})
+
+    def cell(label, pct, zero=False):
+        color, text_color = _heatmap_style(pct)
+        return {"label": label, "pct": pct, "zero": zero, "color": color, "text_color": text_color}
+
+    low_pct = sum(w for d, w in p1_distribution.items() if d <= -_HEATMAP_RANGE - 1) / total * 100
+    high_pct = sum(w for d, w in p1_distribution.items() if d >= _HEATMAP_RANGE + 1) / total * 100
+    cells = [cell(f"≤-{_HEATMAP_RANGE + 1}", low_pct)]
+    for diff in range(-_HEATMAP_RANGE, _HEATMAP_RANGE + 1):
+        pct = p1_distribution.get(diff, 0) / total * 100
+        cells.append(cell(f"{diff:+d}" if diff else "0", pct, zero=(diff == 0)))
+    cells.append(cell(f"≥+{_HEATMAP_RANGE + 1}", high_pct))
+
+    mode_diff, mode_weight = max(p1_distribution.items(), key=lambda item: (item[1], -abs(item[0])))
+    return {
+        "cells": cells,
+        "mode_diff": mode_diff,
+        "mode_pct": mode_weight / total * 100,
+    }
+
+
+def _move_analysis_context(cache, full_game, display_game, history_index, p1_name, p2_name,
+                           inflight=frozenset()):
+    """Build the move-comparison panel's template context for the position
+    currently being reviewed, or None when there's nothing to show (final
+    position, no analysis recorded, or an intractable position). Returns
+    {"pending": True, ...} while the background computation hasn't reached
+    a tractable position yet - or is mid-flight on this one - so the
+    template can say it's on its way.
+    """
+    if cache is None or history_index >= len(full_game.moves):
+        return None
+    mover_seat = 1 if history_index % 2 == 0 else 2
+    mover_name = (p1_name if mover_seat == 1 else p2_name) or f"Player {mover_seat}"
+    opponent_name = (p2_name if mover_seat == 1 else p1_name) or f"Player {3 - mover_seat}"
+    data = cache.get(history_index)
+    if data is None:
+        if history_index not in inflight and not _analysis_feasible(display_game):
+            return None
+        return {"pending": True, "mover_name": mover_name}
+    played_marker = full_game.moves[history_index]
+    rows = []
+    for marker, move in sorted(
+        data.items(), key=lambda item: (-item[1]["combined"], item[0])
+    ):
+        card = move["card"]
+        rows.append(
+            {
+                "marker": marker,
+                "card": card,
+                # A face-down move's analysis averages over what it might
+                # have been, but the one actually played has a known
+                # outcome - the final board holds its revealed identity.
+                "revealed": (
+                    full_game.board[marker[0]][marker[1]]
+                    if card.facedown and marker == played_marker
+                    else None
+                ),
+                "combined": move["combined"],
+                "defensive": move["defensive"],
+                "offensive": move["offensive"],
+                "best": move["combined"] == 0,
+                "played": marker == played_marker,
+            }
+        )
+    best = rows[0]
+    return {
+        "pending": False,
+        "mover_name": mover_name,
+        "opponent_name": opponent_name,
+        "best_player_mean": data[best["marker"]]["player_mean"],
+        "best_opponent_mean": data[best["marker"]]["opponent_mean"],
+        "rows": rows,
+        "heatmap": _outcome_heatmap(data[best["marker"]]["distribution"], mover_seat),
+    }
+
+
 def _room_context(code, room, player_id):
     """Build the (viewer-specific) template context for a room's state."""
     final_game = room.game
@@ -310,6 +665,18 @@ def _room_context(code, room, player_id):
         rematch_requested_by_me = room.rematch_requested_by == player_id
         rematch_requested_by_name = room.name_for_seat(room.seat_of(room.rematch_requested_by))
 
+    move_analysis = None
+    if game_over:
+        move_analysis = _move_analysis_context(
+            room.analysis,
+            final_game,
+            display_game,
+            history_index,
+            room.name_for_seat(1),
+            room.name_for_seat(2),
+            inflight=room.analysis_inflight,
+        )
+
     return {
         "code": code,
         "vs_computer": room.computer_seat is not None,
@@ -339,6 +706,7 @@ def _room_context(code, room, player_id):
         "rematch_pending": room.rematch_requested_by is not None,
         "rematch_requested_by_me": rematch_requested_by_me,
         "rematch_requested_by_name": rematch_requested_by_name,
+        "move_analysis": move_analysis,
     }
 
 
@@ -398,6 +766,15 @@ def _room_review_context(entry, viewer_id):
         "rematch_requested_by_me": False,
         "rematch_requested_by_name": None,
         "entry_id": entry["id"],
+        "move_analysis": _move_analysis_context(
+            entry.get("analysis"),
+            game,
+            display_game,
+            history_index,
+            entry["p1_name"],
+            entry["p2_name"],
+            inflight=entry.get("analysis_inflight", frozenset()),
+        ),
     }
 
 
@@ -424,6 +801,130 @@ def _broadcast_state(code, room):
     for sid, player_id in sid_players.items():
         html = _render_state(code, room, player_id)
         socketio.emit("state", {"html": html}, to=sid)
+
+
+# Live-eval pacing: per-position caps keep an early-game search (which can
+# never finish - the opening's tree is astronomically large) from pinning
+# the CPU and growing its node tree forever; deeper positions solve well
+# inside them. Batches are bounded by wall clock, not quantum count - a
+# single quantum ranges from microseconds (an expansion) to a few hundred
+# milliseconds (an exact leaf solve), so only time-batching keeps the
+# emit/position-change checks responsive. Small sleeps between batches
+# keep the request threads breathing under the GIL.
+_LIVE_EVAL_BUDGET = 60.0
+_LIVE_EVAL_WORK_CAP = 30000
+_LIVE_EVAL_BATCH_SECONDS = 0.25
+_LIVE_EVAL_EMIT_INTERVAL = 0.8
+
+
+def _render_live_eval(room, game, snapshot, status):
+    mover_seat = 1 if len(game.moves) % 2 == 0 else 2
+    return render_template(
+        "_live_eval.html.jinja2",
+        snapshot=snapshot,
+        mover_name=room.name_for_seat(mover_seat) or f"Player {mover_seat}",
+        status=status,
+    )
+
+
+def _emit_live_eval(room, game, snapshot, status):
+    with room.lock:
+        sids = list(room.sid_players)
+    if not sids:
+        return
+    html = []
+    _in_app_context(
+        lambda: html.append(_render_live_eval(room, game, snapshot, status))
+    )
+    if not html:
+        return
+    for sid in sids:
+        socketio.emit("live_eval", {"html": html[0]}, to=sid)
+
+
+def _live_eval_status(root, capped):
+    if root.resolved:
+        return "solved - exact value known"
+    if root.proven:
+        return "best move proven"
+    if capped:
+        return "paused - search limit for this position reached"
+    return f"searching ({root.ctx.work} solves)"
+
+
+def _live_eval_loop(code, room):
+    """Continuously evaluate the room's current position with the anytime
+    search, pushing ranking updates to everyone connected. The search on a
+    position runs for as long as that position stays current (or until it
+    is solved / hits its caps); a move or a fresh deal abandons it and
+    starts over on the new position. Exits when the room empties or leaves
+    live-eval mode - a later join starts a new thread."""
+    try:
+        while True:
+            with room.lock:
+                if not room.live_eval or not room.sid_players:
+                    return
+                game = room.game
+            if not game.legal_moves:
+                # game over - the post-game analysis panel takes over; wait
+                # here for a rematch to swap in a new game
+                time.sleep(1.0)
+                continue
+            root = move_search_iterator(game)
+            started = time.monotonic()
+            last_emit = 0.0
+            final_emitted = False
+            while True:
+                with room.lock:
+                    if not room.live_eval or not room.sid_players:
+                        return
+                    if room.game is not game:
+                        break  # position moved on - restart on the new one
+                capped = (
+                    time.monotonic() - started > _LIVE_EVAL_BUDGET
+                    or root.ctx.work >= _LIVE_EVAL_WORK_CAP
+                )
+                if root.resolved or capped:
+                    if not final_emitted:
+                        _emit_live_eval(
+                            room,
+                            game,
+                            _search_snapshot(root, time.monotonic() - started),
+                            _live_eval_status(root, capped),
+                        )
+                        final_emitted = True
+                    time.sleep(0.5)
+                    continue
+                batch_end = time.monotonic() + _LIVE_EVAL_BATCH_SECONDS
+                while time.monotonic() < batch_end and not root.resolved:
+                    try:
+                        next(root)
+                    except StopIteration:
+                        break
+                now = time.monotonic()
+                if root.moves is not None and now - last_emit >= _LIVE_EVAL_EMIT_INTERVAL:
+                    _emit_live_eval(
+                        room,
+                        game,
+                        _search_snapshot(root, now - started),
+                        _live_eval_status(root, capped=False),
+                    )
+                    last_emit = now
+                time.sleep(0.02)
+    finally:
+        with room.lock:
+            room.live_eval_running = False
+
+
+def _ensure_live_eval(code, room):
+    """Start the room's live-eval thread if its mode calls for one and none
+    is running. Callers invoke this unconditionally after joins; it's a
+    no-op for ordinary rooms."""
+    with room.lock:
+        if not room.live_eval or room.live_eval_running or not room.sid_players:
+            return
+        room.live_eval_running = True
+    threading.Thread(target=_live_eval_loop, args=(code, room), daemon=True).start()
 
 
 def _maybe_play_computer_move(code, room):

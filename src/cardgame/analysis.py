@@ -9,31 +9,72 @@ sides from that point forward.
 
 from collections import Counter
 
-__all__ = ("analyse_moves",)
+from .game import ProbEval, _cached_score
+
+__all__ = ("analyse_moves", "AnalysisAborted")
 
 
-def _collect_terminals(game):
-    """Traverse the game tree under optimal play, returning a weighted score frequency map."""
+class AnalysisAborted(Exception):
+    """Raised out of analyse_moves when its `abort` event is set - the
+    walk is unbounded in general (an early-game position can take hours),
+    so long-running callers need a way to abandon one cooperatively."""
+
+
+def _collect_terminals(game, _state=None, abort=None):
+    """Traverse the game tree under optimal play, returning a weighted
+    score frequency map of (other, mover) score pairs.
+
+    Single pass: the optimal-play pair distribution is carried up
+    alongside the negamax value, instead of re-running a full score_walk
+    at every level of the optimal line as the original formulation did.
+    Move selection replicates score_walk exactly - the same evaluation
+    comparison and the same marker tie-break - so the chosen line, and
+    therefore the returned distribution, is identical.
+    """
+    if abort is not None and abort.is_set():
+        raise AnalysisAborted
+    if _state is None:
+        _state = game._hand_state()
     if not game.legal_moves:
-        if len(game.moves) % 2 == 0:
-            return Counter({(game.p2.score(), game.p1.score()): game.multiplicity})
-        return Counter({(game.p1.score(), game.p2.score()): game.multiplicity})
-    _, best_pos = game.score_walk()
-    result = Counter()
-    for resolution in game.move(*best_pos):
-        result.update(
-            {(k2, k1): v for (k1, k2), v in _collect_terminals(resolution).items()}
+        # (other, mover): the original returned (p2, p1) with p1 to move
+        # and (p1, p2) with p2 to move - both are (other, mover).
+        mover_score = _cached_score(_state[0], _state[1])
+        other_score = _cached_score(_state[2], _state[3])
+        return (
+            ProbEval(game.multiplicity, {mover_score - other_score: game.multiplicity}),
+            Counter({(other_score, mover_score): game.multiplicity}),
         )
-    return result
+    child_state = game._child_hand_state
+    best_key = None
+    best_pairs = None
+    for move in game.all_moves():
+        evals = []
+        pairs = Counter()
+        for possibility in move:
+            child_eval, child_pairs = _collect_terminals(
+                possibility, child_state(_state, possibility.taken_card), abort
+            )
+            evals.append(child_eval)
+            # flip the child's (other, mover) into this node's perspective
+            for (a, b), v in child_pairs.items():
+                pairs[(b, a)] += v
+        candidate = (-ProbEval.combine(evals), move[0].marker)
+        if best_key is None or candidate > best_key:
+            best_key = candidate
+            best_pairs = pairs
+    return best_key[0], best_pairs
 
 
-def analyse_moves(game):
+def analyse_moves(game, abort=None):
     """Compute offensive, defensive, and combined values for every legal move.
 
     Parameters
     ----------
     game : Game
         Current game state. Must have at least one legal move.
+    abort : threading.Event, optional
+        When set, the walk raises AnalysisAborted at the next node - the
+        cooperative escape hatch for long-running background analyses.
 
     Returns
     -------
@@ -44,11 +85,14 @@ def analyse_moves(game):
     ------
     ValueError
         If the game has no legal moves (already terminal).
+    AnalysisAborted
+        If `abort` was set while the walk was in progress.
     """
     if not game.legal_moves:
         raise ValueError("Game is already over — no legal moves to analyse.")
 
     # Collect terminal (p1, p2) score distributions for each legal move
+    state = game._hand_state()
     move_data = {}
     for move_tuple in game.all_moves():
         marker = move_tuple[0].marker
@@ -56,7 +100,9 @@ def analyse_moves(game):
 
         acc = Counter()
         for resolution in move_tuple:
-            acc += _collect_terminals(resolution)
+            acc += _collect_terminals(
+                resolution, game._child_hand_state(state, resolution.taken_card), abort
+            )[1]
 
         # Weighted mean: each (p1, p2) score pair is weighted by the number of
         # face-down card orderings that produce it (game.multiplicity at that terminal).
@@ -65,11 +111,19 @@ def analyse_moves(game):
         mean_opponent = sum(q * w for (_, q), w in acc.items()) / total_weight
         mean_diff = mean_player - mean_opponent  # always P1 - P2
 
+        # Same (p, q) pairs, collapsed to the score-difference distribution
+        # under optimal play - the face-down orderings this move doesn't
+        # resolve are exactly why a single mean hides real spread.
+        distribution = Counter()
+        for (p, q), w in acc.items():
+            distribution[p - q] += w
+
         move_data[marker] = {
             "card": card,
             "player_mean": mean_player,
             "opponent_mean": mean_opponent,
             "mean_diff": mean_diff,
+            "distribution": distribution,
         }
 
     # Baseline = best move for the current player
