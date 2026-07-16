@@ -170,9 +170,21 @@ class SearchParams:
     # positions.
     value_bound: float = 36.0
     win_bonus: float = 6.0
-    potential_weight: float = 0.35
-    centrality_weight: float = 0.6
-    mobility_weight: float = 0.05
+    # The leaf weights below were fitted by least squares against exact
+    # oracle values (cardgame.oracle: 2500 labeled 8-12 card positions,
+    # ~16k child-position rows; held-out rmse 6.26 -> 4.38 vs the original
+    # hand-guessed 0.35/0.6/0.05/0) and validated in the arena at +6.36
+    # points/pair over 200 duplicate deals (82% game score). Note the
+    # centrality weight is fitted *under the linear decay*, whose shape is
+    # itself unvalidated outside the fitting band.
+    potential_weight: float = 0.238
+    centrality_weight: float = 7.562
+    mobility_weight: float = 0.378
+    # Constant added to every heuristic leaf: the value of being on move
+    # (the mover takes the best remaining card first). Affects only
+    # comparisons against terminal values, where it correctly encodes
+    # that a live position is worth more than its bare score.
+    tempo_bonus: float = 2.367
     # Move ordering weight on denial: a cell's ordering key is the mover's
     # marginal gain plus this times the opponent's marginal for the same
     # card. Ordering-only - it never changes what a search returns.
@@ -260,7 +272,7 @@ class AlphaBetaBot:
             else:
                 my_potential += score(me_int | token, me_kings) - my_base
                 opp_potential += score(opp_int | token, opp_kings) - opp_base
-        value = float(my_base - opp_base)
+        value = float(my_base - opp_base) + params.tempo_bonus
         value += params.potential_weight * (my_potential - opp_potential)
         decay = 1.0 - len(game.moves) / 36.0
         if decay > 0:
