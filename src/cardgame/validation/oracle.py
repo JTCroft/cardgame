@@ -25,21 +25,22 @@ and tested on this band generalize to earlier positions, which the arena
 match ultimately checks.
 
 CLI:
-    python -m cardgame.oracle generate --positions 800 --out labels.jsonl --jobs 8
-    python -m cardgame.oracle agree --labels labels.jsonl --depth 3 \
+    python -m cardgame.validation.oracle generate --positions 800 --out labels.jsonl --jobs 8
+    python -m cardgame.validation.oracle agree --labels labels.jsonl --depth 3 \
         --a "" --b "potential_weight=0.5"
 """
 
 import argparse
 import json
 import random
+import signal
 import sys
 from ast import literal_eval
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import comb, sqrt
 from pathlib import Path
 
-from .ai import (
+from ..ai import (
     AlphaBetaBot,
     SearchParams,
     _add_card,
@@ -47,8 +48,8 @@ from .ai import (
     _without,
     _TOKEN,
 )
-from .cards import Card
-from .game import Board, Eval, Game
+from ..cards import Card
+from ..game import Board, Eval, Game
 
 __all__ = (
     "sample_position",
@@ -146,6 +147,8 @@ def fixed_depth_move(bot, game, depth):
     bot._tt = {}
     bot._tt_cuts = 0
     bot._exact_cache = {}
+    bot._fullpot = {}
+    bot._root_tokens = remaining
     bound = bot.params.value_bound
     deadline = float("inf")
     alpha = -bound
@@ -156,13 +159,14 @@ def fixed_depth_move(bot, game, depth):
         if len(resolutions) == 1:
             child = resolutions[0]
             card = child.taken_card
+            token = _TOKEN[card]
             value = -bot._search(
                 child, depth - 1, -bound, -alpha, opp, _add_card(me, card),
-                _without(remaining, _TOKEN[card]), child_mask, deadline,
+                (token,), _without(remaining, token), child_mask, deadline,
             )
         else:
             value = bot._chance_value(
-                resolutions, depth, alpha, bound, me, opp, remaining,
+                resolutions, depth, alpha, bound, me, opp, (), remaining,
                 child_mask, deadline,
             )
         if value > alpha:
@@ -208,13 +212,33 @@ def _mcnemar_p(b, c):
 # CLI
 
 
+class _Timeout(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise _Timeout()
+
+
 def _generate_one(args):
-    seed, band = args
+    seed, band, max_seconds = args
     rng = random.Random(seed)
+    if max_seconds:
+        signal.signal(signal.SIGALRM, _alarm)
     while True:
         game = sample_position(rng, *band)
-        if game is not None:
+        if game is None:
+            continue
+        if not max_seconds:
             return json.dumps(label_position(game))
+        signal.alarm(max_seconds)
+        try:
+            result = json.dumps(label_position(game))
+        except _Timeout:
+            continue
+        finally:
+            signal.alarm(0)
+        return result
 
 
 def main(argv=None):
@@ -229,6 +253,8 @@ def main(argv=None):
     gen.add_argument("--min-cards", type=int, default=8)
     gen.add_argument("--max-cards", type=int, default=11)
     gen.add_argument("--max-facedown", type=int, default=5)
+    gen.add_argument("--max-seconds", type=int, default=0,
+                      help="skip and resample a position if labeling takes longer than this (0=no limit)")
 
     agr = sub.add_parser("agree", help="fixed-depth agreement of one or two configs")
     agr.add_argument("--labels", required=True)
@@ -240,7 +266,7 @@ def main(argv=None):
 
     if args.cmd == "generate":
         band = (args.min_cards, args.max_cards, args.max_facedown)
-        tasks = [(f"{args.seed}:{i}", band) for i in range(args.positions)]
+        tasks = [(f"{args.seed}:{i}", band, args.max_seconds) for i in range(args.positions)]
         out = Path(args.out)
         with out.open("w") as fh:
             if args.jobs <= 1:

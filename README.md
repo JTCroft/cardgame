@@ -215,10 +215,10 @@ move = bot.choose_move(game)   # module-level choose_move(game) uses defaults
 ```
 
 Any change to the bot (or its parameters) should be validated with a
-duplicate-deal match in `cardgame.arena` before it is kept:
+duplicate-deal match in `cardgame.validation.arena` before it is kept:
 
 ```bash
-python -m cardgame.arena --old HEAD --new current --deals 50 --budget 0.3 --jobs 4
+python -m cardgame.validation.arena --old HEAD --new current --deals 50 --budget 0.3 --jobs 4
 ```
 
 Each deal is played twice with seats swapped on the same board *and* the same

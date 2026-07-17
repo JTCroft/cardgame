@@ -27,11 +27,11 @@ expose `AlphaBetaBot`/`SearchParams` (values are parsed as Python literals).
 
 Typical use after making a change (committed baseline vs working tree):
 
-    python -m cardgame.arena --old HEAD --new current --deals 50 --budget 0.3 --jobs 4
+    python -m cardgame.validation.arena --old HEAD --new current --deals 50 --budget 0.3 --jobs 4
 
 or from Python / a notebook::
 
-    from cardgame.arena import run_match, summarise
+    from cardgame.validation.arena import run_match, summarise
     print(summarise(run_match("HEAD", "current", deals=50, budget=0.3, jobs=4)))
 
 Notes: matches at reduced budgets (0.2-0.5s/move) are the intended regime -
@@ -58,8 +58,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 
-from .cards import Card
-from .game import Board, Game
+from ..cards import Card
+from ..game import Board, Game
 
 __all__ = ("deal_with_assignment", "play_game", "run_match", "summarise", "main")
 
@@ -81,13 +81,13 @@ def _import_ai_module(path, name):
 
 
 def _repo_root():
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def _load_module(spec):
     """Resolve a bot spec (without any query string) to an ai module."""
     if spec == "current":
-        from . import ai
+        from .. import ai
 
         return ai
     if spec.startswith("file:"):

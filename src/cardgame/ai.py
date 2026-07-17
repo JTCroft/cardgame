@@ -26,7 +26,7 @@
 
 Every tunable lives in `SearchParams`, and a bot is an `AlphaBetaBot`
 instance (params + a time budget), so differently-configured bots can be
-built side by side and matched against each other — `cardgame.arena`
+built side by side and matched against each other — `cardgame.validation.arena`
 plays duplicate-deal matches between two bot versions to validate that a
 change actually gains strength. The module-level `choose_move` keeps the
 original convenience API with default parameters.
@@ -70,7 +70,7 @@ _CENTRALITY = _centrality_table()
 _KING_CENTRALITY = 1.0
 
 # Move-ordering score weights, fitted by within-position least squares on
-# 6200 oracle-labeled positions (8-16 cards left, cardgame.oracle): an
+# 6200 oracle-labeled positions (8-16 cards left, cardgame.validation.oracle): an
 # oracle-optimal move is ordered first 58.5% of the time vs 48.3% for the
 # previous mover-marginal + denial key, uniformly across card bands
 # (held out). Ordering never changes what a search returns, only how
@@ -189,7 +189,7 @@ def _exact_move(game):
 class SearchParams:
     """Every tunable of the midgame search, in one immutable object so bot
     variants can be constructed side by side and A/B tested (see
-    `cardgame.arena`)."""
+    `cardgame.validation.arena`)."""
 
     # Upper bound on any value the search can return, used for Star1 cutoffs
     # at chance nodes - their strength scales directly with how tight this
@@ -201,12 +201,20 @@ class SearchParams:
     value_bound: float = 36.0
     win_bonus: float = 6.0
     # The leaf weights below were fitted by least squares against exact
-    # oracle values (cardgame.oracle: 2500 labeled 8-12 card positions,
+    # oracle values (cardgame.validation.oracle: 2500 labeled 8-12 card positions,
     # ~16k child-position rows; held-out rmse 6.26 -> 4.38 vs the original
     # hand-guessed 0.35/0.6/0.05/0) and validated in the arena at +6.36
     # points/pair over 200 duplicate deals (82% game score). Note the
     # centrality weight is fitted *under the linear decay*, whose shape is
     # itself unvalidated outside the fitting band.
+    # (2026-07-17: a leaf-feature round - min-replies-left, take-everything
+    # ceiling, clipped win-likelihood, best accessible marginal - improved
+    # held-out oracle RMSE 4.07 -> 3.72 in-band but was arena-refuted as a
+    # joint refit (-1.11 pts/pair; the corpus band, 8-18 cards left, does
+    # not constrain the opening eval) and arena-neutral as a residual fit
+    # over 300 pairs, so it was removed per the arena-proven-only policy.
+    # Candidates, measurements and the offline harness live in
+    # examples/leaf_eval_features.md and validation/fit_weights.py.)
     potential_weight: float = 0.238
     centrality_weight: float = 7.562
     mobility_weight: float = 0.378
@@ -280,29 +288,93 @@ class AlphaBetaBot:
             return max(diff - params.win_bonus, -params.value_bound)
         return 0.0
 
-    def _evaluate_leaf(self, game, me, opp, remaining):
-        # The search's hot spot (~3/4 of all time goes here, almost all of
-        # it in the potential loop), hence the single hand-inlined pass:
-        # one cached-DP probe per hand per remaining card, kings solved
-        # once and reused (every king has the same marginal).
+    def _full_potential(self, hand):
+        """Sum of `hand`'s marginals over the *root* remaining multiset.
+        Tokens the hand already holds contribute zero (the OR is a no-op)
+        and are skipped without a probe; every king has the same marginal,
+        solved once. Cached per hand in `_fullpot` for the whole root
+        search, so this O(cards-left) pass runs once per distinct hand."""
+        score = _score
+        hand_int, kings = hand
+        base = score(hand_int, kings)
+        total = 0
+        king_marginal = None
+        for token in self._root_tokens:
+            if token < 0:
+                if king_marginal is None:
+                    # A 4-king hand has no kings left to gain: its king
+                    # marginal is only ever multiplied by zero net remaining
+                    # kings, so any value cancels — use 0 (the DP does not
+                    # go past 4 kings). Must match _evaluate_leaf's guard.
+                    king_marginal = (
+                        score(hand_int, kings + 1) - base if kings < 4 else 0
+                    )
+                total += king_marginal
+            elif not hand_int & token:
+                total += score(hand_int | token, kings) - base
+        return total
+
+    def _evaluate_leaf(self, game, me, opp, taken, remaining):
+        # The search's hot spot. The potential term (each hand's summed
+        # marginals over the cards still on the board) is a per-card sum,
+        # so it can be computed two equivalent ways, and each leaf picks
+        # the shorter one:
+        # * direct - one probe per hand per remaining card, or
+        # * incremental - potential(hand, root remaining), cached per hand
+        #   in _fullpot, minus the marginals of the cards taken on the
+        #   path from the root: O(path length) probes.
+        # Shallow horizons (long remaining, short path) go incremental;
+        # deep endgame horizons (the reverse) go direct, which also keeps
+        # the full-board sweep from probing expensive many-king hands the
+        # direct sum never needs. All sums are integers, so values are
+        # bit-for-bit identical either way.
         params = self.params
         score = _score
         me_int, me_kings = me
         opp_int, opp_kings = opp
         my_base = score(me_int, me_kings)
         opp_base = score(opp_int, opp_kings)
-        my_potential = opp_potential = 0
         king_mine = king_opp = None
-        for token in remaining:
-            if token < 0:
-                if king_mine is None:
-                    king_mine = score(me_int, me_kings + 1) - my_base
-                    king_opp = score(opp_int, opp_kings + 1) - opp_base
-                my_potential += king_mine
-                opp_potential += king_opp
-            else:
-                my_potential += score(me_int | token, me_kings) - my_base
-                opp_potential += score(opp_int | token, opp_kings) - opp_base
+        if len(taken) < len(remaining):
+            fullpot = self._fullpot
+            my_potential = fullpot.get(me)
+            if my_potential is None:
+                my_potential = fullpot[me] = self._full_potential(me)
+            opp_potential = fullpot.get(opp)
+            if opp_potential is None:
+                opp_potential = fullpot[opp] = self._full_potential(opp)
+            for token in taken:
+                if token < 0:
+                    if king_mine is None:
+                        # 4-king guard mirrors _full_potential: the terms
+                        # cancel.
+                        king_mine = (
+                            score(me_int, me_kings + 1) - my_base
+                            if me_kings < 4 else 0
+                        )
+                        king_opp = (
+                            score(opp_int, opp_kings + 1) - opp_base
+                            if opp_kings < 4 else 0
+                        )
+                    my_potential -= king_mine
+                    opp_potential -= king_opp
+                else:
+                    if not me_int & token:
+                        my_potential -= score(me_int | token, me_kings) - my_base
+                    if not opp_int & token:
+                        opp_potential -= score(opp_int | token, opp_kings) - opp_base
+        else:
+            my_potential = opp_potential = 0
+            for token in remaining:
+                if token < 0:
+                    if king_mine is None:
+                        king_mine = score(me_int, me_kings + 1) - my_base
+                        king_opp = score(opp_int, opp_kings + 1) - opp_base
+                    my_potential += king_mine
+                    opp_potential += king_opp
+                else:
+                    my_potential += score(me_int | token, me_kings) - my_base
+                    opp_potential += score(opp_int | token, opp_kings) - opp_base
         value = float(my_base - opp_base) + params.tempo_bonus
         value += params.potential_weight * (my_potential - opp_potential)
         decay = 1.0 - len(game.moves) / 36.0
@@ -374,7 +446,8 @@ class AlphaBetaBot:
         return resolutions
 
     def _chance_value(
-        self, resolutions, depth, alpha, beta, me, opp, remaining, mask, deadline
+        self, resolutions, depth, alpha, beta, me, opp, taken, remaining,
+        mask, deadline,
     ):
         """Expected value over equally-likely face-down resolutions (Star1):
         each child is searched only in the window of contributions that could
@@ -393,9 +466,10 @@ class AlphaBetaBot:
             hi = min(n * beta - total + spread, bound)
             card = child.taken_card
             child_me = _add_card(me, card)
+            token = _TOKEN[card]
             total -= self._search(
                 child, depth - 1, -hi, -lo, opp, child_me,
-                _without(remaining, _TOKEN[card]), mask, deadline,
+                taken + (token,), _without(remaining, token), mask, deadline,
             )
             upper = (total + spread) / n
             if upper <= alpha:
@@ -420,7 +494,9 @@ class AlphaBetaBot:
             self._exact_cache[game.moves] = value
         return value
 
-    def _search(self, game, depth, alpha, beta, me, opp, remaining, mask, deadline):
+    def _search(
+        self, game, depth, alpha, beta, me, opp, taken, remaining, mask, deadline
+    ):
         if time.perf_counter() > deadline:
             raise _Timeout
         if not game.legal_moves:
@@ -448,7 +524,7 @@ class AlphaBetaBot:
                 self._tt_cuts += 1
                 return value
         if depth == 0:
-            return self._evaluate_leaf(game, me, opp, remaining)
+            return self._evaluate_leaf(game, me, opp, taken, remaining)
         markers = self._ordered_markers(game, me, opp, mask)
         if tt_move is not None and markers[0][0] != tt_move:
             for i, item in enumerate(markers):
@@ -465,14 +541,16 @@ class AlphaBetaBot:
                 child = resolutions[0]
                 card = child.taken_card
                 child_me = _add_card(me, card)
+                token = _TOKEN[card]
                 value = -self._search(
                     child, depth - 1, -beta, -alpha, opp, child_me,
-                    _without(remaining, _TOKEN[card]), child_mask, deadline,
+                    taken + (token,), _without(remaining, token),
+                    child_mask, deadline,
                 )
             else:
                 value = self._chance_value(
-                    resolutions, depth, alpha, beta, me, opp, remaining,
-                    child_mask, deadline,
+                    resolutions, depth, alpha, beta, me, opp, taken,
+                    remaining, child_mask, deadline,
                 )
             if value > best:
                 best = value
@@ -490,6 +568,10 @@ class AlphaBetaBot:
         params = self.params
         bound = params.value_bound
         self._exact_cache = {}
+        # Per-hand cache of the full-board potential (see _full_potential);
+        # valid for exactly one root search, whose remaining multiset is
+        # fixed in _root_tokens.
+        self._fullpot = {}
         # Fresh table per root search: keys are per-deal (card -> cell
         # mappings differ between deals) and per-position entries go stale
         # as the game advances anyway (the taken-cell mask only grows).
@@ -502,7 +584,9 @@ class AlphaBetaBot:
         else:
             me, opp = game.p2.as_int, game.p1.as_int
 
-        remaining = tuple(_TOKEN[card] for card in _remaining_cards(game))
+        remaining = self._root_tokens = tuple(
+            _TOKEN[card] for card in _remaining_cards(game)
+        )
         mask = 0
         for row, col in game.moves:
             mask |= 1 << (row * 6 + col)
@@ -528,14 +612,16 @@ class AlphaBetaBot:
                         child = resolutions[0]
                         card = child.taken_card
                         child_me = _add_card(me, card)
+                        token = _TOKEN[card]
                         value = -self._search(
                             child, depth - 1, -bound, -alpha, opp, child_me,
-                            _without(remaining, _TOKEN[card]), child_mask, deadline,
+                            (token,), _without(remaining, token),
+                            child_mask, deadline,
                         )
                     else:
                         value = self._chance_value(
                             resolutions, depth, alpha, bound, me, opp,
-                            remaining, child_mask, deadline,
+                            (), remaining, child_mask, deadline,
                         )
                     scores[marker] = value
                     if value > alpha:
