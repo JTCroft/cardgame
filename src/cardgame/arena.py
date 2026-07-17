@@ -22,7 +22,7 @@ A bot is specified as:
   *current* rest of the package
 
 Any spec may carry `SearchParams` overrides as a query string, e.g.
-``current?exact_leaf_cards=0&order_denial_weight=0.5`` — the module must
+``current?exact_leaf_cards=6&tempo_bonus=0.0`` — the module must
 expose `AlphaBetaBot`/`SearchParams` (values are parsed as Python literals).
 
 Typical use after making a change (committed baseline vs working tree):

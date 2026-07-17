@@ -69,6 +69,35 @@ def _centrality_table():
 _CENTRALITY = _centrality_table()
 _KING_CENTRALITY = 1.0
 
+# Move-ordering score weights, fitted by within-position least squares on
+# 6200 oracle-labeled positions (8-16 cards left, cardgame.oracle): an
+# oracle-optimal move is ordered first 58.5% of the time vs 48.3% for the
+# previous mover-marginal + denial key, uniformly across card bands
+# (held out). Ordering never changes what a search returns, only how
+# early it cuts. `replies` is the number of moves the opponent is left
+# with - restricting opponent mobility orders well (negative weight).
+_ORDER_ME = 0.5883
+_ORDER_OPP = 0.1114
+_ORDER_CENT = 2.8549
+_ORDER_KING = 0.2874
+_ORDER_FD = -0.1927
+_ORDER_REPLIES = -0.4922
+
+# Bitmask of the cells reachable from each marker (its row and column,
+# self excluded), so opponent reply counts cost one AND + popcount
+# against the taken-cell mask.
+_REPLY_MASK = {
+    (i, j): sum(
+        1 << (r * 6 + c)
+        for r, c in (
+            {(i, j2) for j2 in range(6)} | {(i2, j) for i2 in range(6)}
+        )
+        - {(i, j)}
+    )
+    for i in range(6)
+    for j in range(6)
+}
+
 # Hands are carried through the search as (hand_int, num_kings) pairs in the
 # same encoding as Hand.as_int, so scores come from the cached DP directly.
 
@@ -191,10 +220,6 @@ class SearchParams:
     # comparisons against terminal values, where it correctly encodes
     # that a live position is worth more than its bare score.
     tempo_bonus: float = 2.367
-    # Move ordering weight on denial: a cell's ordering key is the mover's
-    # marginal gain plus this times the opponent's marginal for the same
-    # card. Ordering-only - it never changes what a search returns.
-    order_denial_weight: float = 1.0
     # Face-down moves branch into one child per possible hidden card; deeper
     # in the tree the expectation is approximated with this many
     # evenly-spaced samples of the rank-ordered possibilities.
@@ -299,32 +324,45 @@ class AlphaBetaBot:
         indices = [round(i * last / (cap - 1)) for i in range(cap)]
         return tuple(ordered[i] for i in indices)
 
-    def _ordered_markers(self, game, me, opp):
+    def _ordered_markers(self, game, me, opp, mask):
         """Legal moves as (marker, facedown), best-looking first for the
         mover, with no child games constructed - callers build resolutions
         only for moves that are actually searched, so moves behind a cutoff
-        cost nothing. A card's pull is what it adds to the mover's hand
-        plus what taking it denies the opponent - both marginals come from
-        the same cached DP, so denial-awareness is nearly free."""
-        denial = self.params.order_denial_weight
-        facedown_mean = None
+        cost nothing. The key is the fitted _ORDER_* score: the card's
+        marginal to each hand (cached DP), its static centrality/king
+        value, the face-down flag (means over the hidden multiset), and
+        how many replies the move leaves the opponent (one popcount
+        against `mask`, the taken-cell bitmask)."""
+        facedown_key = None
         board = game.board
         facedown_positions = board.facedown_positions
         moves = []
         for marker in game.legal_moves:
+            replies = (_REPLY_MASK[marker] & ~mask).bit_count()
             if marker in facedown_positions:
-                if facedown_mean is None:
+                if facedown_key is None:
                     hidden = board.facedown_cards
-                    facedown_mean = sum(
-                        _marginal(me, card) + denial * _marginal(opp, card)
-                        for card in hidden
-                    ) / len(hidden)
-                key, facedown = facedown_mean, True
+                    total = 0.0
+                    for card in hidden:
+                        total += _ORDER_ME * _marginal(me, card)
+                        total += _ORDER_OPP * _marginal(opp, card)
+                        if card[0] is Rank.K:
+                            total += _ORDER_CENT * _KING_CENTRALITY + _ORDER_KING
+                        else:
+                            total += _ORDER_CENT * _CENTRALITY[card[0] - 1]
+                    facedown_key = total / len(hidden) + _ORDER_FD
+                key, facedown = facedown_key, True
             else:
                 cell = board[marker[0]][marker[1]]
-                key = _marginal(me, cell) + denial * _marginal(opp, cell)
+                key = _ORDER_ME * _marginal(me, cell) + _ORDER_OPP * _marginal(
+                    opp, cell
+                )
+                if cell[0] is Rank.K:
+                    key += _ORDER_CENT * _KING_CENTRALITY + _ORDER_KING
+                else:
+                    key += _ORDER_CENT * _CENTRALITY[cell[0] - 1]
                 facedown = False
-            moves.append((key, marker, facedown))
+            moves.append((key + _ORDER_REPLIES * replies, marker, facedown))
         moves.sort(key=lambda entry: (-entry[0], entry[1]))
         return [(marker, facedown) for _, marker, facedown in moves]
 
@@ -411,7 +449,7 @@ class AlphaBetaBot:
                 return value
         if depth == 0:
             return self._evaluate_leaf(game, me, opp, remaining)
-        markers = self._ordered_markers(game, me, opp)
+        markers = self._ordered_markers(game, me, opp, mask)
         if tt_move is not None and markers[0][0] != tt_move:
             for i, item in enumerate(markers):
                 if item[0] == tt_move:
@@ -472,7 +510,7 @@ class AlphaBetaBot:
         # them across every deepening iteration.
         moves = [
             (marker, self._resolutions(game, marker, facedown))
-            for marker, facedown in self._ordered_markers(game, me, opp)
+            for marker, facedown in self._ordered_markers(game, me, opp, mask)
         ]
         best_marker = moves[0][0]
         max_depth = 36 - len(game.moves)

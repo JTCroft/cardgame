@@ -29,6 +29,13 @@ _cached_score = lru_cache(maxsize=1 << 20)(score_dp)
 _FACTORIAL = tuple(factorial(n) for n in range(13))
 
 
+# Legal-move memo shared by every game: the marker cell plus the occupancy
+# of its row and column fully determine the legal set, and the marker's own
+# bits are always set in the key, so there are at most 36 * 32 * 32 distinct
+# keys process-wide. Values are frozensets, shared rather than rebuilt.
+_LEGAL_MEMO = {}
+
+
 def _common_prefix(move_sequences):
     prefix = []
     for elements in zip(*move_sequences):
@@ -364,36 +371,67 @@ class Game:
         return self.moves[-1] if self.moves else self.starting_position
 
     @property
+    def _taken_masks(self):
+        # Row-major and column-major occupancy bitmasks of the taken cells.
+        # Built once per game from the move list; `move` and `all_moves`
+        # extend them incrementally so search descents never rebuild them.
+        try:
+            return self._taken_masks_cache
+        except AttributeError:
+            rows = cols = 0
+            for r, c in self.moves:
+                rows |= 1 << (r * 6 + c)
+                cols |= 1 << (c * 6 + r)
+            self._taken_masks_cache = (rows, cols)
+            return self._taken_masks_cache
+
+    @property
     def legal_moves(self):
-        # Memoised: games are immutable, and the search consults this
-        # several times per node.
+        # Memoised twice: per game (games are immutable, and the search
+        # consults this several times per node), and globally via
+        # _LEGAL_MEMO - two shifts and a dict probe replace the set
+        # difference over the whole move list.
         try:
             return self._legal_moves_cache
         except AttributeError:
-            self._legal_moves_cache = self.possible_moves[self.marker] - set(self.moves)
-            return self._legal_moves_cache
+            pass
+        row, col = self.moves[-1] if self.moves else self.starting_position
+        rows, cols = self._taken_masks
+        # The marker's own bits are forced on so the root marker (whose
+        # starting cell was never taken) excludes itself like any other.
+        row_bits = ((rows >> (row * 6)) | (1 << col)) & 63
+        col_bits = ((cols >> (col * 6)) | (1 << row)) & 63
+        key = (row * 6 + col, row_bits, col_bits)
+        legal = _LEGAL_MEMO.get(key)
+        if legal is None:
+            legal = frozenset(
+                [(row, j) for j in range(6) if not row_bits >> j & 1]
+                + [(i, col) for i in range(6) if not col_bits >> i & 1]
+            )
+            _LEGAL_MEMO[key] = legal
+        self._legal_moves_cache = legal
+        return legal
 
     def all_moves(self):
         for row, col in self.legal_moves:
-            new_moves = self.moves + ((row, col),)
-            if self.board[row][col].facedown:
-                yield tuple(
-                    self.__class__(new_board, new_moves)
-                    for new_board in self.board.resolve(row, col)
-                )
-            else:
-                yield (self.__class__(self.board, new_moves),)
+            yield self.move(row, col)
 
     def move(self, row, col):
         if (row, col) not in self.legal_moves:
             raise ValueError("Illegal move")
         new_moves = self.moves + ((row, col),)
+        rows, cols = self._taken_masks
+        masks = (rows | 1 << (row * 6 + col), cols | 1 << (col * 6 + row))
         if self.board[row][col].facedown:
-            return tuple(
+            children = tuple(
                 self.__class__(new_board, new_moves)
                 for new_board in self.board.resolve(row, col)
             )
-        return (self.__class__(self.board, new_moves),)
+        else:
+            children = (self.__class__(self.board, new_moves),)
+        for child in children:
+            child._taken_masks_cache = masks
+        return children
 
     def random_move(self):
         return choice(choice(list(self.all_moves())))

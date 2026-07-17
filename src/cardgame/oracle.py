@@ -150,7 +150,7 @@ def fixed_depth_move(bot, game, depth):
     deadline = float("inf")
     alpha = -bound
     best = None
-    for marker, facedown in bot._ordered_markers(game, me, opp):
+    for marker, facedown in bot._ordered_markers(game, me, opp, mask):
         child_mask = mask | (1 << (marker[0] * 6 + marker[1]))
         resolutions = bot._resolutions(game, marker, facedown)
         if len(resolutions) == 1:
