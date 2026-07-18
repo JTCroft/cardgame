@@ -216,22 +216,29 @@ data "aws_iam_policy_document" "operator" {
   }
 
   # Lets cardgame-update run a git-pull-and-restart one-liner on the
-  # instance without an interactive session - same tag-scoping approach as
-  # SessionManagerShellAccess above.
+  # instance without an interactive session. Unlike StartSession, SendCommand
+  # authorizes the target instance and the document as two separate
+  # resources - the tag condition can only ever apply to the instance (the
+  # AWS-owned document has no tags of its own), so they need separate
+  # statements rather than one combined one like SessionManagerShellAccess.
   statement {
-    sid     = "RemoteUpdateCommand"
-    effect  = "Allow"
-    actions = ["ssm:SendCommand"]
-    resources = [
-      "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
-      "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
-    ]
+    sid       = "RemoteUpdateCommandOnInstance"
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"]
 
     condition {
       test     = "StringEquals"
       variable = "ssm:resourceTag/Project"
       values   = [var.project_tag]
     }
+  }
+
+  statement {
+    sid       = "RemoteUpdateCommandDocument"
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript"]
   }
 
   # ssm:GetCommandInvocation/ListCommandInvocations key off a command ID,

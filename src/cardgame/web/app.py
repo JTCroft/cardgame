@@ -53,6 +53,7 @@ multiple workers):
 - `extensions.py` - the shared `socketio` instance `rooms.py` emits through.
 """
 
+import importlib.metadata
 import os
 import random
 import secrets
@@ -130,6 +131,10 @@ def create_app():
             PackageLoader(package_name="cardgame", package_path="../../templates"),
         ]
     )
+
+    @app.context_processor
+    def inject_app_version():
+        return {"app_version": importlib.metadata.version("cardgame")}
 
     @app.get("/")
     def index():

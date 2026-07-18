@@ -64,6 +64,14 @@
         cursor: pointer;
     }
     .nav-menu a:hover, .nav-menu button:hover { background: #454545; }
+    .nav-version {
+        display: block;
+        padding: 8px 10px;
+        font-size: 0.8em;
+        color: #888;
+        border-top: 1px solid #444;
+        margin-top: 4px;
+    }
     .site-nav .nav-extra {
         display: flex;
         gap: 16px;
