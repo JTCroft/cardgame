@@ -67,6 +67,10 @@ def _centrality_table():
 
 
 _CENTRALITY = _centrality_table()
+# King centrality inside the *move-ordering* key only: the _ORDER_*
+# weights below were jointly fitted with kings pinned at 1.0, so this
+# stays a constant alongside them. The evaluation's king centrality is
+# SearchParams.king_centrality (same 1.0 default, independently tunable).
 _KING_CENTRALITY = 1.0
 
 # Move-ordering score weights, fitted by within-position least squares on
@@ -115,9 +119,9 @@ def _marginal(hand, card):
 
 
 @lru_cache(maxsize=1 << 16)
-def _centrality_sum(hand):
+def _centrality_sum(hand, king_centrality=1.0):
     hand_int, kings = hand
-    total = kings * _KING_CENTRALITY
+    total = kings * king_centrality
     for rank in range(8):
         total += _CENTRALITY[rank] * ((hand_int >> rank) & _RANK_MASK).bit_count()
     return total
@@ -187,9 +191,14 @@ def _exact_move(game):
 
 @dataclass(frozen=True)
 class SearchParams:
-    """Every tunable of the midgame search, in one immutable object so bot
+    """Every *behavioral* tunable of the midgame search - anything that can
+    change what the search returns - in one immutable object so bot
     variants can be constructed side by side and A/B tested (see
-    `cardgame.validation.arena`)."""
+    `cardgame.validation.arena`). Fitted machinery constants that only
+    affect search speed (the `_ORDER_*` move-ordering weights) or that are
+    a feature's internal shape (the `_CENTRALITY` table) live at module
+    level: they are outputs of offline fits, only coherent to change by
+    refitting, and arena-invisible individually."""
 
     # Upper bound on any value the search can return, used for Star1 cutoffs
     # at chance nodes - their strength scales directly with how tight this
@@ -218,6 +227,39 @@ class SearchParams:
     potential_weight: float = 0.238
     centrality_weight: float = 7.562
     mobility_weight: float = 0.378
+    # King centrality relative to the 0..1 rank table (4/5 = 1.0) inside
+    # the evaluation's centrality sum. Pinned at 1.0; a free fit prices
+    # kings at ~1.13x a 4/5 (2026-07-16), close enough that the pin
+    # survived. Fittable via fit_weights' king-centrality column.
+    king_centrality: float = 1.0
+    # Phase slopes (2026-07-17, fitted on the exact corpus + the 19-30-card
+    # bootstrap corpus, data/bootstrap_labels.jsonl): each base weight may
+    # vary linearly in cards left ABOVE the in-band anchor,
+    # w_eff = weight + slope * max(cards_left - 12, 0), so play at <= 12
+    # cards is exactly the arena-validated champion and the correction
+    # ramps in toward the opening, where per-band fits show potential
+    # (0.24 -> ~0.07 by 27 cards) and the tempo constant genuinely decay.
+    # The centrality linear-decay shape needs no correction - the
+    # bootstrap fit reproduces it (0.178*cl vs the implied 0.210*cl);
+    # `centrality_base` adds a flat floor to that decayed term,
+    # (centrality_base + centrality_weight * cl / 36) * raw_centrality.
+    # Setting the slopes to 0 recovers the phase-flat champion exactly.
+    # Arena status (2026-07-18): +0.24 +/- 0.21 pts/pair pooled over 400
+    # pairs across two seeds (p~0.26) - consistently positive, below the
+    # proof threshold (~1,200 pairs for this effect size). Kept as
+    # defaults by decision: the change is bit-identical at <= 12 cards
+    # and in-band agreement-neutral, so it can only affect opening play,
+    # where the offline evidence (held-out RMSE 2.5-2.9 -> 1.5-2.3 above
+    # 16 cards vs the bootstrap labels) is strong.
+    potential_slope: float = -0.01199
+    centrality_base: float = 0.0
+    mobility_slope: float = 0.00037
+    tempo_slope: float = -0.1182
+    # Where the phase ramp starts, in cards left. The slopes above are
+    # only valid at the pivot they were fitted against - changing this
+    # requires refitting them (fit_weights' phase-fit section grids over
+    # pivots); it is a parameter for that refit loop, not a free knob.
+    phase_pivot: float = 12.0
     # (Empirical per-rank-class material and same-suit proximity features
     # were tried here and removed: arena-refuted / no fit gain - the DP
     # potential and centrality terms already carry that information from
@@ -375,16 +417,23 @@ class AlphaBetaBot:
                 else:
                     my_potential += score(me_int | token, me_kings) - my_base
                     opp_potential += score(opp_int | token, opp_kings) - opp_base
+        cards_left = 36.0 - len(game.moves)
+        pivot = params.phase_pivot
+        phase = cards_left - pivot if cards_left > pivot else 0.0
         value = float(my_base - opp_base) + params.tempo_bonus
-        value += params.potential_weight * (my_potential - opp_potential)
-        decay = 1.0 - len(game.moves) / 36.0
+        value += params.tempo_slope * phase
+        value += (
+            params.potential_weight + params.potential_slope * phase
+        ) * (my_potential - opp_potential)
+        decay = cards_left / 36.0
         if decay > 0:
+            kc = params.king_centrality
             value += (
-                params.centrality_weight
-                * decay
-                * (_centrality_sum(me) - _centrality_sum(opp))
-            )
-        value += params.mobility_weight * len(game.legal_moves)
+                params.centrality_base + params.centrality_weight * decay
+            ) * (_centrality_sum(me, kc) - _centrality_sum(opp, kc))
+        value += (
+            params.mobility_weight + params.mobility_slope * phase
+        ) * len(game.legal_moves)
         return min(params.value_bound, max(-params.value_bound, value))
 
     def _sample_resolutions(self, resolutions):
