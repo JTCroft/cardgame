@@ -8,7 +8,9 @@ set -euo pipefail
 
 dnf install -y git jq
 
-curl -fsSL "https://github.com/caddyserver/caddy/releases/latest/download/caddy_linux_arm64.tar.gz" -o /tmp/caddy.tar.gz
+CADDY_URL=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest \
+  | jq -r '.assets[] | select(.name | test("linux_arm64\\.tar\\.gz$")) | .browser_download_url')
+curl -fsSL "$CADDY_URL" -o /tmp/caddy.tar.gz
 tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
 chmod +x /usr/local/bin/caddy
 
