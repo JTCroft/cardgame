@@ -104,13 +104,30 @@ sudo journalctl -u cardgame-web -f
 ## Deploying app code changes
 
 The boot script only clones the repo on the instance's *first* boot. To
-pick up new commits on an existing instance:
+pick up new commits on an existing instance, first push them to whichever
+branch `git_ref` is currently set to in `terraform.tfvars` (check there if
+unsure - it won't always be `main`), then either:
+
+**One-liner from your desktop** (`cardgame-update` in `~/.zshrc`, added
+alongside `cardgame-start`/`cardgame-stop`) - runs the same steps below via
+SSM Run Command, no interactive session:
 
 ```bash
-aws ssm start-session --target "$INSTANCE_ID" --profile cardgame
-# once connected:
+cardgame-update
+```
+
+It has the branch name (`web-ui` right now) hardcoded in the function body
+- if you ever change `git_ref` in `terraform.tfvars`, update the matching
+`git reset --hard origin/<branch>` line in `~/.zshrc` too, they don't stay
+in sync automatically.
+
+**Or manually**, if you want to see output live or debug a failure:
+
+```bash
+aws ssm start-session --target "$(cardgame-id)" --profile cardgame
+# once connected (replace <branch> with your actual git_ref):
 cd /opt/cardgame
-sudo git fetch origin && sudo git reset --hard origin/main
+sudo git fetch origin && sudo git reset --hard "origin/<branch>"
 sudo /usr/local/bin/uv sync --extra web
 sudo systemctl restart cardgame-web
 ```

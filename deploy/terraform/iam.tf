@@ -90,6 +90,7 @@ data "aws_iam_policy_document" "provisioning" {
       "iam:AddRoleToInstanceProfile",
       "iam:RemoveRoleFromInstanceProfile",
       "iam:GetRole",
+      "iam:GetRolePolicy",
       "iam:GetInstanceProfile",
       "iam:GetPolicy",
       "iam:GetPolicyVersion",
@@ -208,6 +209,34 @@ data "aws_iam_policy_document" "operator" {
       "ssm:DescribeInstanceInformation",
       "ssm:GetConnectionStatus",
     ]
+    resources = ["*"]
+  }
+
+  # Lets cardgame-update run a git-pull-and-restart one-liner on the
+  # instance without an interactive session - same tag-scoping approach as
+  # SessionManagerShellAccess above.
+  statement {
+    sid     = "RemoteUpdateCommand"
+    effect  = "Allow"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+      "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Project"
+      values   = [var.project_tag]
+    }
+  }
+
+  # ssm:GetCommandInvocation/ListCommandInvocations key off a command ID,
+  # not an instance ARN, so they aren't resource-scopable the same way.
+  statement {
+    sid       = "RemoteUpdateCommandStatus"
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
     resources = ["*"]
   }
 }
