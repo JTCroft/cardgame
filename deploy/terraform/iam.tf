@@ -107,6 +107,24 @@ data "aws_iam_policy_document" "provisioning" {
     ]
   }
 
+  # Lets the operator user manage *its own* user resource on future
+  # `terraform apply` runs, so a bootstrap admin identity is only ever
+  # needed once, for the very first apply (before this user exists at all).
+  statement {
+    sid    = "ManageOwnOperatorUser"
+    effect = "Allow"
+    actions = [
+      "iam:CreateUser",
+      "iam:DeleteUser",
+      "iam:GetUser",
+      "iam:TagUser",
+      "iam:AttachUserPolicy",
+      "iam:DetachUserPolicy",
+      "iam:ListAttachedUserPolicies",
+    ]
+    resources = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:user/${var.project_tag}-*"]
+  }
+
   # Deliberately scoped: only lets you hand a cardgame-* role to EC2, not
   # to anything else, and not any other role. Without this condition a
   # user with iam:PassRole could attach an unrelated, more privileged role

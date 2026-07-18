@@ -6,7 +6,7 @@ subdomain      = "play.example.com"
 
 # Defaults below are usually fine as-is.
 # instance_type    = "t4g.micro"
-# root_volume_gb   = 8
+# root_volume_gb   = 30 # AL2023 arm64 AMI's snapshot requires at least this
 # github_repo_url  = "https://github.com/JTCroft/cardgame.git"
 # git_ref          = "main"
 # create_iam_user  = true

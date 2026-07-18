@@ -27,9 +27,9 @@ variable "instance_type" {
 }
 
 variable "root_volume_gb" {
-  description = "Root EBS volume size in GB. This is the one cost that's charged whether the instance is running or stopped."
+  description = "Root EBS volume size in GB. This is the one cost that's charged whether the instance is running or stopped. The AL2023 arm64 AMI's snapshot currently requires at least 30."
   type        = number
-  default     = 8
+  default     = 30
 }
 
 variable "github_repo_url" {

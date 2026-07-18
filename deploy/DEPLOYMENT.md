@@ -126,10 +126,10 @@ With occasional use (a few hours a month):
 | Item | Cost |
 |---|---|
 | EC2 t4g.micro, only while running | ~$0.008/hr → pennies/month |
-| EBS gp3 8GB root volume (billed even while stopped) | ~$0.65/month |
+| EBS gp3 30GB root volume (billed even while stopped - the AL2023 arm64 AMI's snapshot requires at least this) | ~$2.40/month |
 | Public IPv4 (only while running) | ~$0.005/hr → pennies/month |
 | Route 53 hosted zone | $0.50/month |
-| **Total** | **~$1-2/month** |
+| **Total** | **~$3/month** |
 
 Leaving it running by accident costs at most ~$6-7/month (24/7 t4g.micro)
 — not runaway. There's no idle-shutdown timer in this setup (you chose
