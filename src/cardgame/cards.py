@@ -7,8 +7,8 @@ env = Environment(
     loader=PackageLoader(package_name="cardgame", package_path="../../templates")
 )
 
-Suit = IntEnum("suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
-Rank = IntEnum("rank", names=list("A2345678K"))
+Suit = IntEnum("Suit", names=("hearts", "clubs", "diamonds", "spades"), start=0)
+Rank = IntEnum("Rank", names=list("A2345678K"))
 
 
 class Card(tuple):
@@ -23,6 +23,12 @@ class Card(tuple):
             instance = super().__new__(cls, (Rank(rank), Suit(suit)))
         instance.facedown = facedown
         return instance
+
+    def __getnewargs__(self):
+        # Card.__new__ doesn't match tuple's default pickling: it takes
+        # rank/suit as separate args rather than the packed tuple, and
+        # facedown lives on the instance, not in the tuple contents at all.
+        return (self[0], self[1], self.facedown)
 
     @classmethod
     def from_str(cls, card_str):

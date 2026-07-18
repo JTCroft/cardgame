@@ -19,6 +19,7 @@ call into, kept separate so app.py can stay focused on request/event
 wiring.
 """
 
+import os
 import random
 import re
 import secrets
@@ -26,12 +27,13 @@ import string
 import threading
 import time
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 
 from flask import render_template
 
 from ..ai import choose_move
-from ..analysis import AnalysisAborted, analyse_moves
+from ..analysis import analyse_moves_by_deadline
 from ..game import Game
 from ..search_alt import _snapshot as _search_snapshot
 from ..search_alt import move_search_iterator
@@ -57,6 +59,18 @@ def _normalize_code(raw_code):
 @dataclass
 class RoomState:
     game: Game
+    # Stable identity for the current match, distinct from the room itself:
+    # a room persists across rematches, but each dealt game gets its own id,
+    # generated fresh alongside `game` (see the rematch handlers in app.py
+    # and _get_or_create_room). Doubles as the frozen _finished_rooms entry's
+    # id once the match ends (see _record_room_finished_locked) - a match's
+    # review URL is therefore fixed from the moment it's dealt, not just
+    # decided at the end - and lets the analysis worker tell "this room
+    # rematched out from under me" apart from "this is still the same
+    # match" with one direct equality check instead of comparing the
+    # identity of the analysis dict/set it was reset to (see
+    # _analysis_worker_loop).
+    game_id: str = field(default_factory=lambda: secrets.token_hex(8))
     # Which player id currently occupies each human seat: {1: player_id, 2: player_id}.
     # A seat with no entry is vacant, unless it's the computer's (see
     # computer_seat) - claiming/leaving are still explicit actions
@@ -97,33 +111,40 @@ class RoomState:
     # Cleared whenever a new game is dealt.
     game_over_seen: set = field(default_factory=set)
     # Post-game move-comparison analyses, {move_index: analyse_moves(...)}.
-    # Filled from two cooperating sources sharing this dict: a live worker
-    # that analyses already-played positions *during* the game (each
-    # position is fixed the moment its move is made, and a long game
-    # donates its thinking time to the deep, expensive ones - see
-    # _live_analysis_loop), and the post-game drain that fills the cheap
-    # tail at game end (_precompute_analysis). Shared with the frozen
-    # _finished_rooms entry recorded at game end - same dict object, so
-    # late-finishing live analyses still land in the review. Reset to None
-    # on a fresh deal (the frozen entry keeps the old dict).
+    # Filled by a single worker (_analysis_worker_loop) that analyses
+    # already-played positions both *during* the game (each position is
+    # fixed the moment its move is made, and a long game donates its
+    # thinking time to the deep, expensive ones) and for a bounded grace
+    # period *after* it ends (see analysis_deadline) - the same walk just
+    # keeps going, so nothing already in flight when the game ends is
+    # thrown away. Shared with the frozen _finished_rooms entry recorded at
+    # game end - same dict object, so late-finishing analyses still land in
+    # the review. Reset to None on a fresh deal (the frozen entry keeps the
+    # old dict).
     analysis: dict | None = None
-    # Move indices currently being analysed by the live worker, so the
-    # post-game drain doesn't duplicate a minutes-long computation.
-    # Replaced (not cleared) on a fresh deal, since the frozen entry
-    # shares the old set.
+    # Move indices currently being analysed by the worker, so a fresh
+    # request doesn't duplicate a minutes-long computation already in
+    # flight. Replaced (not cleared) on a fresh deal, since the frozen
+    # entry shares the old set.
     analysis_inflight: set = field(default_factory=set)
-    # Guard so at most one live analysis worker runs per room.
+    # Guard so at most one analysis worker runs per room.
     analysis_running: bool = False
-    # Cooperative abort for the live worker's current analysis: set when
-    # the game ends (see _record_room_finished_locked) so an unbounded
-    # backtracking analysis stops burning CPU on a game nobody is playing
-    # any more. Replaced with a fresh event on a new deal.
-    analysis_abort: threading.Event = field(default_factory=threading.Event)
+    # Wall-clock (time.monotonic()) deadline for the worker's *post-game*
+    # grace period, set once the game ends (see _record_room_finished_locked)
+    # so an unbounded backtracking analysis eventually stops burning CPU on
+    # a game nobody is playing any more - but not before it's had a real
+    # window to finish whatever it was already doing. None while a game is
+    # in progress (unbounded - the running game itself is the budget).
+    # Deliberately left untouched by a rematch: the worker notices its game
+    # has moved on and clears it itself once it's safe to (see
+    # _analysis_worker_loop), so a still-draining previous game keeps its
+    # own correct cutoff instead of being cut short or freed to run forever.
+    analysis_deadline: float | None = None
     # Whether this (solo) room is in "live eval" mode: a background thread
     # runs the anytime search (cardgame.search_alt) on whatever the current
     # position is, pushing a continuously-updating move ranking to every
-    # connected socket. Set by the owner's entry point (/play/live vs
-    # /play) at join time.
+    # connected socket. Set by the owner's entry point
+    # (/play?show_live_eval=true vs /play) at join time.
     live_eval: bool = False
     # Guard so at most one live-eval thread runs per room; the thread
     # clears it when it exits (no viewers / mode switched off) so a later
@@ -229,32 +250,66 @@ _sid_index_lock = threading.Lock()
 # moment, a per-viewer history-scrubbing position, a unique id, and whether
 # it was a solo (vs. computer) game - so it can be reviewed later even
 # after the room has gone into a rematch, and so the /rooms lobby's
-# "Recently finished games" table can link each entry to the right route
-# ("review_room" vs "review_solo") - see _room_review_context, which reads
-# from this frozen entry rather than the live RoomState.
+# "Recently finished games" table can link each entry to a single "review"
+# route that dispatches on its "is_solo" flag - see _room_review_context,
+# which reads from this frozen entry rather than the live RoomState.
 _finished_rooms: list[dict] = []
 _finished_rooms_lock = threading.Lock()
 
 
-# Total background time spent analysing any one finished game. Positions
-# are analysed newest-first with monotonically growing cost (going
-# backwards only ever adds cards and unknowns) - observed growth is
-# roughly 3-15x per ply, so the walk stops once the next (costlier)
-# position can no longer plausibly fit the remaining budget.
+# Total background time spent analysing any one finished game.
 _ANALYSIS_TIME_CAP = 120.0
-_ANALYSIS_GROWTH_FACTOR = 6
+
+# _analysis_worker_loop runs exactly two concurrent analyse_moves calls,
+# each with a fixed, reserved role (see the function's docstring): one
+# always chasing the newest attemptable position, the other always
+# extending one step further back into history. Neither role ever
+# borrows the other's slot, even when idle - a backward call can run for
+# a very long time, and if it were allowed to occupy both slots, a fresh
+# move played in the meantime would have to wait behind it. The reserved
+# forward slot guarantees that never happens, at the cost of sitting idle
+# whenever there's nothing new to catch up on.
+
+# Hard per-call backstop, regardless of live play or the post-game grace
+# period: bounds a single analyse_moves call in case its actual cost
+# doesn't match what _analysis_attemptable (or the unbounded backtrack)
+# expected, so a bad estimate can only ever tie up its own slot for a
+# bounded time - not indefinitely, and not at the expense of the other
+# slot's role.
+_ANALYSIS_CALL_SAFETY_CAP = 30 * 60
+
+# Shared, app-wide pool that runs analyse_moves calls in separate
+# processes - CPU-bound pure Python, so plain threads here would just take
+# turns on one core rather than adding capacity. Lazily created so
+# importing this module doesn't spawn worker processes unless analysis is
+# actually used; bounded by CPU count regardless of how many rooms are
+# active, since ProcessPoolExecutor queues submissions beyond max_workers
+# rather than running them all at once.
+_analysis_pool = None
+_analysis_pool_lock = threading.Lock()
+
+
+def _get_analysis_pool():
+    global _analysis_pool
+    with _analysis_pool_lock:
+        if _analysis_pool is None:
+            _analysis_pool = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
+        return _analysis_pool
 
 
 def _analysis_feasible(game):
-    """Hard ceiling on which positions `analyse_moves` may even attempt -
-    calibrated against worst cases over sampled random games (recalibrated
-    2026-07 after the cached-scoring / single-pass-walk optimisations,
-    which bought roughly 8-30x here). The adaptive soft stop in
-    _precompute_analysis does the fine-grained cost control; this only
-    rules out the combinations whose worst cases run into minutes. It
-    walks the full remaining tree with no pruning, so it's viable only
-    near the end of the game; as with Game.evaluate, the chance-node
-    branching from face-down cards is the main cost driver.
+    """Whether a position is cheap enough that the review page should show
+    "pending" rather than nothing at all while the worker hasn't reached it
+    yet - calibrated against worst cases over sampled random games
+    (recalibrated 2026-07 after the cached-scoring / single-pass-walk
+    optimisations, which bought roughly 8-30x here). The worker itself
+    (_analysis_worker_loop) uses the wider _analysis_attemptable instead and
+    isn't bound by this at all once backtracking past it, so this is purely
+    about not promising a viewer "coming soon" for something that in
+    practice never finishes. It walks the full remaining tree with no
+    pruning, so it's only meaningful near the end of the game; as with
+    Game.evaluate, the chance-node branching from face-down cards is the
+    main cost driver.
     """
     # The next combinations out - (14, 5), (15, 4), (16, 4), (17, 3) -
     # were measured at 100-336s for a single position, past any sensible
@@ -296,107 +351,281 @@ def _analysis_attemptable(game):
     return False
 
 
-def _precompute_analysis(game, cache, inflight=frozenset(), on_done=None):
-    """Fill `cache[move_index]` with `analyse_moves` of the position after
-    `move_index` moves, walking backwards from the last move played until
-    a position is past the hard ceiling, the previous position already
-    took long enough that the next (always costlier) one shouldn't be
-    started, or the total budget is spent. Skips indices already analysed
-    (typically by the live worker during the game) or currently in flight
-    there. Runs on a background thread - see _record_room_finished_locked.
-    """
-    deadline = time.monotonic() + _ANALYSIS_TIME_CAP
-    total = len(game.moves)
-    for index in range(total - 1, -1, -1):
-        if index in cache or index in inflight:
+def _newest_attemptable_index(game, total, done, upper):
+    """The newest index in range(upper) not already in `done` whose
+    position satisfies _analysis_attemptable, or None if there isn't one.
+    Shared by _analysis_worker_loop's backward slot (bootstrapping itself
+    when nothing's been analysed yet at all) and forward slot (its
+    ordinary catch-up scan)."""
+    for k in reversed(range(upper)):
+        if k in done:
             continue
-        position = game.undo(total - index)
-        if not _analysis_feasible(position):
-            break
-        position_start = time.monotonic()
-        cache[index] = analyse_moves(position)
-        now = time.monotonic()
-        if now >= deadline or (now - position_start) * _ANALYSIS_GROWTH_FACTOR > deadline - now:
-            break
-    if on_done is not None:
-        on_done()
+        if _analysis_attemptable(game.undo(total - k)):
+            return k
+    return None
 
 
-def _live_analysis_loop(code, room):
-    """Analyse the current game's already-played positions while it is
-    still being played: every position is fixed the moment its move is
-    made. _analysis_attemptable decides where the work *starts*; once
-    every position inside that band is done, the worker backtracks one
-    position deeper at a time with no ceiling at all - the running game
-    itself is the budget, so a long, thoughtful game buys itself review
-    depth a fixed gate never could. Results go into the same cache the
-    post-game review reads; a backtracking analysis still in flight when
-    the game ends is aborted cooperatively (room.analysis_abort, set at
-    game end) rather than left burning CPU. Exits when the game ends (the
-    post-game drain in _precompute_analysis owns the tail) or the room
-    empties."""
+def _abandon_futures(room, cache, inflight, futures):
+    """Stop tracking this room's outstanding submissions against `cache`/
+    `inflight` - called whenever the worker is giving up on that game's
+    epoch: a rematch has swapped in a new game (see the epoch check in
+    _analysis_worker_loop) or the worker itself is exiting (room emptied,
+    grace period elapsed, or any other reason). Anything already finished
+    is harvested into `cache` first, so a result that landed moments before
+    the decision to stop isn't wasted; whatever's still running gets
+    `.cancel()`'d, which only actually prevents it from starting if the
+    pool hasn't gotten to it yet - ProcessPoolExecutor has no way to stop a
+    task already running in its worker process. It's left to run to its
+    own baked-in deadline in that case, with nothing left to collect its
+    result. Either way `inflight` always gets cleared, so a later worker
+    can pick the same index up again rather than seeing it "pending"
+    forever."""
+    for index, fut in futures.items():
+        if fut.done():
+            result = fut.result()
+            if result is not None:
+                cache[index] = result
+        else:
+            fut.cancel()
+        with room.lock:
+            inflight.discard(index)
+    futures.clear()
+
+
+def _submit(pool, room, inflight, game, index, ended, deadline):
+    """Submit analyse_moves_by_deadline for the position `index` moves into
+    `game`, marking it inflight. Shared by both of _analysis_worker_loop's
+    reserved slots - only what candidate to submit differs between them."""
+    total = len(game.moves)
+    position = game.undo(total - index)
+    safety = time.monotonic() + _ANALYSIS_CALL_SAFETY_CAP
+    call_deadline = min(deadline, safety) if ended else safety
+    with room.lock:
+        inflight.add(index)
+    return pool.submit(analyse_moves_by_deadline, position, call_deadline)
+
+
+def _analysis_worker_loop(code, room):
+    """Analyse the room's already-played positions, live during the game and
+    for a bounded grace period after it ends - one continuous walk rather
+    than two, so nothing already in flight at the moment the game ends gets
+    thrown away.
+
+    Runs exactly two concurrent analyse_moves calls, each in its own process
+    (see _get_analysis_pool), with a fixed, reserved role that never borrows
+    the other's slot:
+
+    - The backward slot always extends one position further back into
+      history than anything analysed so far, with no ceiling of its own -
+      including the very first position ever analysed for this game: with
+      nothing analysed yet, it bootstraps itself by finding the newest
+      attemptable position directly (see _newest_attemptable_index), so
+      it - not the forward slot - is the one that ends up owning the
+      earliest analysed position and everything behind it. While the game
+      is in progress the running game itself is the budget - a long,
+      thoughtful game buys itself review depth a fixed gate never could.
+    - The forward slot always chases the newest not-yet-analysed position
+      that satisfies _analysis_attemptable. In practice this only ever
+      finds anything once there's a position newer than whatever the
+      backward slot has already claimed - a fresh move is the only thing
+      that can be attemptable and not already spoken for at that point.
+      This is the slot guaranteed to never fall behind: a backward call
+      can legitimately run for a very long time, and if that call were
+      ever allowed to occupy *both* slots, a freshly played move would
+      have to wait behind it before its own analysis could even start.
+      Reserving this slot rules that out entirely, at the cost of it
+      sitting idle whenever there's nothing new to catch up on (including
+      once the game has ended - there will never be another new move to
+      stay ready for).
+
+    A single call unexpectedly running long only ties up its own slot, and
+    _ANALYSIS_CALL_SAFETY_CAP bounds it regardless - it can't block the
+    other slot's role.
+
+    Once the game ends, room.analysis_deadline (set by
+    _record_room_finished_locked) gives it _ANALYSIS_TIME_CAP more seconds to
+    keep backtracking regardless of viewers, so the frozen review still gets
+    filled in even if the room empties the instant the game finishes. Each
+    call submitted from then on carries that deadline (and the safety cap,
+    whichever is sooner) baked in up front, since a separate process can't
+    be signalled to stop cooperatively the way a thread can - so a call
+    already in flight when the deadline is set still gets cut off at it,
+    rather than running to completion regardless.
+
+    Exits when the room empties (game still in progress), the post-game
+    grace period elapses, or there's nothing left to analyse.
+    """
+    pool = _get_analysis_pool()
+    futures = {}  # move_index -> Future, this room's own outstanding submissions
+    forward_index = None  # key in `futures` currently owned by the forward slot
+    backward_index = None  # key in `futures` currently owned by the backward slot
+    # Which match (RoomState.game_id) the above futures - and the cache/
+    # inflight below - actually belong to. A rematch can swap in a fresh
+    # game_id (and reset room.analysis/room.analysis_inflight to match)
+    # while a wait() below is in progress (not holding room.lock), so
+    # re-reading room.analysis/room.analysis_inflight at the top of the next
+    # iteration isn't safe to assume they still belong to the match
+    # `futures` was submitted for - checking game_id (a single, explicit
+    # equality check on the one thing that's the actual source of truth for
+    # "is this still the same match") is what tells them apart.
+    futures_game_id = None
+    futures_cache = None
+    futures_inflight = None
     try:
         while True:
+            # _abandon_futures acquires room.lock itself (it's a plain,
+            # non-reentrant Lock), so any exit that needs it is decided
+            # inside this block but only actually called after it's
+            # released, below.
+            stop, broadcast_on_exit = False, False
+            deadline = None  # only meaningful once ended - see _submit
             with room.lock:
-                if not room.sid_players:
-                    return
                 game = room.game
-                if room.analysis is None:
-                    room.analysis = {}
-                cache = room.analysis
-                inflight = room.analysis_inflight
-                abort = room.analysis_abort
-            if not game.legal_moves:
+                game_id = room.game_id
+                ended = not game.legal_moves
+                if ended:
+                    deadline = room.analysis_deadline
+                    if deadline is None or time.monotonic() >= deadline:
+                        stop = broadcast_on_exit = True
+                else:
+                    if room.analysis_deadline is not None:
+                        # Leftover from a previous game a rematch has since
+                        # replaced - safe to clear now since nothing can
+                        # still be relying on it (see analysis_deadline's
+                        # field comment for why a rematch itself never
+                        # touches this).
+                        room.analysis_deadline = None
+                    if not room.sid_players:
+                        # Nobody's watching a game that's still going - stop
+                        # here rather than keep filling slots with
+                        # potentially unbounded backward positions nobody
+                        # will ever see. Abandon rather than wait for
+                        # in-flight work to drain: while live there's no
+                        # deadline bounding it, so waiting could mean
+                        # waiting indefinitely.
+                        stop = True
+                if not stop:
+                    if room.analysis is None:
+                        room.analysis = {}
+                    cache = room.analysis
+                    inflight = room.analysis_inflight
+
+            if stop:
+                _abandon_futures(room, futures_cache, futures_inflight, futures)
+                forward_index = backward_index = None
+                if broadcast_on_exit:
+                    _in_app_context(lambda: _broadcast_state(code, room))
                 return
+
+            if futures and game_id != futures_game_id:
+                # A rematch swapped in a new match while we were in wait()
+                # below - `futures` is for a position from a match that's no
+                # longer this room's current one. It can't contribute to
+                # the *new* match's cache, so stop waiting on it rather than
+                # risk harvesting a stale result into the wrong match's slot.
+                _abandon_futures(room, futures_cache, futures_inflight, futures)
+                forward_index = backward_index = None
+            futures_game_id, futures_cache, futures_inflight = game_id, cache, inflight
+
+            # Harvest whatever finished since the last time round.
+            for index in [k for k, fut in futures.items() if fut.done()]:
+                result = futures.pop(index).result()
+                with room.lock:
+                    inflight.discard(index)
+                if result is not None:
+                    cache[index] = result
+                if index == forward_index:
+                    forward_index = None
+                if index == backward_index:
+                    backward_index = None
+
             total = len(game.moves)
-            done = cache.keys() | inflight
-            candidates = [k for k in range(total + 1) if k not in done]
-            index = None
-            # Newest attemptable position first: the band's members are all
-            # cheap (minutes at worst), so clear them before going deeper.
-            for k in reversed(candidates):
-                if _analysis_attemptable(game.undo(total - k)):
-                    index = k
-                    break
-            if index is None and done:
-                # Band finished - backtrack one position deeper, unbounded.
-                frontier = min(done)
-                if frontier > 0 and frontier - 1 in candidates:
-                    index = frontier - 1
-            if index is None:
+            # Live, `game` itself (index `total`, i.e. undo(0)) is always a
+            # legal-move position worth analysing - there's always a next
+            # move to make. Once the game has ended it isn't: it has no
+            # legal moves left at all, so there's nothing for analyse_moves
+            # to compare there.
+            upper = total + 1 if not ended else total
+
+            # Backward slot: one position further back into history than
+            # anything analysed so far, unconditionally. With nothing
+            # analysed yet at all there's no existing frontier to extend,
+            # so it bootstraps itself from the newest attemptable position
+            # instead (the same search the forward slot uses below) - that
+            # way this slot is the one that ends up owning the earliest
+            # analysed position and everything behind it, rather than the
+            # forward slot claiming it as a side effect of merely running
+            # first.
+            if backward_index is None:
+                done = cache.keys() | inflight
+                if done:
+                    frontier = min(done)
+                    index = frontier - 1 if frontier > 0 else None
+                else:
+                    index = _newest_attemptable_index(game, total, done, upper)
+                if index is not None:
+                    futures[index] = _submit(
+                        pool, room, inflight, game, index, ended, deadline
+                    )
+                    backward_index = index
+
+            # Forward slot: only the newest not-yet-done attemptable
+            # position - never falls back to backtracking, so it's always
+            # free the instant a fresh move needs analysing rather than
+            # waiting on whatever the backward slot is doing. In practice
+            # this only ever finds anything once there's a position newer
+            # than whatever the backward slot has already claimed above -
+            # a fresh move is the only thing that can be attemptable and
+            # not already spoken for at that point.
+            if forward_index is None:
+                done = cache.keys() | inflight
+                index = _newest_attemptable_index(game, total, done, upper)
+                if index is not None:
+                    futures[index] = _submit(
+                        pool, room, inflight, game, index, ended, deadline
+                    )
+                    forward_index = index
+
+            if not futures:
+                if ended:
+                    _in_app_context(lambda: _broadcast_state(code, room))
+                    return
                 # Either the game hasn't reached the sensible starting
                 # point yet, or every position back to the deal is done.
                 time.sleep(1.0)
                 continue
-            position = game.undo(total - index)
-            with room.lock:
-                inflight.add(index)
-            try:
-                cache[index] = analyse_moves(position, abort=abort)
-            except AnalysisAborted:
-                pass
-            finally:
-                with room.lock:
-                    inflight.discard(index)
+
+            wait(futures.values(), timeout=1.0, return_when=FIRST_COMPLETED)
     finally:
+        _abandon_futures(room, futures_cache, futures_inflight, futures)
         with room.lock:
             room.analysis_running = False
 
 
-def _ensure_analysis_worker(code, room):
-    """Start the room's live analysis worker if the game is in progress,
-    someone is watching, and none is running. Callers invoke this after
-    joins and moves; it's a cheap no-op otherwise."""
-    with room.lock:
-        if (
-            room.analysis_running
-            or not room.sid_players
-            or not room.game.legal_moves
-            or not room.game.moves
-        ):
+def _start_analysis_worker_locked(code, room):
+    """Start the analysis worker if it isn't already running and there's
+    currently a reason to: live viewers for a game in progress, or still
+    within the post-game grace period for one that just ended. Caller must
+    already hold room.lock (see _ensure_analysis_worker for the version
+    that acquires it, and _record_room_finished_locked, which is already
+    holding it when the game ends)."""
+    if room.analysis_running or not room.game.moves:
+        return
+    if room.game.legal_moves:
+        if not room.sid_players:
             return
-        room.analysis_running = True
-    threading.Thread(target=_live_analysis_loop, args=(code, room), daemon=True).start()
+    elif room.analysis_deadline is None or time.monotonic() >= room.analysis_deadline:
+        return
+    room.analysis_running = True
+    threading.Thread(target=_analysis_worker_loop, args=(code, room), daemon=True).start()
+
+
+def _ensure_analysis_worker(code, room):
+    """Start the room's analysis worker if there's currently a reason to
+    and none is running - see _start_analysis_worker_locked. Callers invoke
+    this after joins and moves; it's a cheap no-op otherwise."""
+    with room.lock:
+        _start_analysis_worker_locked(code, room)
 
 
 def _in_app_context(fn):
@@ -416,32 +645,28 @@ def _record_room_finished_locked(code, room):
     reflects exactly the move that just finished it - not a later one.
     """
     entry = _room_summary_locked(code, room)
-    entry["id"] = secrets.token_hex(8)
+    # Reuse the match's own id (assigned at deal time - see RoomState.game_id)
+    # rather than minting a fresh one: the /review URL for this match was
+    # already fixed the moment it was dealt.
+    entry["id"] = room.game_id
     entry["game"] = room.game
     entry["history_index"] = {}
     # One shared cache for the room's own post-game review and this frozen
-    # entry's /review page - usually already largely filled by the live
-    # worker during the game; the drain adds the cheap tail (skipping
-    # anything the worker finished or is still finishing). Viewers already
-    # scrubbing get a refresh when it's done; anyone arriving later just
-    # finds it ready.
+    # entry's /review page - usually already largely filled during the game;
+    # the worker's post-game grace period (below) adds whatever more it can
+    # in the time it has left. Viewers already scrubbing get a refresh when
+    # it's done; anyone arriving later just finds it ready.
     if room.analysis is None:
         room.analysis = {}
-    # Stop any unbounded backtracking analysis still in flight - the game
-    # it was buying time for is over. The cheap drain below takes over.
-    room.analysis_abort.set()
-    cache = room.analysis
-    entry["analysis"] = cache
+    # Give the worker _ANALYSIS_TIME_CAP more seconds to keep backtracking -
+    # long enough to let anything already in flight finish rather than
+    # aborting it outright, and to fill in a bit more depth besides - before
+    # it stops burning CPU on a game nobody is playing any more. See
+    # _analysis_worker_loop and analysis_deadline's field comment.
+    room.analysis_deadline = time.monotonic() + _ANALYSIS_TIME_CAP
+    entry["analysis"] = room.analysis
     entry["analysis_inflight"] = room.analysis_inflight
-    threading.Thread(
-        target=_precompute_analysis,
-        args=(entry["game"], cache),
-        kwargs={
-            "inflight": room.analysis_inflight,
-            "on_done": lambda: _in_app_context(lambda: _broadcast_state(code, room)),
-        },
-        daemon=True,
-    ).start()
+    _start_analysis_worker_locked(code, room)
     with _finished_rooms_lock:
         _finished_rooms.append(entry)
         while len(_finished_rooms) > _MAX_FINISHED_ENTRIES:

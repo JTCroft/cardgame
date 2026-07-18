@@ -56,7 +56,6 @@ multiple workers):
 import os
 import random
 import secrets
-import threading
 
 from flask import (
     Flask,
@@ -161,17 +160,18 @@ def create_app():
         # No known player id yet at this point - see module docstring. The
         # page's own JS reads/creates its client-side identity and asks for
         # its actual game over the socket (see "join" below) moments after
-        # this loads.
-        return render_template("play.html.jinja2")
-
-    @app.get("/play/live")
-    def play_live():
-        # Same solo-vs-computer game as /play, but with the anytime search
-        # (cardgame.search_alt) continuously evaluating the current
-        # position and streaming a live move ranking to the page. The mode
-        # flag travels with the page's "join" (see handler below) since the
-        # room itself is only resolved/created there.
-        return render_template("play.html.jinja2", live_eval=True)
+        # this loads. ?show_live_eval=true additionally turns on the
+        # anytime search (cardgame.search_alt), continuously evaluating the
+        # current position and streaming a live move ranking to the page -
+        # the mode flag travels with the page's "join" (see handler below)
+        # since the room itself is only resolved/created there.
+        show_live_eval = request.args.get("show_live_eval", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        return render_template("play.html.jinja2", live_eval=show_live_eval)
 
     @app.get("/play/<player_id>")
     def spectate_solo(player_id):
@@ -180,24 +180,22 @@ def create_app():
             abort(404, description="Invalid player id.")
         return render_template("play.html.jinja2", spectate_player_id=target_id)
 
-    @app.get("/play/review/<entry_id>")
-    def review_solo(entry_id):
+    @app.get("/review/<entry_id>")
+    def review(entry_id):
         # Checked eagerly here (unlike spectate_solo, which only validates
         # the id's *shape*) since finished entries are content-addressed
         # and never change, so a 404 now is a reliable, permanent answer.
         # The page's own JS still re-asks over the socket - see "join"
         # below - using the exact same live/spectate flow, just pointed at
-        # this frozen entry instead of a live game.
+        # this frozen entry instead of a live game. Solo and room games are
+        # otherwise different templates (play.html.jinja2 needs no "code";
+        # room.html.jinja2 shows one), so dispatch on the frozen entry's own
+        # "is_solo" flag rather than needing two separate routes for it.
         entry = _find_finished_room_entry(entry_id)
-        if entry is None or not entry["is_solo"]:
+        if entry is None:
             abort(404, description="That finished game could no longer be found.")
-        return render_template("play.html.jinja2", review_entry_id=entry_id)
-
-    @app.get("/room/review/<entry_id>")
-    def review_room(entry_id):
-        entry = _find_finished_room_entry(entry_id)
-        if entry is None or entry["is_solo"]:
-            abort(404, description="That finished game could no longer be found.")
+        if entry["is_solo"]:
+            return render_template("play.html.jinja2", review_entry_id=entry_id)
         return render_template("room.html.jinja2", code=entry["code"], review_entry_id=entry_id)
 
     @app.get("/room/<code>")
@@ -254,8 +252,9 @@ def handle_join(data):
     sid = request.sid
     with room.lock:
         room.sid_players[sid] = player_id
-        # Live-eval mode is an owner's choice of entry point (/play/live vs
-        # /play) for their own solo room; other pages send no flag at all
+        # Live-eval mode is an owner's choice of entry point
+        # (/play?show_live_eval=true vs /play) for their own solo room;
+        # other pages send no flag at all
         # and leave the mode as it is.
         if room.computer_seat is not None and code == player_id and "live_eval" in data:
             room.live_eval = bool(data.get("live_eval"))
@@ -556,21 +555,21 @@ def handle_request_rematch(data):
             # The computer always accepts immediately - there's no one to
             # ask, and no point waiting.
             room.game = Game.deal()
+            room.game_id = secrets.token_hex(8)
             room.rematch_requested_by = None
             room.history_index.clear()
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
-            room.analysis_abort = threading.Event()
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
             room.game = Game.deal()
+            room.game_id = secrets.token_hex(8)
             room.rematch_requested_by = None
             room.history_index.clear()
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
-            room.analysis_abort = threading.Event()
         else:
             room.rematch_requested_by = player_id
 
@@ -599,11 +598,11 @@ def handle_respond_rematch(data):
             return  # nothing to respond to, or you're the one who asked
         if accept:
             room.game = Game.deal()
+            room.game_id = secrets.token_hex(8)
             room.history_index.clear()
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
-            room.analysis_abort = threading.Event()
         room.rematch_requested_by = None
 
     _broadcast_state(code, room)

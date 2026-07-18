@@ -7,17 +7,46 @@ and the combined score-difference swing — all under optimal play by both
 sides from that point forward.
 """
 
+import time
 from collections import Counter
 
 from .game import ProbEval, _cached_score
 
-__all__ = ("analyse_moves", "AnalysisAborted")
+__all__ = ("analyse_moves", "analyse_moves_by_deadline", "AnalysisAborted")
 
 
 class AnalysisAborted(Exception):
     """Raised out of analyse_moves when its `abort` event is set - the
     walk is unbounded in general (an early-game position can take hours),
     so long-running callers need a way to abandon one cooperatively."""
+
+
+class _Deadline:
+    """Plain, picklable stand-in for a live abort signal: is_set() fires
+    once the given time.monotonic() deadline has passed. Used to bound a
+    call running in a separate process, where there's no shared object a
+    caller could set to signal it cooperatively - the cutoff has to be
+    decided up front and travel with the call instead."""
+
+    __slots__ = ("deadline",)
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+
+    def is_set(self):
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
+
+def analyse_moves_by_deadline(game, deadline):
+    """Like analyse_moves, but takes a plain time.monotonic() deadline (or
+    None for unbounded) instead of a live abort object - the entry point
+    for running a call in a worker process via a ProcessPoolExecutor, which
+    can only receive plain, picklable arguments up front. Returns None
+    instead of raising if the deadline passes before finishing."""
+    try:
+        return analyse_moves(game, abort=_Deadline(deadline))
+    except AnalysisAborted:
+        return None
 
 
 def _collect_terminals(game, _state=None, abort=None):

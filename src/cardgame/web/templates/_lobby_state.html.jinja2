@@ -49,7 +49,7 @@
             <td>{{ game.p1_name or "— vacant —" }}{% if game.p1_score is not none %} ({{ game.p1_score }}){% endif %}</td>
             <td>{{ game.p2_name or "— vacant —" }}{% if game.p2_score is not none %} ({{ game.p2_score }}){% endif %}</td>
             <td>
-                <a class="button" href="{{ url_for('review_solo', entry_id=game.id) if game.is_solo else url_for('review_room', entry_id=game.id) }}">Review</a>
+                <a class="button" href="{{ url_for('review', entry_id=game.id) }}">Review</a>
             </td>
         </tr>
         {% endfor %}

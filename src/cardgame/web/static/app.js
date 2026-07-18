@@ -168,7 +168,7 @@
         applyActiveHand();
     });
     // Live-eval pushes update their own container (only present on
-    // /play/live pages), independent of #game-state re-renders.
+    // /play?show_live_eval=true pages), independent of #game-state re-renders.
     socket.on("live_eval", (payload) => {
         const el = document.getElementById("live-eval");
         if (el) el.innerHTML = payload.html;

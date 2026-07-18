@@ -15,7 +15,7 @@ or join a room someone shared with you.</p>
 <p>Or with a live evaluation panel: the engine analyses the current
 position continuously while you think, showing its best-to-worst move
 ranking as bounds tighten and moves get ruled out.</p>
-<a href="{{ url_for('play_live') }}"><button type="button">Play vs computer (live eval)</button></a>
+<a href="{{ url_for('play', show_live_eval=True) }}"><button type="button">Play vs computer (live eval)</button></a>
 
 <h2>Join a room</h2>
 <form method="post" action="{{ url_for('join_room_form') }}">

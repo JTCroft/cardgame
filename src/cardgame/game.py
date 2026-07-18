@@ -56,6 +56,14 @@ class Board(tuple):
         instance.facedown_cards = tuple(facedown_cards)
         return instance
 
+    def __getnewargs__(self):
+        # Same mismatch as Card: __new__ takes the row layout and
+        # facedown_cards (an instance attribute, not part of the tuple
+        # contents) as separate args, not what tuple's default pickling
+        # reduction assumes. Unwrapped to a plain tuple - passing `self`
+        # here would recurse back into pickling this same Board forever.
+        return (tuple(self), self.facedown_cards)
+
     def save(self, alnum=False):
         func = repr if alnum else str
         board_str = "/".join("".join(func(card) for card in row) for row in self)
