@@ -1,0 +1,113 @@
+#!/bin/bash
+# Runs once, at the instance's first boot only (that's how EC2 user-data
+# works). It installs everything and registers systemd units - including
+# cardgame-dns-update.service, which is *enabled* so it re-runs on every
+# subsequent boot too. That's what re-points DNS each time you start the
+# instance after a stop, since stopping/starting gets a fresh public IP.
+set -euo pipefail
+
+dnf install -y git jq
+
+curl -fsSL "https://github.com/caddyserver/caddy/releases/latest/download/caddy_linux_arm64.tar.gz" -o /tmp/caddy.tar.gz
+tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
+chmod +x /usr/local/bin/caddy
+
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+git clone --branch "${git_ref}" ${github_repo_url} /opt/cardgame
+cd /opt/cardgame
+/usr/local/bin/uv sync --extra web
+
+install -m 600 /dev/null /etc/cardgame.env
+{
+  echo "CARDGAME_SECRET_KEY=$(openssl rand -hex 32)"
+  echo "CARDGAME_HOST=127.0.0.1"
+  echo "CARDGAME_PORT=5000"
+} > /etc/cardgame.env
+
+cat > /etc/systemd/system/cardgame-web.service <<'UNIT'
+[Unit]
+Description=Cross Kings web app
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cardgame
+EnvironmentFile=/etc/cardgame.env
+ExecStart=/opt/cardgame/.venv/bin/cardgame-web
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+mkdir -p /etc/caddy
+cat > /etc/caddy/Caddyfile <<CADDYFILE
+${dns_name} {
+    reverse_proxy 127.0.0.1:5000
+}
+CADDYFILE
+
+cat > /etc/systemd/system/caddy.service <<'UNIT'
+[Unit]
+Description=Caddy web server (TLS termination + reverse proxy)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /usr/local/bin/update-dns.sh <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+cat > /tmp/dns-change-batch.json <<JSON
+{
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "__DNS_NAME__",
+      "Type": "A",
+      "TTL": 60,
+      "ResourceRecords": [{"Value": "$PUBLIC_IP"}]
+    }
+  }]
+}
+JSON
+
+aws route53 change-resource-record-sets \
+  --hosted-zone-id "__HOSTED_ZONE_ID__" \
+  --change-batch file:///tmp/dns-change-batch.json
+SCRIPT
+sed -i "s/__DNS_NAME__/${dns_name}/; s/__HOSTED_ZONE_ID__/${hosted_zone_id}/" /usr/local/bin/update-dns.sh
+chmod +x /usr/local/bin/update-dns.sh
+
+cat > /etc/systemd/system/cardgame-dns-update.service <<'UNIT'
+[Unit]
+Description=Point DNS at this boot's public IP
+After=network-online.target
+Wants=network-online.target
+Before=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/update-dns.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now cardgame-dns-update.service
+systemctl enable --now cardgame-web.service
+systemctl enable --now caddy.service

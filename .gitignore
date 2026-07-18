@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .ipynb_checkpoints
+
+# Terraform (.terraform.lock.hcl is intentionally NOT ignored - it should be committed)
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/terraform.tfvars
+deploy/terraform/crash.log

@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars (gitignored) and fill in your own values.
+
+aws_region     = "us-east-1"
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+subdomain      = "play.example.com"
+
+# Defaults below are usually fine as-is.
+# instance_type    = "t4g.micro"
+# root_volume_gb   = 8
+# github_repo_url  = "https://github.com/JTCroft/cardgame.git"
+# git_ref          = "main"
+# create_iam_user  = true
+# iam_user_name    = "cardgame-operator"
