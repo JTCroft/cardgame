@@ -19,7 +19,7 @@ import random
 from pathlib import Path
 
 from ..analysis import analyse_moves
-from ..game import Game
+from ..game import Eval, Game
 
 _DEFAULT_LABELS = Path(__file__).resolve().parents[3] / "data" / "oracle_labels.jsonl"
 
@@ -85,13 +85,25 @@ def main(argv=None):
         if record_bad:
             mismatches += 1
 
-        # Also check "best" agrees with the oracle-derived eval-tuple winner.
-        oracle_best = max(
-            oracle.items(), key=lambda kv: (2 * kv[1][0] + kv[1][1], kv[1][0], kv[1][2], kv[0])
-        )[0]
-        analysed_best = next(m for m, d in got.items() if d["best"])
-        if oracle_best != analysed_best:
-            print(f"  BEST-MOVE MISMATCH record {i}: got {analysed_best}, oracle {oracle_best}")
+        # Also check the set of "best"-flagged moves agrees with the oracle-
+        # derived eval-tuple winner(s) - analyse_moves now flags every move
+        # tied for best, not just one, so this compares sets rather than a
+        # single marker. Eval's own (multiplicity-normalising) comparison is
+        # used on both sides to stay consistent with production semantics.
+        oracle_evals = {m: Eval(mm, w, d, s) for m, (w, d, s, mm) in oracle.items()}
+        best_key = None
+        for m, ev in oracle_evals.items():
+            candidate = (ev, m)
+            if best_key is None or candidate > best_key:
+                best_key = candidate
+        oracle_best_eval = best_key[0]
+        oracle_best_set = {m for m, ev in oracle_evals.items() if ev == oracle_best_eval}
+        analysed_best_set = {m for m, d in got.items() if d["best"]}
+        if oracle_best_set != analysed_best_set:
+            print(
+                f"  BEST-MOVE MISMATCH record {i}: got {analysed_best_set}, "
+                f"oracle {oracle_best_set}"
+            )
             best_mismatches += 1
 
         positions += 1

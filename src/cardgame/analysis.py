@@ -275,10 +275,14 @@ def analyse_moves(game, abort=None):
         data["offensive"] = data["opponent_mean"] - baseline_opponent
         data["defensive"] = data["player_mean"] - baseline_player
         data["combined"] = data["mean_diff"] - baseline_diff
-        # Not the same as "combined == 0": two moves can tie on mean_diff
-        # (and therefore both compute combined == 0) while differing in
-        # win/draw shape, in which case only one of them is actually best.
-        data["best"] = data is best
+        # Not "combined == 0": two moves can tie on mean_diff (and therefore
+        # both compute combined == 0) while differing in win/draw shape, in
+        # which case neither is actually best. Not "data is best" either:
+        # that only ever flagged the single move the (eval, marker) tie-break
+        # happened to land on, even when other moves share the exact same
+        # eval - genuine ties (identical w/d/s under Eval's multiplicity-
+        # normalised equality) should all be marked best, not just one.
+        data["best"] = data["eval"] == best["eval"]
 
     # The one expensive part (the full outcome distribution, needed only for
     # the heatmap) - built only for the winner, via the unchanged pairs walk.
