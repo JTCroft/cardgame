@@ -168,11 +168,53 @@
     function historyGoto(index) {
         socket.emit("history_goto", withTarget({ index: index }));
     }
+    // "Calculate" button in the move-analysis panel, for a position the
+    // automatic post-game worker gave up on (see
+    // rooms.start_ondemand_analysis) - the server pushes a fresh "state"
+    // straight back once it's done (no polling needed here), the same way
+    // it replies to history_step/history_goto above.
+    function calculateMove(index) {
+        socket.emit("calculate_move", withTarget({ index: index }));
+    }
+
+    // Ticks the move-analysis panel's "still being computed (Ns so far)"
+    // counter between server pushes, which only arrive when the position
+    // changes or a calculation finishes - not once a second - so without
+    // this the elapsed time would only ever update on those occasions.
+    // Re-anchored from the server-rendered data-started-ago baseline every
+    // time #game-state is replaced (see the "state" handler below), so it
+    // stays accurate to the server's own clock rather than drifting.
+    let analysisTimerInterval = null;
+    function applyAnalysisTimer() {
+        if (analysisTimerInterval) {
+            clearInterval(analysisTimerInterval);
+            analysisTimerInterval = null;
+        }
+        const el = document.querySelector(".analysis-timer");
+        if (!el) return;
+        const startedAt = Date.now() - parseFloat(el.dataset.startedAgo) * 1000;
+        const format = (seconds) => {
+            seconds = Math.max(0, Math.round(seconds));
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            return m > 0 ? m + "m " + String(s).padStart(2, "0") + "s" : s + "s";
+        };
+        analysisTimerInterval = setInterval(() => {
+            const live = document.querySelector(".analysis-timer");
+            if (!live) {
+                clearInterval(analysisTimerInterval);
+                analysisTimerInterval = null;
+                return;
+            }
+            live.textContent = format((Date.now() - startedAt) / 1000);
+        }, 1000);
+    }
 
     socket.on("state", (payload) => {
         const el = document.getElementById("game-state");
         if (el) el.innerHTML = payload.html;
         applyActiveHand();
+        applyAnalysisTimer();
     });
     // Live-eval pushes update their own container (only present on
     // /play?show_live_eval=true pages), independent of #game-state re-renders.

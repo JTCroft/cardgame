@@ -80,6 +80,7 @@ from .rooms import (
     _finished_rooms_lock,
     _find_finished_room_entry,
     _get_or_create_room,
+    _grace_period_over,
     _lobby_active_summaries,
     _lobby_finished_summaries,
     _maybe_play_computer_move,
@@ -93,6 +94,7 @@ from .rooms import (
     _rooms,
     _sid_index,
     _sid_index_lock,
+    start_ondemand_analysis,
 )
 
 # Socket.IO broadcast group used for the /rooms lobby listing. This is a
@@ -588,6 +590,72 @@ def handle_history_goto(data):
     socketio.emit("state", {"html": _render_state(code, room, player_id)}, to=request.sid)
 
 
+@socketio.on("calculate_move")
+def handle_calculate_move(data):
+    """Explicit "Calculate" click (see _game_state.html.jinja2's
+    move-analysis panel) for a position the automatic post-game worker gave
+    up on - see rooms.start_ondemand_analysis. Always replies with a fresh
+    render regardless of whether this call is the one that actually started
+    it, so a second click (or a second viewer's own click) while it's
+    already running just confirms it's under way rather than doing nothing
+    visible.
+    """
+    data = data or {}
+    player_id = _normalize_player_id(data.get("player_id"))
+    if player_id is None:
+        return
+    try:
+        index = int(data.get("index"))
+    except (TypeError, ValueError):
+        return
+    sid = request.sid
+
+    review_entry_id = (data.get("review_entry_id") or "").strip()
+    if review_entry_id:
+        entry = _find_finished_room_entry(review_entry_id)
+        if entry is None:
+            return
+        if not _grace_period_over(entry.get("analysis_deadline")):
+            return
+        start_ondemand_analysis(
+            entry["analysis"],
+            entry["analysis_inflight"],
+            entry["analysis_calc_started"],
+            _finished_rooms_lock,
+            entry["game"],
+            index,
+            on_done=lambda: socketio.emit(
+                "state", {"html": _render_room_review_state(entry, player_id)}, to=sid
+            ),
+        )
+        socketio.emit("state", {"html": _render_room_review_state(entry, player_id)}, to=sid)
+        return
+
+    code = _resolve_room_key(data.get("code", ""), player_id)
+    room = _rooms.get(code)
+    if room is None:
+        return
+    with room.lock:
+        if not room.game_over or not _grace_period_over(room.analysis_deadline):
+            return
+        game, game_id = room.game, room.game_id
+        cache, inflight, calc_started = room.analysis, room.analysis_inflight, room.analysis_calc_started
+
+    def on_done():
+        # The room may have since gone into a rematch, in which case
+        # whoever's still watching it live is looking at that new game, not
+        # this one - broadcasting here would clobber their board with a
+        # stale render, so there's nothing safe left to push; they'll find
+        # the result waiting next time they visit this match's own
+        # /review page instead (see _record_room_finished_locked).
+        current = _rooms.get(code)
+        if current is not None and current.game_id == game_id:
+            _broadcast_state(code, current)
+
+    start_ondemand_analysis(cache, inflight, calc_started, room.lock, game, index, on_done=on_done)
+    _broadcast_state(code, room)
+
+
 @socketio.on("request_rematch")
 def handle_request_rematch(data):
     data = data or {}
@@ -622,6 +690,7 @@ def handle_request_rematch(data):
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
+            room.analysis_calc_started = {}
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
             room.game = Game.deal()
@@ -631,6 +700,7 @@ def handle_request_rematch(data):
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
+            room.analysis_calc_started = {}
         else:
             room.rematch_requested_by = player_id
 
@@ -664,6 +734,7 @@ def handle_respond_rematch(data):
             room.game_over_seen.clear()
             room.analysis = None
             room.analysis_inflight = set()
+            room.analysis_calc_started = {}
         room.rematch_requested_by = None
 
     _broadcast_state(code, room)

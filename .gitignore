@@ -10,6 +10,13 @@ wheels/
 .venv
 .ipynb_checkpoints
 
+# Transient/exploratory data dumps (oracle_labels.jsonl and bootstrap_labels.jsonl
+# are the durable corpora and stay tracked)
+data/temp_*
+
+# One-off analysis scripts, not part of the package
+experiments/
+
 # Terraform (.terraform.lock.hcl is intentionally NOT ignored - it should be committed)
 deploy/terraform/.terraform/
 deploy/terraform/*.tfstate

@@ -127,6 +127,14 @@ class RoomState:
     # flight. Replaced (not cleared) on a fresh deal, since the frozen
     # entry shares the old set.
     analysis_inflight: set = field(default_factory=set)
+    # Wall-clock (time.monotonic()) start time of each index currently in
+    # analysis_inflight *because of* an explicit "Calculate" click (see
+    # start_ondemand_analysis) - not populated for positions the automatic
+    # worker is chewing through on its own, only ones a viewer opted into
+    # waiting (up to _ONDEMAND_ANALYSIS_DEADLINE) for, so the page can show
+    # how long that wait has been running. Same sharing/reset rules as
+    # analysis_inflight.
+    analysis_calc_started: dict = field(default_factory=dict)
     # Guard so at most one analysis worker runs per room.
     analysis_running: bool = False
     # Wall-clock (time.monotonic()) deadline for the worker's *post-game*
@@ -350,6 +358,80 @@ def _get_analysis_pool():
         if _analysis_pool is None:
             _analysis_pool = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
         return _analysis_pool
+
+
+# Deadline for an explicit, one-off "Calculate" request (see
+# start_ondemand_analysis) - only reachable once the automatic worker has
+# already given up on a position (see _analysis_feasible/_ANALYSIS_TIME_CAP),
+# so this is a much longer leash than that unattended budget: a user who
+# clicks the button is deliberately opting into the wait for one single
+# position, not leaving something running unsupervised. Comfortably past the
+# ~2-6 minute range _analysis_attemptable's docstring measures for the ring
+# just beyond _analysis_feasible's ceiling, with headroom for deeper ones.
+_ONDEMAND_ANALYSIS_DEADLINE = 30 * 60
+
+
+def _grace_period_over(deadline):
+    """Whether the automatic post-game analysis worker's grace period (see
+    _ANALYSIS_TIME_CAP/analysis_deadline) has already ended - the gate for
+    offering an explicit "Calculate" button in _move_analysis_context,
+    since before that the worker may still reach this position on its own.
+    `deadline` is None only if the game somehow hasn't been recorded as
+    finished yet, which shouldn't happen for a position review is even
+    possible for; treated as "over" rather than wedging the button off
+    forever on what would be a bug elsewhere.
+    """
+    return deadline is None or time.monotonic() >= deadline
+
+
+def start_ondemand_analysis(cache, inflight, calc_started, lock, game, index, on_done=None):
+    """Kick off a one-off analysis of a single already-played position (at
+    `index` moves into `game`) that the automatic worker gave up on,
+    running it on a background thread with _ONDEMAND_ANALYSIS_DEADLINE to
+    work with instead of the worker's own stingier budget. Returns True if
+    a fresh calculation was actually started, False if `index` is already
+    cached or already being calculated (by a previous on-demand request, or
+    in principle still by the automatic worker itself) - in which case the
+    caller has nothing further to do, the existing "pending"/inflight state
+    already covers it.
+
+    `cache`/`inflight`/`calc_started`/`lock` are a live room's or a frozen
+    _finished_rooms entry's own analysis/analysis_inflight/
+    analysis_calc_started plus whichever lock guards them (room.lock, or
+    _finished_rooms_lock for a frozen entry - see the "calculate_move"
+    socket handler) - passed in rather than a RoomState/entry directly so
+    this one function serves both.
+
+    `on_done`, if given, runs (inside a Flask app context, so it's safe to
+    render_template) once the result - or lack of one - has already been
+    folded into `cache`/`inflight`/`calc_started` above; it's how the
+    caller pushes a fresh render out to whoever's watching, since nothing
+    here knows about sockets or which room/entry this even belongs to.
+    """
+    total = len(game.moves)
+    if not (0 <= index < total):
+        return False
+    with lock:
+        if index in cache or index in inflight:
+            return False
+        inflight.add(index)
+        calc_started[index] = time.monotonic()
+
+    def worker():
+        position = game.undo(total - index)
+        pool = _get_analysis_pool()
+        call_deadline = time.monotonic() + _ONDEMAND_ANALYSIS_DEADLINE
+        result = pool.submit(analyse_moves_by_deadline, position, call_deadline).result()
+        with lock:
+            inflight.discard(index)
+            calc_started.pop(index, None)
+            if result is not None:
+                cache[index] = result
+        if on_done is not None:
+            _in_app_context(on_done)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
 
 
 def _analysis_feasible(game):
@@ -721,6 +803,13 @@ def _record_room_finished_locked(code, room):
     room.analysis_deadline = time.monotonic() + _ANALYSIS_TIME_CAP
     entry["analysis"] = room.analysis
     entry["analysis_inflight"] = room.analysis_inflight
+    entry["analysis_calc_started"] = room.analysis_calc_started
+    # Copied by value, not shared like the dicts above: the live room's own
+    # analysis_deadline gets repurposed (or cleared - see its field comment)
+    # by a later rematch, but a frozen entry's "has the automatic grace
+    # period passed, so is a 'Calculate' button appropriate" question always
+    # refers to *this* match's own deadline, fixed at the moment it froze.
+    entry["analysis_deadline"] = room.analysis_deadline
     _start_analysis_worker_locked(code, room)
     with _finished_rooms_lock:
         _finished_rooms.append(entry)
@@ -855,13 +944,18 @@ def _outcome_heatmap(distribution, mover_seat):
 
 
 def _move_analysis_context(cache, full_game, display_game, history_index, p1_name, p2_name,
-                           inflight=frozenset()):
+                           inflight=frozenset(), calc_started=None, grace_period_over=False):
     """Build the move-comparison panel's template context for the position
-    currently being reviewed, or None when there's nothing to show (final
-    position, no analysis recorded, or an intractable position). Returns
-    {"pending": True, ...} while the background computation hasn't reached
-    a tractable position yet - or is mid-flight on this one - so the
-    template can say it's on its way.
+    currently being reviewed, or None when there's nothing to show at all
+    (final position, or no analysis recorded and the position is one the
+    automatic worker hasn't given up on yet). Returns {"pending": True, ...}
+    while the background computation hasn't reached a tractable position
+    yet - or is mid-flight on this one - so the template can say it's on
+    its way; {"calculable": True, ...} once the automatic post-game grace
+    period (_ANALYSIS_TIME_CAP) has passed and this position was never
+    reached - too deep for the worker's own unattended budget, but still
+    computable on explicit request (see start_ondemand_analysis) - so the
+    template can offer a "Calculate" button instead of showing nothing.
     """
     if cache is None or history_index >= len(full_game.moves):
         return None
@@ -872,9 +966,16 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
     p2_display = p2_name or "Player 2"
     data = cache.get(history_index)
     if data is None:
-        if history_index not in inflight and not _analysis_feasible(display_game):
-            return None
-        return {"pending": True, "mover_name": mover_name}
+        if history_index in inflight:
+            started_ago = None
+            if calc_started is not None and history_index in calc_started:
+                started_ago = time.monotonic() - calc_started[history_index]
+            return {"pending": True, "mover_name": mover_name, "started_ago": started_ago}
+        if _analysis_feasible(display_game):
+            return {"pending": True, "mover_name": mover_name, "started_ago": None}
+        if grace_period_over:
+            return {"calculable": True, "mover_name": mover_name, "history_index": history_index}
+        return None
     played_marker = full_game.moves[history_index]
     rows = []
     # Same (eval, marker) tie-break analyse_moves itself uses to decide
@@ -976,6 +1077,8 @@ def _room_context(code, room, player_id):
             room.name_for_seat(1),
             room.name_for_seat(2),
             inflight=room.analysis_inflight,
+            calc_started=room.analysis_calc_started,
+            grace_period_over=_grace_period_over(room.analysis_deadline),
         )
 
     return {
@@ -1079,6 +1182,8 @@ def _room_review_context(entry, viewer_id):
             entry["p1_name"],
             entry["p2_name"],
             inflight=entry.get("analysis_inflight", frozenset()),
+            calc_started=entry.get("analysis_calc_started"),
+            grace_period_over=_grace_period_over(entry.get("analysis_deadline")),
         ),
     }
 

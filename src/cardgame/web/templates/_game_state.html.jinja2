@@ -98,8 +98,14 @@
 
 {% if move_analysis %}
 <div class="move-analysis">
-    {% if move_analysis.pending %}
-        <p class="analysis-note">Move comparison for this position is still being computed&hellip;</p>
+    {% if move_analysis.calculable %}
+        <h3>Move comparison <span class="analysis-sub">{{ move_analysis.mover_name }} to move</span></h3>
+        <p class="analysis-note">This position was too deep for the automatic post-game analysis to reach.</p>
+        <button type="button" onclick="calculateMove({{ move_analysis.history_index }})">Calculate</button>
+    {% elif move_analysis.pending %}
+        <p class="analysis-note">
+            Move comparison for this position is still being computed{% if move_analysis.started_ago is not none %} (<span class="analysis-timer" data-started-ago="{{ move_analysis.started_ago }}">{{ "%.0f"|format(move_analysis.started_ago) }}s</span> so far){% endif %}&hellip;
+        </p>
     {% else %}
         {% macro analysis_card(row) %}
             {%- if row.card.facedown -%}

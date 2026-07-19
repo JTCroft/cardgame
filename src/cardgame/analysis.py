@@ -52,11 +52,11 @@ def analyse_moves_by_deadline(game, deadline):
 class _Agg:
     """Cheap, allocation-free stand-in for (ProbEval, pairs Counter) - just
     the aggregate win/draw/score-sum/mover's-own-score-sum a position
-    resolves to under optimal play, with no per-outcome histogram. Mirrors
-    validation/exact_simple.py's _SAgg philosophy (aggregates are all any
-    comparison ever needs), extended with `mover_sum` so player_mean/
-    opponent_mean stay recoverable without a distribution: after one more
-    negation (bringing it into the analysed player's own perspective),
+    resolves to under optimal play, with no per-outcome histogram
+    (aggregates are all any comparison ever needs), extended with
+    `mover_sum` so player_mean/opponent_mean stay recoverable without a
+    distribution: after one more negation (bringing it into the analysed
+    player's own perspective),
     `mover_sum` is that player's own score-sum and `mover_sum - s` is the
     opponent's - see analyse_moves.
 
