@@ -10,7 +10,7 @@ sides from that point forward.
 import time
 from collections import Counter
 
-from .game import Eval, ProbEval, _cached_score
+from .game import Eval, _cached_score
 
 __all__ = ("analyse_moves", "analyse_moves_by_deadline", "AnalysisAborted")
 
@@ -135,9 +135,13 @@ def _collect_terminals(game, _state=None, abort=None):
     Single pass: the optimal-play pair distribution is carried up
     alongside the negamax value, instead of re-running a full score_walk
     at every level of the optimal line as the original formulation did.
-    Move selection replicates score_walk exactly - the same evaluation
-    comparison and the same marker tie-break - so the chosen line, and
-    therefore the returned distribution, is identical.
+    Move selection uses the same cheap _Agg tie-break _collect_aggregate
+    does (proven to pick the identical line score_walk/evaluate would,
+    since this walk never prunes - see _Agg's docstring) rather than
+    ProbEval, which nothing here needs: analyse_moves only ever reads the
+    pairs half of this function's return value, never the eval half, and
+    ProbEval's bounds-consistent __eq__/__gt__ cost a full Counter pass
+    per comparison that a plain tuple compare doesn't.
     """
     if abort is not None and abort.is_set():
         raise AnalysisAborted
@@ -148,29 +152,38 @@ def _collect_terminals(game, _state=None, abort=None):
         # and (p1, p2) with p2 to move - both are (other, mover).
         mover_score = _cached_score(_state[0], _state[1])
         other_score = _cached_score(_state[2], _state[3])
-        return (
-            ProbEval(game.multiplicity, {mover_score - other_score: game.multiplicity}),
-            Counter({(other_score, mover_score): game.multiplicity}),
+        diff = mover_score - other_score
+        m = game.multiplicity
+        agg = _Agg(
+            m,
+            w=(m if diff > 0 else 0),
+            d=(m if diff == 0 else 0),
+            s=diff * m,
+            mover_sum=mover_score * m,
         )
+        return agg, Counter({(other_score, mover_score): m})
     child_state = game._child_hand_state
     best_key = None
     best_pairs = None
+    best_agg = None
     for move in game.all_moves():
-        evals = []
+        combined = None
         pairs = Counter()
         for possibility in move:
-            child_eval, child_pairs = _collect_terminals(
+            child_agg, child_pairs = _collect_terminals(
                 possibility, child_state(_state, possibility.taken_card), abort
             )
-            evals.append(child_eval)
+            combined = child_agg if combined is None else combined + child_agg
             # flip the child's (other, mover) into this node's perspective
             for (a, b), v in child_pairs.items():
                 pairs[(b, a)] += v
-        candidate = (-ProbEval.combine(evals), move[0].marker)
+        candidate_agg = -combined
+        candidate = (candidate_agg.key, move[0].marker)
         if best_key is None or candidate > best_key:
             best_key = candidate
+            best_agg = candidate_agg
             best_pairs = pairs
-    return best_key[0], best_pairs
+    return best_agg, best_pairs
 
 
 def analyse_moves(game, abort=None):
@@ -222,7 +235,7 @@ def analyse_moves(game, abort=None):
             combined = child_agg if combined is None else combined + child_agg
         # One negation brings this from the resolutions' own (opponent's)
         # perspective back to the analysed player's - same convention
-        # _collect_terminals's -ProbEval.combine(evals) uses.
+        # _collect_terminals's negation uses.
         agg = -combined
 
         total_weight = agg.m
