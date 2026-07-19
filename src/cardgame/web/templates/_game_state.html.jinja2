@@ -121,9 +121,12 @@
                 <thead>
                     <tr>
                         <th>Take</th>
+                        <th title="Share of face-down orderings where {{ move_analysis.p1_name }} wins under optimal play from here">{{ move_analysis.p1_name }}<br>win%</th>
+                        <th title="Share of face-down orderings where {{ move_analysis.p2_name }} wins under optimal play from here">{{ move_analysis.p2_name }}<br>win%</th>
+                        <th title="Share of face-down orderings that end in a draw under optimal play from here">Draw%</th>
                         <th title="Swing in ({{ move_analysis.mover_name }} - {{ move_analysis.opponent_name }}) vs the best move">Swing</th>
-                        <th title="Change in {{ move_analysis.mover_name }}'s own average points vs the best move">{{ move_analysis.mover_name }}</th>
-                        <th title="Change in {{ move_analysis.opponent_name }}'s average points vs the best move (positive = they score more)">{{ move_analysis.opponent_name }}</th>
+                        <th title="Change in {{ move_analysis.p1_name }}'s average points vs the best move">{{ move_analysis.p1_name }}</th>
+                        <th title="Change in {{ move_analysis.p2_name }}'s average points vs the best move">{{ move_analysis.p2_name }}</th>
                         <th></th>
                     </tr>
                 </thead>
@@ -131,9 +134,12 @@
                     {% for row in move_analysis.rows %}
                     <tr class="{% if row.played %}analysis-played{% endif %}">
                         <td>{{ analysis_card(row) }}</td>
+                        <td class="num">{{ "%.0f"|format(row.p1_win_pct) }}%</td>
+                        <td class="num">{{ "%.0f"|format(row.p2_win_pct) }}%</td>
+                        <td class="num">{{ "%.0f"|format(row.draw_pct) }}%</td>
                         <td class="num">{{ "%+.2f"|format(row.combined) }}</td>
-                        <td class="num">{{ "%+.2f"|format(row.defensive) }}</td>
-                        <td class="num">{{ "%+.2f"|format(row.offensive) }}</td>
+                        <td class="num">{{ "%+.2f"|format(row.p1_change) }}</td>
+                        <td class="num">{{ "%+.2f"|format(row.p2_change) }}</td>
                         <td class="badges">
                             {%- if row.best %}<span class="badge badge-best">best</span>{% endif -%}
                             {%- if row.played %}<span class="badge badge-played">played</span>{% endif -%}

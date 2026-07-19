@@ -813,6 +813,8 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
     mover_seat = 1 if history_index % 2 == 0 else 2
     mover_name = (p1_name if mover_seat == 1 else p2_name) or f"Player {mover_seat}"
     opponent_name = (p2_name if mover_seat == 1 else p1_name) or f"Player {3 - mover_seat}"
+    p1_display = p1_name or "Player 1"
+    p2_display = p2_name or "Player 2"
     data = cache.get(history_index)
     if data is None:
         if history_index not in inflight and not _analysis_feasible(display_game):
@@ -820,10 +822,26 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
         return {"pending": True, "mover_name": mover_name}
     played_marker = full_game.moves[history_index]
     rows = []
+    # Same (eval, marker) tie-break analyse_moves itself uses to decide
+    # "best" - not `combined`, which is a mean-based delta that can tie (or
+    # even disagree in sign) between moves with different win/draw shapes.
+    # Sorting by it too keeps the badged best move first in the table.
     for marker, move in sorted(
-        data.items(), key=lambda item: (-item[1]["combined"], item[0])
+        data.items(), key=lambda item: (item[1]["eval"], item[0]), reverse=True
     ):
         card = move["card"]
+        # analyse_moves reports win_pct/loss_pct/defensive/offensive from
+        # the mover's own perspective, which alternates with mover_seat as
+        # you step through history - fixed to P1/P2 here so the columns
+        # mean the same thing on every position instead of swapping sides
+        # each time the mover changes (see _outcome_heatmap for the same
+        # fix already applied to the heatmap's axis).
+        if mover_seat == 1:
+            p1_win_pct, p2_win_pct = move["win_pct"], move["loss_pct"]
+            p1_change, p2_change = move["defensive"], move["offensive"]
+        else:
+            p1_win_pct, p2_win_pct = move["loss_pct"], move["win_pct"]
+            p1_change, p2_change = move["offensive"], move["defensive"]
         rows.append(
             {
                 "marker": marker,
@@ -837,19 +855,22 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
                     else None
                 ),
                 "combined": move["combined"],
-                "defensive": move["defensive"],
-                "offensive": move["offensive"],
-                "best": move["combined"] == 0,
+                "p1_win_pct": p1_win_pct,
+                "p2_win_pct": p2_win_pct,
+                "draw_pct": move["draw_pct"],
+                "p1_change": p1_change,
+                "p2_change": p2_change,
+                "best": move["best"],
                 "played": marker == played_marker,
             }
         )
-    best = rows[0]
+    best = next(row for row in rows if row["best"])
     return {
         "pending": False,
         "mover_name": mover_name,
         "opponent_name": opponent_name,
-        "best_player_mean": data[best["marker"]]["player_mean"],
-        "best_opponent_mean": data[best["marker"]]["opponent_mean"],
+        "p1_name": p1_display,
+        "p2_name": p2_display,
         "rows": rows,
         "heatmap": _outcome_heatmap(data[best["marker"]]["distribution"], mover_seat),
     }

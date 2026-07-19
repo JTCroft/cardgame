@@ -193,6 +193,13 @@ class Eval(tuple):
         inst.multiplicity = multiplicity
         return inst
 
+    def __getnewargs__(self):
+        # __new__ takes multiplicity separately from (w, d, s) - tuple's
+        # default pickling reduction doesn't know that and would otherwise
+        # pass the packed tuple as a single arg and drop multiplicity
+        # (an instance attribute, not part of the tuple contents) entirely.
+        return (self.multiplicity, *self)
+
     @property
     def eval(self):
         return self.eval_from_wds(*self)
@@ -340,9 +347,27 @@ class ProbEval(Counter):
         return self._bound_evals()[0] >= other._bound_evals()[1]
 
     def __eq__(self, other):
-        return bool(
-            (self.multiplicity == other.multiplicity) and (dict(self) == dict(other))
-        )
+        # Ordering (and therefore equality) on a ProbEval is only ever
+        # meaningful through Eval: ProbEval's job is to record the exact
+        # frequency map, Eval's is to reduce that to a well-ordered (w, d,
+        # s) bound for comparison/tie-breaking - see _bound_evals and
+        # __lt__/__gt__ below. A dict-based __eq__ bypassed that and
+        # compared raw Counter contents instead, so two distributions with
+        # identical (w, d, s) - and therefore identical bounds - but
+        # different underlying frequency maps (e.g. {-4: 2, -2: 4} and
+        # {-3: 4, -2: 2}, both w=0, d=0, s=-16) came out simultaneously
+        # not-equal, not-less, and not-greater. That silently broke the
+        # (eval, marker) tie-break used throughout (score_walk, evaluate,
+        # _collect_terminals all compare (value, marker) tuples and rely on
+        # tied values falling through to the marker) - ties resolved by
+        # iteration order instead of the intended deterministic marker
+        # tie-break. Comparing bounds here instead keeps __eq__ consistent
+        # with __lt__/__gt__ for both fully- and partially-observed
+        # ProbEvals, and (via Eval.__eq__) handles differing multiplicities
+        # the same way they do.
+        self_bounds = self._bound_evals()
+        other_bounds = other._bound_evals()
+        return self_bounds[0] == other_bounds[0] and self_bounds[1] == other_bounds[1]
 
     def __neg__(self):
         inst = ProbEval(multiplicity=self.multiplicity)

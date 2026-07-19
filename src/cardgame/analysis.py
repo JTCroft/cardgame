@@ -10,7 +10,7 @@ sides from that point forward.
 import time
 from collections import Counter
 
-from .game import ProbEval, _cached_score
+from .game import Eval, ProbEval, _cached_score
 
 __all__ = ("analyse_moves", "analyse_moves_by_deadline", "AnalysisAborted")
 
@@ -47,6 +47,85 @@ def analyse_moves_by_deadline(game, deadline):
         return analyse_moves(game, abort=_Deadline(deadline))
     except AnalysisAborted:
         return None
+
+
+class _Agg:
+    """Cheap, allocation-free stand-in for (ProbEval, pairs Counter) - just
+    the aggregate win/draw/score-sum/mover's-own-score-sum a position
+    resolves to under optimal play, with no per-outcome histogram. Mirrors
+    validation/exact_simple.py's _SAgg philosophy (aggregates are all any
+    comparison ever needs), extended with `mover_sum` so player_mean/
+    opponent_mean stay recoverable without a distribution: after one more
+    negation (bringing it into the analysed player's own perspective),
+    `mover_sum` is that player's own score-sum and `mover_sum - s` is the
+    opponent's - see analyse_moves.
+
+    Never partial (this walk never prunes, so `key` is a plain tuple
+    comparison - no bounds needed the way ProbEval/Eval's fail-soft
+    bookkeeping requires for pruned search).
+    """
+
+    __slots__ = ("m", "w", "d", "s", "mover_sum")
+
+    def __init__(self, m, w=0, d=0, s=0, mover_sum=0):
+        self.m, self.w, self.d, self.s, self.mover_sum = m, w, d, s, mover_sum
+
+    @property
+    def key(self):
+        return (2 * self.w + self.d, self.w, self.s)
+
+    def __add__(self, other):
+        return _Agg(
+            self.m + other.m,
+            self.w + other.w,
+            self.d + other.d,
+            self.s + other.s,
+            self.mover_sum + other.mover_sum,
+        )
+
+    def __neg__(self):
+        return _Agg(self.m, self.m - self.w - self.d, self.d, -self.s, self.mover_sum - self.s)
+
+
+def _collect_aggregate(game, _state=None, abort=None):
+    """Like _collect_terminals, but returns only the winning line's _Agg -
+    no pairs/Counter, no per-outcome histogram. Same base case, same
+    per-move/per-possibility structure, same (candidate, marker) tie-break,
+    so it selects the identical optimal line _collect_terminals does - this
+    is what makes every move's win/draw/score-sum/mean cheap to compute
+    for every legal move, not just the winner (see analyse_moves)."""
+    if abort is not None and abort.is_set():
+        raise AnalysisAborted
+    if _state is None:
+        _state = game._hand_state()
+    if not game.legal_moves:
+        mover_score = _cached_score(_state[0], _state[1])
+        other_score = _cached_score(_state[2], _state[3])
+        diff = mover_score - other_score
+        m = game.multiplicity
+        return _Agg(
+            m,
+            w=(m if diff > 0 else 0),
+            d=(m if diff == 0 else 0),
+            s=diff * m,
+            mover_sum=mover_score * m,
+        )
+    child_state = game._child_hand_state
+    best_key = None
+    best_agg = None
+    for move in game.all_moves():
+        combined = None
+        for possibility in move:
+            child_agg = _collect_aggregate(
+                possibility, child_state(_state, possibility.taken_card), abort
+            )
+            combined = child_agg if combined is None else combined + child_agg
+        candidate_agg = -combined
+        candidate_key = (candidate_agg.key, move[0].marker)
+        if best_key is None or candidate_key > best_key:
+            best_key = candidate_key
+            best_agg = candidate_agg
+    return best_agg
 
 
 def _collect_terminals(game, _state=None, abort=None):
@@ -107,8 +186,17 @@ def analyse_moves(game, abort=None):
 
     Returns
     -------
-    MoveAnalysis
-        Object with .summary() and .narrative() methods.
+    dict
+        {marker: {...}} - see the fields assembled below. Exactly one move
+        has "best": True, chosen the same way Game.evaluate chooses its own
+        best move (see "eval" below) - not by whichever has the highest mean
+        score-difference, which can disagree with it. Every move gets exact
+        win/draw/loss/mean stats cheaply (via _collect_aggregate); only the
+        *best* move's "distribution" is populated (the one thing that's
+        actually expensive to obtain - see _collect_terminals) - it's `None`
+        for every other move, since nothing in this codebase ever reads a
+        non-winner's distribution (only the web review page's heatmap does,
+        and only for the winner).
 
     Raises
     ------
@@ -120,43 +208,51 @@ def analyse_moves(game, abort=None):
     if not game.legal_moves:
         raise ValueError("Game is already over — no legal moves to analyse.")
 
-    # Collect terminal (p1, p2) score distributions for each legal move
     state = game._hand_state()
     move_data = {}
     for move_tuple in game.all_moves():
         marker = move_tuple[0].marker
         card = game.board[marker[0]][marker[1]]
 
-        acc = Counter()
+        combined = None
         for resolution in move_tuple:
-            acc += _collect_terminals(
+            child_agg = _collect_aggregate(
                 resolution, game._child_hand_state(state, resolution.taken_card), abort
-            )[1]
+            )
+            combined = child_agg if combined is None else combined + child_agg
+        # One negation brings this from the resolutions' own (opponent's)
+        # perspective back to the analysed player's - same convention
+        # _collect_terminals's -ProbEval.combine(evals) uses.
+        agg = -combined
 
-        # Weighted mean: each (p1, p2) score pair is weighted by the number of
-        # face-down card orderings that produce it (game.multiplicity at that terminal).
-        total_weight = sum(acc.values())
-        mean_player = sum(p * w for (p, _), w in acc.items()) / total_weight
-        mean_opponent = sum(q * w for (_, q), w in acc.items()) / total_weight
-        mean_diff = mean_player - mean_opponent  # always P1 - P2
-
-        # Same (p, q) pairs, collapsed to the score-difference distribution
-        # under optimal play - the face-down orderings this move doesn't
-        # resolve are exactly why a single mean hides real spread.
-        distribution = Counter()
-        for (p, q), w in acc.items():
-            distribution[p - q] += w
+        total_weight = agg.m
+        player_sum = agg.mover_sum
+        opponent_sum = agg.mover_sum - agg.s
 
         move_data[marker] = {
             "card": card,
-            "player_mean": mean_player,
-            "opponent_mean": mean_opponent,
-            "mean_diff": mean_diff,
-            "distribution": distribution,
+            "player_mean": player_sum / total_weight,
+            "opponent_mean": opponent_sum / total_weight,
+            "mean_diff": agg.s / total_weight,
+            "distribution": None,  # filled in for the winner only, below
+            "win_pct": 100 * agg.w / total_weight,
+            "draw_pct": 100 * agg.d / total_weight,
+            "loss_pct": 100 * (total_weight - agg.w - agg.d) / total_weight,
+            "eval": Eval(total_weight, agg.w, agg.d, agg.s),
         }
 
-    # Baseline = best move for the current player
-    best = max(move_data.values(), key=lambda d: d["mean_diff"])
+    # Baseline = best move for the current player, by the same (eval, marker)
+    # tie-break already used throughout the codebase (_collect_terminals,
+    # score_walk, Game.evaluate, evaluate_simple) - not by mean_diff, which
+    # can tie or disagree between moves with different win/draw shapes even
+    # though "eval" tells them apart (a guaranteed draw vs. a 50/50 win-or-
+    # matching-loss can have identical means).
+    best_marker, best_key = None, None
+    for marker, data in move_data.items():
+        candidate = (data["eval"], marker)
+        if best_key is None or candidate > best_key:
+            best_key, best_marker = candidate, marker
+    best = move_data[best_marker]
     baseline_player = best["player_mean"]
     baseline_opponent = best["opponent_mean"]
     baseline_diff = best["mean_diff"]
@@ -166,184 +262,22 @@ def analyse_moves(game, abort=None):
         data["offensive"] = data["opponent_mean"] - baseline_opponent
         data["defensive"] = data["player_mean"] - baseline_player
         data["combined"] = data["mean_diff"] - baseline_diff
+        # Not the same as "combined == 0": two moves can tie on mean_diff
+        # (and therefore both compute combined == 0) while differing in
+        # win/draw shape, in which case only one of them is actually best.
+        data["best"] = data is best
+
+    # The one expensive part (the full outcome distribution, needed only for
+    # the heatmap) - built only for the winner, via the unchanged pairs walk.
+    best_move_tuple = next(m for m in game.all_moves() if m[0].marker == best_marker)
+    acc = Counter()
+    for resolution in best_move_tuple:
+        acc += _collect_terminals(
+            resolution, game._child_hand_state(state, resolution.taken_card), abort
+        )[1]
+    distribution = Counter()
+    for (p, q), w in acc.items():
+        distribution[p - q] += w
+    best["distribution"] = distribution
 
     return move_data
-
-
-class MoveAnalysis:
-    def __init__(
-        self,
-        move_data,
-        baseline_p1,
-        baseline_p2,
-        baseline_diff,
-        current_player,
-        opponent,
-        is_p1_turn,
-        current_p1_score,
-        current_p2_score,
-    ):
-        self.move_data = move_data
-        self.baseline_p1 = baseline_p1
-        self.baseline_p2 = baseline_p2
-        self.baseline_diff = baseline_diff
-        self.current_player = current_player
-        self.opponent = opponent
-        self.is_p1_turn = is_p1_turn
-        self.current_p1_score = current_p1_score
-        self.current_p2_score = current_p2_score
-
-    def _sorted_moves(self):
-        """Return moves sorted best-to-worst for the current player."""
-        return sorted(
-            self.move_data.items(),
-            key=lambda x: x[1]["combined"],
-            reverse=True,
-        )
-
-    def summary(self):
-        """Return a human-readable table of all moves with their values."""
-        lines = []
-        cp = self.current_player
-        op = self.opponent
-
-        lines.append(f"Move analysis — {cp}'s turn")
-        lines.append(
-            f"Current score: P1={self.current_p1_score}  P2={self.current_p2_score}"
-        )
-        lines.append(
-            f"Under optimal play: best move leads to "
-            f"P1={self.baseline_p1:.1f}  P2={self.baseline_p2:.1f}  "
-            f"diff={self.baseline_diff:+.1f}"
-        )
-        lines.append(f"Deltas below are relative to the best move (best move = 0.0).")
-        lines.append("")
-
-        hdr = (
-            f"  {'Move':<8}  {'Card':<6}  {'Combined':>9}  "
-            f"{'Offensive':>10}  {'Defensive':>10}  {'n':>5}"
-        )
-        lines.append(hdr)
-        lines.append("  " + "-" * (len(hdr) - 2))
-
-        for marker, data in self._sorted_moves():
-            comb = data["combined"]
-            off = data["offensive"]
-            defv = data["defensive"]
-            n = data["n"]
-            card = data["card"]
-
-            # Tag the move type
-            tag = ""
-            if comb == 0.0:
-                tag = "  ← best"
-            elif abs(off) > abs(defv) + 0.5:
-                tag = "  [mainly offensive cost]"
-            elif abs(defv) > abs(off) + 0.5:
-                tag = "  [mainly defensive cost]"
-
-            lines.append(
-                f"  {str(marker):<8}  {str(card):<6}  {comb:>+9.2f}  "
-                f"{off:>+10.2f}  {defv:>+10.2f}  {n:>5}{tag}"
-            )
-
-        lines.append("")
-        lines.append(f"  Combined  = swing in ({cp} score − {op} score) vs best move")
-        lines.append(f"  Offensive = change in {cp}'s own final score vs best move")
-        lines.append(f"  Defensive = change in {op}'s final score vs best move")
-        lines.append(
-            f"              (negative defensive = {op} scores less = good for {cp})"
-        )
-        lines.append(
-            f"  n         = number of equally-likely face-down card orderings represented"
-        )
-
-        return "\n".join(lines)
-
-    def narrative(self):
-        """Return natural-language sentences explaining the key move contrasts."""
-        lines = []
-        cp = self.current_player
-        op = self.opponent
-        sorted_moves = self._sorted_moves()
-
-        best_marker, best_data = sorted_moves[0]
-        worst_marker, worst_data = sorted_moves[-1]
-
-        # Best move description
-        best_card = best_data["card"]
-        if best_card.facedown:
-            lines.append(
-                f"Best move: take the face-down card at {best_marker}. "
-                f"Under optimal play from here, {cp} leads by "
-                f"{self.baseline_diff:+.1f} pts on average "
-                f"(P1={self.baseline_p1:.1f}, P2={self.baseline_p2:.1f})."
-            )
-        else:
-            lines.append(
-                f"Best move: take {best_card} at {best_marker}. "
-                f"Under optimal play from here, {cp} leads by "
-                f"{self.baseline_diff:+.1f} pts on average "
-                f"(P1={self.baseline_p1:.1f}, P2={self.baseline_p2:.1f})."
-            )
-
-        # Worst move description with offensive/defensive breakdown
-        if len(sorted_moves) > 1:
-            w_card = worst_data["card"]
-            w_comb = worst_data["combined"]
-            w_off = worst_data["offensive"]
-            w_def = worst_data["defensive"]
-
-            card_str = (
-                f"the face-down card at {worst_marker}"
-                if w_card.facedown
-                else f"{w_card} at {worst_marker}"
-            )
-
-            lines.append(
-                f"\nWorst move: take {card_str} ({w_comb:+.2f} pts combined vs best). "
-            )
-
-            # Explain why it's bad
-            if abs(w_off) > abs(w_def) + 0.5:
-                lines.append(
-                    f"This is mainly an offensive cost: {cp} scores "
-                    f"{abs(w_off):.1f} pts less on average. "
-                    f"The impact on {op}'s score is smaller ({abs(w_def):.1f} pts)."
-                )
-            elif abs(w_def) > abs(w_off) + 0.5:
-                lines.append(
-                    f"This is mainly a defensive cost: it allows {op} to score "
-                    f"{abs(w_def):.1f} more pts on average. "
-                    f"{cp}'s own score drops by less ({abs(w_off):.1f} pts)."
-                )
-            else:
-                lines.append(
-                    f"The cost is roughly split: {cp} scores {abs(w_off):.1f} pts less "
-                    f"and {op} scores {abs(w_def):.1f} pts more."
-                )
-
-        # Any interesting middle moves
-        for marker, data in sorted_moves[1:-1]:
-            off = data["offensive"]
-            defv = data["defensive"]
-            card = data["card"]
-            card_str = f"face-down at {marker}" if card.facedown else f"{card}"
-
-            if abs(defv) > abs(off) + 1.5:
-                lines.append(
-                    f"\n{card_str}: primarily a denial move — "
-                    f"taking it prevents {op} from scoring {abs(defv):.1f} extra pts, "
-                    f"while adding {abs(off):.1f} pts to {cp}'s own score."
-                )
-            elif abs(off) > abs(defv) + 1.5:
-                lines.append(
-                    f"\n{card_str}: primarily an offensive move — "
-                    f"adds {abs(off):.1f} pts to {cp}'s score "
-                    f"but only denies {op} {abs(defv):.1f} pts."
-                )
-
-        return "\n".join(lines)
-
-    def __repr__(self):
-        return self.summary()
