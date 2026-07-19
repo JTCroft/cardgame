@@ -42,9 +42,15 @@
                 <span class="hand-label">
                     {{ p1_name or "Player 1" }}{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="trophy">&#127942;</span>{% endif %}
                 </span>
-                {% if my_seat == 1 and not seats_locked and not vs_computer %}
-                    <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
-                {% elif is_spectator and not p1_seated and not seats_locked %}
+                {% if my_seat == 1 %}
+                    {% if not seats_locked and not vs_computer %}
+                        <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
+                    {% endif %}
+                {% elif p1_seated and p1_disconnected and not vs_computer %}
+                    <button type="button" class="small" onclick="kickSeat(1)">Kick</button>
+                {% elif p1_seated and my_seat == 2 and not game_started %}
+                    <button type="button" class="small" onclick="swapSeats()">Swap seats</button>
+                {% elif is_spectator and not p1_seated %}
                     <button type="button" class="small" onclick="claimSeat(1)">Join as Player 1</button>
                 {% endif %}
             </div>
@@ -55,9 +61,15 @@
                 <span class="hand-label">
                     {{ p2_name or "Player 2" }}{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="trophy">&#127942;</span>{% endif %}
                 </span>
-                {% if my_seat == 2 and not seats_locked and not vs_computer %}
-                    <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
-                {% elif is_spectator and not p2_seated and not seats_locked %}
+                {% if my_seat == 2 %}
+                    {% if not seats_locked and not vs_computer %}
+                        <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
+                    {% endif %}
+                {% elif p2_seated and p2_disconnected and not vs_computer %}
+                    <button type="button" class="small" onclick="kickSeat(2)">Kick</button>
+                {% elif p2_seated and my_seat == 1 and not game_started %}
+                    <button type="button" class="small" onclick="swapSeats()">Swap seats</button>
+                {% elif is_spectator and not p2_seated %}
                     <button type="button" class="small" onclick="claimSeat(2)">Join as Player 2</button>
                 {% endif %}
             </div>

@@ -155,6 +155,13 @@
     function respondRematch(accept) {
         socket.emit("respond_rematch", withIdentity({ code: ROOM_KEY, accept: accept }));
     }
+    // Swapping seats is meaningful both in a multiplayer room and in a solo
+    // game vs. the computer (it swaps which seat the computer's in too) -
+    // see rooms.RoomState.swap_seats - so unlike claim/leave/kick (room.html.jinja2
+    // only), this lives here where both room.html.jinja2 and play.html.jinja2 can use it.
+    function swapSeats() {
+        socket.emit("swap_seats", withIdentity({ code: ROOM_KEY }));
+    }
     function historyStep(delta) {
         socket.emit("history_step", withTarget({ delta: delta }));
     }

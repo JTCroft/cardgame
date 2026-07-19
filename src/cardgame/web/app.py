@@ -396,6 +396,62 @@ def handle_vacate_seat(data):
     _broadcast_lobby()
 
 
+@socketio.on("swap_seats")
+def handle_swap_seats(data):
+    data = data or {}
+    player_id = _normalize_player_id(data.get("player_id"))
+    if player_id is None:
+        return
+    # Unlike claim_seat/vacate_seat, this needs to work for a solo room too
+    # (its "code" is the owner's own player id, not a 4-letter code) - see
+    # _resolve_room_key.
+    code = _resolve_room_key(data.get("code", ""), player_id)
+    room = _rooms.get(code)
+    if room is None:
+        return
+
+    ok, error = room.swap_seats(player_id)
+    if not ok:
+        socketio.emit("error_message", {"message": error}, to=request.sid)
+        return
+
+    _broadcast_state(code, room)
+    _broadcast_lobby()
+    # A solo room's computer opponent may now be sitting in seat 1, which
+    # always moves first (see Game.is_p1_turn) - without this, swapping
+    # into seat 2 would leave the computer waiting forever for a "turn"
+    # nothing ever hands it, since no move has been played to trigger the
+    # usual post-move check (see handle_move).
+    _maybe_play_computer_move(code, room)
+
+
+@socketio.on("kick_seat")
+def handle_kick_seat(data):
+    data = data or {}
+    code = _normalize_code(data.get("code", ""))
+    if code is None:
+        return
+    room = _rooms.get(code)
+    if room is None:
+        return
+
+    player_id = _normalize_player_id(data.get("player_id"))
+    if player_id is None:
+        return
+    try:
+        seat = int(data.get("seat"))
+    except (TypeError, ValueError):
+        return
+
+    ok, error = room.kick_seat(seat)
+    if not ok:
+        socketio.emit("error_message", {"message": error}, to=request.sid)
+        return
+
+    _broadcast_state(code, room)
+    _broadcast_lobby()
+
+
 @socketio.on("move")
 def handle_move(data):
     data = data or {}
@@ -636,6 +692,14 @@ def handle_disconnect():
         if room is not None:
             with room.lock:
                 room.sid_players.pop(sid, None)
+            # Someone else still watching may now be able to offer a "Kick"
+            # button for the seat this connection just gave up (see
+            # RoomState.seat_disconnected) - without this, that would only
+            # ever show up once some other action (a move, a join) happened
+            # to re-render the board, which might be never if nobody else
+            # is doing anything yet (e.g. still waiting for the game to
+            # start).
+            _broadcast_state(code, room)
             _broadcast_lobby()
 
 

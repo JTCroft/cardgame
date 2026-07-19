@@ -14,14 +14,18 @@
     ROOM_KEY = {{ code | tojson }};
     REVIEW_ENTRY_ID = {{ (review_entry_id or none) | tojson }};
 
-    // Claiming/leaving a seat is a room-only concept - a solo game's seats
-    // are always both already filled (you and the computer), so
-    // play.html.jinja2 never needs these.
+    // Claiming/leaving/kicking a seat are room-only concepts - a solo
+    // game's seats are always both already filled (you and the computer),
+    // so play.html.jinja2 never needs these. (swapSeats() is shared with
+    // play.html.jinja2 instead - see app.js.)
     function claimSeat(seat) {
         requireNameThen("claim_seat", { code: ROOM_KEY, seat: seat });
     }
     function leaveSeat() {
         socket.emit("vacate_seat", withIdentity({ code: ROOM_KEY }));
+    }
+    function kickSeat(seat) {
+        socket.emit("kick_seat", withIdentity({ code: ROOM_KEY, seat: seat }));
     }
 </script>
 {% endblock %}

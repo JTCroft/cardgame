@@ -190,14 +190,23 @@ class RoomState:
         return self.player_names.get(occupant, f"Player {seat}")
 
     def claim_seat(self, seat, player_id):
-        """Try to claim a vacant seat. Returns (success, error_message)."""
+        """Try to claim a vacant seat. Returns (success, error_message).
+
+        Ordinarily only possible before the game starts - once it's under
+        way the two seats are locked in for the rest of that game, same as
+        vacate_seat. The one exception is a seat kick_seat has just emptied:
+        that happens precisely because the game is already in progress, so
+        claiming it has to stay possible then too. That's safe to allow
+        unconditionally here (no game_started check at all) because a seat
+        can only ever be vacant while game_started is true as a result of
+        kick_seat - handle_move refuses to advance a game with either seat
+        empty, and vacate_seat itself refuses to empty one mid-game.
+        """
         with self.lock:
             if seat not in (1, 2):
                 return False, "Invalid seat."
             if self.computer_seat == seat:
                 return False, "That seat is taken by the computer."
-            if self.game_started and not self.game_over:
-                return False, "The game has already started."
             if any(occupant == player_id for occupant in self.seats.values()):
                 return False, "You already have a seat."
             if seat in self.seats:
@@ -217,6 +226,52 @@ class RoomState:
                     del self.seats[seat]
                     return True, None
             return False, "You don't have a seat."
+
+    def swap_seats(self, player_id):
+        """Swap the two seats' occupants - including the computer's, for a
+        solo room - so a seated player can switch sides. Returns (success,
+        error_message). Only meaningful before the game starts: once a move
+        has been made, which seat is "Player 1" vs "Player 2" decides whose
+        turn it is, so swapping after the fact would hand the move in
+        progress to the wrong side.
+        """
+        with self.lock:
+            if self.game_started:
+                return False, "You can't swap seats after the game has started."
+            if player_id not in self.seats.values():
+                return False, "You don't have a seat."
+            self.seats = {3 - seat: occupant for seat, occupant in self.seats.items()}
+            if self.computer_seat is not None:
+                self.computer_seat = 3 - self.computer_seat
+            return True, None
+
+    def seat_disconnected(self, seat):
+        """Whether `seat` is held by a human player with no currently
+        connected socket - the signal to offer a "Kick" button in place of
+        that seat's usual controls, so someone else can take over a seat
+        abandoned mid-game rather than waiting on a reconnect that may
+        never come. Never true for the computer's seat, which has no
+        player id to look up in sid_players in the first place.
+        """
+        occupant = self.seats.get(seat)
+        return occupant is not None and occupant not in self.sid_players.values()
+
+    def kick_seat(self, seat):
+        """Forcibly empty `seat`, but only while it's genuinely a
+        disconnected player's (see seat_disconnected) - unlike vacate_seat,
+        this is allowed mid-game, since the whole point is freeing a seat
+        whose occupant can no longer act on it themselves so someone else
+        can take over. Returns (success, error_message).
+        """
+        with self.lock:
+            if seat not in (1, 2):
+                return False, "Invalid seat."
+            if self.computer_seat is not None:
+                return False, "You can't kick a seat in a solo game."
+            if not self.seat_disconnected(seat):
+                return False, "That seat isn't a disconnected player's."
+            del self.seats[seat]
+            return True, None
 
     def displayed_game(self, player_id):
         """The Game to actually render for this viewer: the live game while
@@ -941,6 +996,8 @@ def _room_context(code, room, player_id):
         "p2_name": room.name_for_seat(2),
         "p1_seated": room.occupied(1),
         "p2_seated": room.occupied(2),
+        "p1_disconnected": room.seat_disconnected(1),
+        "p2_disconnected": room.seat_disconnected(2),
         "p1_score": final_game.p1.score(),
         "p2_score": final_game.p2.score(),
         "seats_taken": len(room.seats) + (1 if room.computer_seat else 0),
@@ -1000,6 +1057,8 @@ def _room_review_context(entry, viewer_id):
         "p2_name": entry["p2_name"],
         "p1_seated": True,
         "p2_seated": True,
+        "p1_disconnected": False,
+        "p2_disconnected": False,
         "p1_score": p1_score,
         "p2_score": p2_score,
         "seats_taken": 2,
