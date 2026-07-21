@@ -2,10 +2,11 @@
 
 `AlphaBetaBot` plays in two regimes:
 
-* **Endgame** — once the remaining game tree is small enough (measured by
-  cards left on the board and unresolved face-down cards, calibrated
-  empirically), it defers to the exact expectiminimax in `Game.evaluate`,
-  which optimises win/draw/loss directly.
+* **Endgame** — once the exact solver's measured worst case for the
+  position's (cards left, face-down) cell fits the per-move budget, it
+  defers to `cardgame.solve_native` (Python `solve` fallback), which
+  optimises win/draw/loss expectation directly - reaching exact play
+  from ~16-19 cards at normal budgets.
 * **Opening/midgame** — iterative-deepening expectiminimax under a time
   budget: negamax with alpha-beta at decision nodes, expectation with
   Star1 cutoffs at face-down (chance) nodes — each resolution searched
@@ -43,6 +44,8 @@ from functools import lru_cache
 
 from .cards import Card, Rank
 from .scoring import score_dp
+from .solver import solve
+from .solver_native import solve_native, NATIVE_AVAILABLE
 
 __all__ = ("choose_move", "AlphaBetaBot", "SearchParams")
 
@@ -160,33 +163,43 @@ class _Timeout(Exception):
     pass
 
 
-# Regions where a full `Game.evaluate` stays comfortably inside the ~10s
-# move ceiling (observed worst cases a few seconds, leaving headroom for
-# unsampled tails), calibrated over random games. The chance-node branching
-# from face-down cards is the main cost driver.
-def _exact_feasible(game):
+# Worst observed solve_native seconds per (cards_left, facedown), 8
+# samples per cell over oracle positions (experiments/
+# calibrate_exact_gate.py, 2026-07-21). Missing low-facedown cells are
+# filled from the nearest measured higher-facedown cell in the same row
+# (cost only falls as facedown falls); unmeasured cells are infeasible.
+# The chance-node branching from face-down cards is the main cost driver.
+_EXACT_COST = {
+    13: {0: 0.01, 1: 0.01, 2: 0.01, 3: 0.04, 4: 0.06},
+    14: {0: 0.05, 1: 0.05, 2: 0.04, 3: 0.05, 4: 0.13},
+    15: {0: 0.03, 1: 0.03, 2: 0.04, 3: 0.06, 4: 0.44, 5: 0.38},
+    16: {0: 0.04, 1: 0.04, 2: 0.23, 3: 0.49, 4: 0.31, 5: 0.65},
+    17: {0: 0.19, 1: 0.19, 2: 0.19, 3: 0.48, 4: 0.70},
+    18: {0: 0.18, 1: 0.18, 2: 0.38, 3: 1.08},
+    19: {0: 0.76, 1: 0.76, 2: 0.76, 3: 2.81, 4: 5.46},
+    20: {0: 0.60, 1: 0.60, 2: 0.60, 3: 3.73, 4: 18.63},
+    21: {0: 1.96, 1: 1.96, 2: 1.96, 3: 9.75, 4: 128.07},
+}
+# Pure-Python solve fallback runs ~11x slower (measured median).
+_EXACT_COST_SCALE = 1.0 if NATIVE_AVAILABLE else 11.0
+_EXACT_SOLVE = solve_native if NATIVE_AVAILABLE else solve
+
+
+def _exact_feasible(game, budget):
+    """True when the exact solver's observed worst case for this
+    (cards_left, facedown) cell fits inside the per-move budget - the
+    ~1.7x move ceiling (see choose_move callers) is left as headroom
+    for unsampled tails."""
     cards_left = 36 - len(game.moves)
-    facedown = len(game.board.facedown_cards)
-    return (
-        cards_left <= 8
-        or (cards_left == 9 and facedown <= 5)
-        or (cards_left == 10 and facedown <= 4)
-        or (cards_left <= 12 and facedown <= 3)
-        or (cards_left == 13 and facedown <= 2)
-    )
+    if cards_left <= 12:
+        return True
+    cost = _EXACT_COST.get(cards_left, {}).get(len(game.board.facedown_cards))
+    return cost is not None and cost * _EXACT_COST_SCALE <= budget
 
 
 def _exact_move(game):
-    sequence = game.evaluate()["Deterministic optimal moves"]
-    first = sequence[0] if sequence else None
-    if isinstance(first, Card):
-        # Face-up optimal moves are recorded as the card taken; cards are
-        # unique, so locate it among the legal cells.
-        for marker in game.legal_moves:
-            if game.board[marker[0]][marker[1]] == first:
-                return marker
-        return None
-    return first if first in game.legal_moves else None
+    marker = _EXACT_SOLVE(game)["marker"]
+    return marker if marker in game.legal_moves else None
 
 
 @dataclass(frozen=True)
@@ -315,7 +328,7 @@ class AlphaBetaBot:
             raise ValueError("Game is over - no legal moves to choose from")
         if len(legal_moves) == 1:
             return next(iter(legal_moves))
-        if self.params.exact_endgame and _exact_feasible(game):
+        if self.params.exact_endgame and _exact_feasible(game, self.time_budget):
             move = _exact_move(game)
             if move is not None:
                 return move
