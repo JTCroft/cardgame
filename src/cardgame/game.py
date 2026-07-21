@@ -251,6 +251,33 @@ class Eval(tuple):
             self.multiplicity, self.multiplicity - self[0] - self[1], self[1], -self[2]
         )
 
+    def decisively_exceeds(self, other):
+        # (2w + d, w, s) is a valid total order, but it is NOT reliably
+        # reversed by negation: __neg__ maps (w, d, s) -> (m-w-d, d, -s),
+        # so the first component maps 2w+d -> 2m - (2w+d), a strictly
+        # decreasing bijection - safe on its own - but the second (w) is
+        # UNCHANGED whenever 2w+d ties between two values (algebra: if
+        # 2w1+d1 = 2w2+d2 = x, then the negated w's are m+w1-x and
+        # m+w2-x, so their difference is (w1-w2) unchanged). That means
+        # a comparison DECIDED by the w tiebreak (2w+d ties, w differs)
+        # can come out "greater than" on BOTH sides of a negation at
+        # once - the exact scenario the codebase's docstrings warn is
+        # "not strictly well ordered". `alpha > beta and not -alpha >
+        # -beta` only catches this when alpha/beta THEMSELVES exhibit
+        # it; it can't see that continuing the search might later find
+        # an even-better value that would (see
+        # evaluate-alpha-beta-ordering-bug in project memory for the
+        # concrete counterexample this was fixed from). The one
+        # comparator outcome immune to this regardless of what a deeper
+        # search might still find is a STRICT difference in 2w+d alone
+        # (cross-multiplied to a common multiplicity, like every other
+        # comparison here) - only that is safe to prune on.
+        self_multip = self.multiplicity
+        other_multip = other.multiplicity
+        if self_multip == other_multip:
+            return self.eval[0] > other.eval[0]
+        return self.eval[0] * other_multip > other.eval[0] * self_multip
+
     def __repr__(self):
         normed_formatted_str = ", ".join(f"{x:.2f}" for x in self.normed_eval)
         return f"Eval({normed_formatted_str})"
@@ -744,13 +771,13 @@ class Game:
                         alpha = max(move_lower, alpha)
                     else:
                         alpha = max(best_score._bound_evals()[0], alpha)
-                    if alpha > beta and not (-alpha) > (-beta):
+                    if alpha.decisively_exceeds(beta):
                         break
                 if curr_move_best_move:
                     best_move_seq = (move_marker,) + _common_prefix(
                         possibility_move_seqs
                     )
-            if alpha > beta and not (-alpha) > (-beta):
+            if alpha.decisively_exceeds(beta):
                 break
         return {
             "Evaluation": best_score,
