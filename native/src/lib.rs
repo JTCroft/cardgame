@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const SCORE_BOUND: i64 = 26;
 const FACT: [i64; 13] = [
@@ -314,6 +315,336 @@ impl Ctx {
 }
 
 // ---------------------------------------------------------------------------
+// Move analysis (port of analysis._collect_aggregate / _collect_terminals)
+//
+// Unlike the solver these walks never prune: analyse_moves needs exact
+// per-move win/draw/loss/score aggregates for *every* legal move, and the
+// (2w+d, w, s) line-selection tie-break is not an ordered group, so
+// alpha-beta on it would be unsound. Each root move is independent (no
+// pruning between them), which is what lets a caller solve them one at a
+// time and stream the results.
+// ---------------------------------------------------------------------------
+
+// Score diffs are in [-26, 26]; the histogram carries generous headroom
+// and negates by index reversal (key k lives at index k + HIST_OFFSET).
+const HIST_OFFSET: i64 = 32;
+const HIST_SIZE: usize = 65;
+type Hist = [i64; HIST_SIZE];
+
+fn hist_rev(h: &Hist) -> Hist {
+    let mut r = [0i64; HIST_SIZE];
+    for i in 0..HIST_SIZE {
+        r[HIST_SIZE - 1 - i] = h[i];
+    }
+    r
+}
+
+/// (multiplicity, wins, draws, score_sum, mover's-own-score_sum) - the same
+/// aggregate analysis._Agg carries, all weighted by chance multiplicity.
+#[derive(Clone, Copy)]
+struct Agg {
+    m: i64,
+    w: i64,
+    d: i64,
+    s: i64,
+    mover_sum: i64,
+}
+
+impl Agg {
+    #[inline]
+    fn zero() -> Agg {
+        Agg { m: 0, w: 0, d: 0, s: 0, mover_sum: 0 }
+    }
+    #[inline]
+    fn add(self, o: Agg) -> Agg {
+        Agg {
+            m: self.m + o.m,
+            w: self.w + o.w,
+            d: self.d + o.d,
+            s: self.s + o.s,
+            mover_sum: self.mover_sum + o.mover_sum,
+        }
+    }
+    #[inline]
+    fn neg(self) -> Agg {
+        Agg {
+            m: self.m,
+            w: self.m - self.w - self.d,
+            d: self.d,
+            s: -self.s,
+            mover_sum: self.mover_sum - self.s,
+        }
+    }
+    #[inline]
+    fn key(&self) -> (i64, i64, i64) {
+        (2 * self.w + self.d, self.w, self.s)
+    }
+}
+
+struct ACtx {
+    cells: [i64; 36],
+    unknowns: [i64; 12],
+    deadline: Option<Instant>,
+    nodes: u64,
+    aborted: bool,
+}
+
+impl ACtx {
+    #[inline]
+    fn tick(&mut self) {
+        self.nodes += 1;
+        if self.nodes & 0x3ff == 0 {
+            if let Some(dl) = self.deadline {
+                if Instant::now() >= dl {
+                    self.aborted = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn leaf(&self, mi: u32, mk: u8, oi: u32, ok: u8, nu: usize) -> Agg {
+        let mover = score(mi, mk);
+        let diff = mover - score(oi, ok);
+        let m = FACT[nu];
+        Agg {
+            m,
+            w: if diff > 0 { m } else { 0 },
+            d: if diff == 0 { m } else { 0 },
+            s: m * diff,
+            mover_sum: m * mover,
+        }
+    }
+
+    /// Exhaustive expectiminimax returning the optimal line's aggregate in
+    /// this node's mover perspective. Selection is by (2w+d, w, s) then
+    /// marker - the same tie-break analysis._Agg uses, made order-
+    /// independent by including the (distinct) marker in the key.
+    #[allow(clippy::too_many_arguments)]
+    fn agg_search(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+        ok: u8, nu: usize,
+    ) -> Agg {
+        if self.aborted {
+            return Agg::zero();
+        }
+        self.tick();
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            return self.leaf(mi, mk, oi, ok, nu);
+        }
+        let mut best: Option<(Agg, (usize, usize))> = None;
+        for &target in &buf[..n] {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = self.cells[target];
+            let combined = if payload < 0 {
+                self.agg_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+            } else if payload > 0 {
+                self.agg_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+            } else {
+                self.agg_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+            };
+            let candidate = combined.neg();
+            let marker = (target / 6, target % 6);
+            let better = match best {
+                None => true,
+                Some((ba, bm)) => (candidate.key(), marker) > (ba.key(), bm),
+            };
+            if better {
+                best = Some((candidate, marker));
+            }
+        }
+        best.unwrap().0
+    }
+
+    /// Sum of the resolutions' child-perspective aggregates (no negation -
+    /// the caller negates the sum, exactly as _collect_aggregate does).
+    #[allow(clippy::too_many_arguments)]
+    fn agg_chance(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8,
+        oi: u32, ok: u8, nu: usize,
+    ) -> Agg {
+        let mut combined = Agg::zero();
+        for i in 0..nu {
+            let card = self.unknowns[i];
+            for j in i..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            let r = if card > 0 {
+                self.agg_search(target, nrows, ncols, oi, ok, mi | card as u32, mk, nu - 1)
+            } else {
+                self.agg_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu - 1)
+            };
+            for j in (i..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[i] = card;
+            combined = combined.add(r);
+        }
+        combined
+    }
+
+    /// Like agg_search, additionally carrying the optimal line's score-diff
+    /// histogram (key = mover_score - other_score at the leaf, negated by
+    /// reversal on the way up). Used for the winner's outcome heatmap only.
+    #[allow(clippy::too_many_arguments)]
+    fn dist_search(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+        ok: u8, nu: usize,
+    ) -> (Agg, Hist) {
+        if self.aborted {
+            return (Agg::zero(), [0; HIST_SIZE]);
+        }
+        self.tick();
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            let agg = self.leaf(mi, mk, oi, ok, nu);
+            let mut h = [0i64; HIST_SIZE];
+            let diff = score(mi, mk) - score(oi, ok);
+            h[(diff + HIST_OFFSET) as usize] = agg.m;
+            return (agg, h);
+        }
+        let mut best: Option<(Agg, Hist, (usize, usize))> = None;
+        for &target in &buf[..n] {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = self.cells[target];
+            let (cagg, chist) = if payload < 0 {
+                self.dist_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+            } else if payload > 0 {
+                self.dist_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+            } else {
+                self.dist_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+            };
+            let candidate = cagg.neg();
+            let marker = (target / 6, target % 6);
+            let better = match best {
+                None => true,
+                Some((ba, _, bm)) => (candidate.key(), marker) > (ba.key(), bm),
+            };
+            if better {
+                best = Some((candidate, hist_rev(&chist), marker));
+            }
+        }
+        let b = best.unwrap();
+        (b.0, b.1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dist_chance(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8,
+        oi: u32, ok: u8, nu: usize,
+    ) -> (Agg, Hist) {
+        let mut agg = Agg::zero();
+        let mut hist = [0i64; HIST_SIZE];
+        for i in 0..nu {
+            let card = self.unknowns[i];
+            for j in i..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            let (r_agg, r_hist) = if card > 0 {
+                self.dist_search(target, nrows, ncols, oi, ok, mi | card as u32, mk, nu - 1)
+            } else {
+                self.dist_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu - 1)
+            };
+            for j in (i..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[i] = card;
+            agg = agg.add(r_agg);
+            for k in 0..HIST_SIZE {
+                hist[k] += r_hist[k];
+            }
+        }
+        (agg, hist)
+    }
+}
+
+fn new_actx(cells: Vec<i64>, unknowns: &[i64], deadline_secs: Option<f64>) -> PyResult<ACtx> {
+    if cells.len() != 36 || unknowns.len() > 12 {
+        return Err(pyo3::exceptions::PyValueError::new_err("bad state shape"));
+    }
+    let mut u = [0i64; 12];
+    u[..unknowns.len()].copy_from_slice(unknowns);
+    Ok(ACtx {
+        cells: cells.try_into().unwrap(),
+        unknowns: u,
+        deadline: deadline_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
+        nodes: 0,
+        aborted: false,
+    })
+}
+
+/// One root move's exact aggregate, in the analysed (root) player's
+/// perspective: (m, w, d, s, mover_sum), or None if the deadline tripped.
+/// `target` is the cell being played; the caller enumerates legal cells.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn analyse_move(
+    py: Python<'_>, cells: Vec<i64>, target: usize, rows: u64, cols: u64, mi: u32,
+    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
+) -> PyResult<Option<(i64, i64, i64, i64, i64)>> {
+    let mut ctx = new_actx(cells, &unknowns, deadline_secs)?;
+    let nu = unknowns.len();
+    py.detach(move || {
+        let nrows = rows | 1 << target;
+        let ncols = cols | col_bit(target);
+        let payload = ctx.cells[target];
+        let combined = if payload < 0 {
+            ctx.agg_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+        } else if payload > 0 {
+            ctx.agg_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+        } else {
+            ctx.agg_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+        };
+        if ctx.aborted {
+            return Ok(None);
+        }
+        let a = combined.neg();
+        Ok(Some((a.m, a.w, a.d, a.s, a.mover_sum)))
+    })
+}
+
+/// The winner's outcome distribution: (score_diff, weight) pairs in the
+/// analysed player's own perspective (self - opponent), matching
+/// analyse_moves' `distribution`. None if the deadline tripped.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn distribution(
+    py: Python<'_>, cells: Vec<i64>, target: usize, rows: u64, cols: u64, mi: u32,
+    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
+) -> PyResult<Option<Vec<(i64, i64)>>> {
+    let mut ctx = new_actx(cells, &unknowns, deadline_secs)?;
+    let nu = unknowns.len();
+    py.detach(move || {
+        let nrows = rows | 1 << target;
+        let ncols = cols | col_bit(target);
+        let payload = ctx.cells[target];
+        let (_, hist) = if payload < 0 {
+            ctx.dist_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+        } else if payload > 0 {
+            ctx.dist_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+        } else {
+            ctx.dist_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+        };
+        if ctx.aborted {
+            return Ok(None);
+        }
+        // Top level applies no flip; distribution key is other - mover =
+        // -(mover - other), i.e. the child histogram reversed.
+        let final_hist = hist_rev(&hist);
+        let out: Vec<(i64, i64)> = (0..HIST_SIZE)
+            .filter(|&i| final_hist[i] != 0)
+            .map(|i| (i as i64 - HIST_OFFSET, final_hist[i]))
+            .collect();
+        Ok(Some(out))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Root (port of solver.solve, ordered=False path)
 // ---------------------------------------------------------------------------
 
@@ -387,5 +718,7 @@ fn solve_root(
 #[pymodule]
 fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_root, m)?)?;
+    m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
+    m.add_function(wrap_pyfunction!(distribution, m)?)?;
     Ok(())
 }

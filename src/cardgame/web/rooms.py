@@ -27,13 +27,14 @@ import string
 import threading
 import time
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 from flask import render_template
 
 from ..ai import choose_move
-from ..analysis import analyse_moves_by_deadline
+from ..analysis import AnalysisAborted, analyse_moves_by_deadline
+from ..analysis_native import FINAL, NATIVE_AVAILABLE, iter_move_analyses
 from ..game import Game
 from ..search_alt import _snapshot as _search_snapshot
 from ..search_alt import move_search_iterator
@@ -341,13 +342,16 @@ _ANALYSIS_TIME_CAP = 120.0
 # slot's role.
 _ANALYSIS_CALL_SAFETY_CAP = 30 * 60
 
-# Shared, app-wide pool that runs analyse_moves calls in separate
-# processes - CPU-bound pure Python, so plain threads here would just take
-# turns on one core rather than adding capacity. Lazily created so
-# importing this module doesn't spawn worker processes unless analysis is
-# actually used; bounded by CPU count regardless of how many rooms are
-# active, since ProcessPoolExecutor queues submissions beyond max_workers
-# rather than running them all at once.
+# Shared, app-wide pool that runs analyse_moves calls. Threads, not
+# processes: the native solver (cardgame_native) releases the GIL for the
+# whole walk, so concurrent calls genuinely use multiple cores, and running
+# in-process lets a call stream its per-move results straight into the room
+# cache and broadcast them as they land - something a ProcessPoolExecutor
+# Future (all-or-nothing) can't do. Without the native core the walk is
+# pure-Python and holds the GIL, so those calls serialise; that path is the
+# untuned fallback and streams nothing (analyse_moves_by_deadline returns the
+# whole dict at once). Lazily created; bounded by CPU count regardless of how
+# many rooms are active, since the pool queues submissions beyond max_workers.
 _analysis_pool = None
 _analysis_pool_lock = threading.Lock()
 
@@ -356,8 +360,57 @@ def _get_analysis_pool():
     global _analysis_pool
     with _analysis_pool_lock:
         if _analysis_pool is None:
-            _analysis_pool = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
+            _analysis_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 2)
         return _analysis_pool
+
+
+def _stream_analysis(cache, lock, position, index, deadline, broadcast):
+    """Analyse one position, folding results into cache[index] and calling
+    `broadcast` after each update - the single per-position work unit both
+    the automatic worker and the on-demand path submit to the pool.
+
+    Native path: streams one root move at a time (see iter_move_analyses),
+    writing a provisional, re-sorting table into cache[index] as each move
+    lands and the winner's heatmap once it's all in. Whatever completed
+    before a deadline stays visible. Fallback path: computes the whole dict
+    and writes it once. Returns the finished move_data, or None if the
+    deadline cut it short (the streamed partial, if any, is left in place).
+    """
+    if not NATIVE_AVAILABLE:
+        result = analyse_moves_by_deadline(position, deadline)
+        if result is not None:
+            with lock:
+                cache[index] = result
+            broadcast()
+        return result
+
+    total = len(position.legal_moves)
+    try:
+        final = None
+        for marker, data in iter_move_analyses(position, deadline):
+            with lock:
+                if marker is FINAL:
+                    final = data
+                    cache[index] = data  # complete move_data (marker -> stats)
+                else:
+                    # A distinct shape from a finished move_data dict (whose
+                    # keys are (row, col) tuples) - see _move_analysis_context.
+                    cache[index] = {
+                        "streaming": True,
+                        "moves": dict(data),
+                        "done": len(data),
+                        "total": total,
+                    }
+            broadcast()
+        return final
+    except AnalysisAborted:
+        # Keep whatever streamed, but settle it so the UI stops spinning.
+        with lock:
+            existing = cache.get(index)
+            if isinstance(existing, dict) and existing.get("streaming"):
+                existing["streaming"] = False
+        broadcast()
+        return None
 
 
 # Deadline for an explicit, one-off "Calculate" request (see
@@ -421,12 +474,16 @@ def start_ondemand_analysis(cache, inflight, calc_started, lock, game, index, on
         position = game.undo(total - index)
         pool = _get_analysis_pool()
         call_deadline = time.monotonic() + _ONDEMAND_ANALYSIS_DEADLINE
-        result = pool.submit(analyse_moves_by_deadline, position, call_deadline).result()
+        broadcast = (lambda: _in_app_context(on_done)) if on_done is not None else (lambda: None)
+        # _stream_analysis folds results (and streamed partials) into cache
+        # itself; just wait for it to settle before clearing the inflight
+        # markers and pushing the final render.
+        pool.submit(
+            _stream_analysis, cache, lock, position, index, call_deadline, broadcast
+        ).result()
         with lock:
             inflight.discard(index)
             calc_started.pop(index, None)
-            if result is not None:
-                cache[index] = result
         if on_done is not None:
             _in_app_context(on_done)
 
@@ -511,12 +568,12 @@ def _abandon_futures(room, cache, inflight, futures):
     is harvested into `cache` first, so a result that landed moments before
     the decision to stop isn't wasted; whatever's still running gets
     `.cancel()`'d, which only actually prevents it from starting if the
-    pool hasn't gotten to it yet - ProcessPoolExecutor has no way to stop a
-    task already running in its worker process. It's left to run to its
-    own baked-in deadline in that case, with nothing left to collect its
-    result. Either way `inflight` always gets cleared, so a later worker
-    can pick the same index up again rather than seeing it "pending"
-    forever."""
+    pool hasn't gotten to it yet - a task already running in a pool thread
+    can't be interrupted from here. It's left to run to its own baked-in
+    deadline in that case (the native walk polls that deadline itself, so it
+    does stop), streaming into `cache` as it goes but with the slot no longer
+    tracked. Either way `inflight` always gets cleared, so a later worker can
+    pick the same index up again rather than seeing it "pending" forever."""
     for index, fut in futures.items():
         if fut.done():
             result = fut.result()
@@ -529,17 +586,22 @@ def _abandon_futures(room, cache, inflight, futures):
     futures.clear()
 
 
-def _submit(pool, room, inflight, game, index, ended, deadline):
-    """Submit analyse_moves_by_deadline for the position `index` moves into
+def _submit(pool, code, room, cache, inflight, game, index, ended, deadline):
+    """Submit the streaming analysis of the position `index` moves into
     `game`, marking it inflight. Shared by both of _analysis_worker_loop's
-    reserved slots - only what candidate to submit differs between them."""
+    reserved slots - only what candidate to submit differs between them.
+    Results (and streamed partials) are folded into `cache` and pushed to
+    viewers via _broadcast_state as they land."""
     total = len(game.moves)
     position = game.undo(total - index)
     safety = time.monotonic() + _ANALYSIS_CALL_SAFETY_CAP
     call_deadline = min(deadline, safety) if ended else safety
     with room.lock:
         inflight.add(index)
-    return pool.submit(analyse_moves_by_deadline, position, call_deadline)
+    broadcast = lambda: _in_app_context(lambda: _broadcast_state(code, room))
+    return pool.submit(
+        _stream_analysis, cache, room.lock, position, index, call_deadline, broadcast
+    )
 
 
 def _analysis_worker_loop(code, room):
@@ -548,8 +610,10 @@ def _analysis_worker_loop(code, room):
     than two, so nothing already in flight at the moment the game ends gets
     thrown away.
 
-    Runs exactly two concurrent analyse_moves calls, each in its own process
-    (see _get_analysis_pool), with a fixed, reserved role that never borrows
+    Runs exactly two concurrent analyse_moves calls, each on its own pool
+    thread (see _get_analysis_pool; the native walk releases the GIL, so the
+    two genuinely run in parallel and stream their per-move results straight
+    into the shared cache), with a fixed, reserved role that never borrows
     the other's slot:
 
     - The backward slot always extends one position further back into
@@ -584,10 +648,9 @@ def _analysis_worker_loop(code, room):
     keep backtracking regardless of viewers, so the frozen review still gets
     filled in even if the room empties the instant the game finishes. Each
     call submitted from then on carries that deadline (and the safety cap,
-    whichever is sooner) baked in up front, since a separate process can't
-    be signalled to stop cooperatively the way a thread can - so a call
-    already in flight when the deadline is set still gets cut off at it,
-    rather than running to completion regardless.
+    whichever is sooner) baked in up front - the native walk polls it and
+    stops on its own - so a call already in flight when the deadline is set
+    still gets cut off at it, rather than running to completion regardless.
 
     Exits when the room empties (game still in progress), the post-game
     grace period elapses, or there's nothing left to analyse.
@@ -702,7 +765,7 @@ def _analysis_worker_loop(code, room):
                     index = _newest_attemptable_index(game, total, done, upper)
                 if index is not None:
                     futures[index] = _submit(
-                        pool, room, inflight, game, index, ended, deadline
+                        pool, code, room, cache, inflight, game, index, ended, deadline
                     )
                     backward_index = index
 
@@ -719,7 +782,7 @@ def _analysis_worker_loop(code, room):
                 index = _newest_attemptable_index(game, total, done, upper)
                 if index is not None:
                     futures[index] = _submit(
-                        pool, room, inflight, game, index, ended, deadline
+                        pool, code, room, cache, inflight, game, index, ended, deadline
                     )
                     forward_index = index
 
@@ -976,6 +1039,16 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
         if grace_period_over:
             return {"calculable": True, "mover_name": mover_name, "history_index": history_index}
         return None
+    # A still-streaming entry (see _stream_analysis) carries the moves solved
+    # so far under a "streaming" wrapper, with the winner's heatmap not yet
+    # computed; a finished analysis is a plain {(row, col): stats} dict. The
+    # rows below render either - only the heatmap and a "still computing" note
+    # differ, both keyed off `streaming`.
+    streaming = isinstance(data, dict) and data.get("streaming")
+    done_count = total_count = None
+    if streaming:
+        done_count, total_count = data["done"], data["total"]
+        data = data["moves"]
     played_marker = full_game.moves[history_index]
     rows = []
     # Same (eval, marker) tie-break analyse_moves itself uses to decide
@@ -1021,14 +1094,21 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
             }
         )
     best = next(row for row in rows if row["best"])
+    # The winner's distribution (and so the heatmap) is only there once the
+    # analysis has fully finished - a streaming entry shows the table alone
+    # until then.
+    best_distribution = None if streaming else data[best["marker"]]["distribution"]
     return {
         "pending": False,
+        "streaming": bool(streaming),
+        "done_count": done_count,
+        "total_count": total_count,
         "mover_name": mover_name,
         "opponent_name": opponent_name,
         "p1_name": p1_display,
         "p2_name": p2_display,
         "rows": rows,
-        "heatmap": _outcome_heatmap(data[best["marker"]]["distribution"], mover_seat),
+        "heatmap": _outcome_heatmap(best_distribution, mover_seat) if best_distribution else None,
     }
 
 

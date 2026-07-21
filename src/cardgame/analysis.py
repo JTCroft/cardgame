@@ -11,6 +11,7 @@ import time
 from collections import Counter
 
 from .game import Eval, _cached_score
+from .analysis_native import NATIVE_AVAILABLE, analyse_moves_native
 
 __all__ = ("analyse_moves", "analyse_moves_by_deadline", "AnalysisAborted")
 
@@ -39,11 +40,14 @@ class _Deadline:
 
 def analyse_moves_by_deadline(game, deadline):
     """Like analyse_moves, but takes a plain time.monotonic() deadline (or
-    None for unbounded) instead of a live abort object - the entry point
-    for running a call in a worker process via a ProcessPoolExecutor, which
-    can only receive plain, picklable arguments up front. Returns None
-    instead of raising if the deadline passes before finishing."""
+    None for unbounded) instead of a live abort object. Returns None instead
+    of raising if the deadline passes before finishing. Runs on the Rust core
+    when it's available (analyse_moves_native), falling back to the pure-
+    Python reference otherwise - both produce identical results (validated
+    field-for-field), the native path just reaches far deeper in the budget."""
     try:
+        if NATIVE_AVAILABLE:
+            return analyse_moves_native(game, deadline)
         return analyse_moves(game, abort=_Deadline(deadline))
     except AnalysisAborted:
         return None

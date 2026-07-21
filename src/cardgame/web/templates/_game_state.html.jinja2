@@ -115,6 +115,12 @@
             {%- endif -%}
         {% endmacro %}
         <h3>Move comparison <span class="analysis-sub">{{ move_analysis.mover_name }} to move</span></h3>
+        {% if move_analysis.streaming %}
+        <p class="analysis-note">
+            Solving each move&hellip; ({{ move_analysis.done_count }}/{{ move_analysis.total_count }} done)
+        </p>
+        {% endif %}
+        {% if move_analysis.heatmap %}
         <div class="outcome-heatmap">
             {% set columns = "repeat(" ~ move_analysis.heatmap.cells|length ~ ", 1fr)" %}
             <div class="outcome-heatmap-row" style="grid-template-columns: {{ columns }};">
@@ -134,6 +140,7 @@
                 <span>{{ p1_name or "Player 1" }}</span>
             </div>
         </div>
+        {% endif %}
         <div class="analysis-table-wrap">
             <table class="analysis-table">
                 <thead>
