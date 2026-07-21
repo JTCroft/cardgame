@@ -128,9 +128,26 @@ aws ssm start-session --target "$(cardgame-id)" --profile cardgame
 # once connected (replace <branch> with your actual git_ref):
 cd /opt/cardgame
 sudo git fetch origin && sudo git reset --hard "origin/<branch>"
-sudo /usr/local/bin/uv sync --extra web
+sudo /usr/local/bin/uv sync --extra web --extra native
 sudo systemctl restart cardgame-web
 ```
+
+The `native` extra builds the Rust solver core (`native/`) on the
+instance; the boot script installs its toolchain (`rust`, `cargo`,
+`gcc`) and a 2G swap file so the build fits in a t4g.micro's memory.
+**Instances booted before that was added need those installed once**
+(user-data only runs at first boot) - via SSM before the next update:
+
+```bash
+aws ssm send-command --instance-ids "$(cardgame-id)" \
+  --document-name "AWS-RunShellScript" \
+  --parameters '{"commands":["dnf install -y rust cargo gcc","[ -f /swapfile ] || (fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo /swapfile none swap sw 0 0 >> /etc/fstab)"]}' \
+  --profile cardgame
+```
+
+If the extra isn't installed the app still works - `solve_native`'s
+callers fall back to the pure-Python solver (the bot's exact-endgame
+gate scales its cost thresholds accordingly).
 
 If you'd rather always get a fully clean instance (e.g. after bigger infra
 changes), `terraform taint aws_instance.web && terraform apply` replaces it

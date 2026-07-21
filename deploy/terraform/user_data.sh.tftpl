@@ -6,7 +6,17 @@
 # instance after a stop, since stopping/starting gets a fresh public IP.
 set -euo pipefail
 
-dnf install -y git jq
+# rust/cargo/gcc build the cardgame-native solver crate (the "native"
+# extra); the swap file keeps that build (and the 1GB instance generally)
+# out of OOM territory.
+dnf install -y git jq rust cargo gcc
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
 
 CADDY_URL=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest \
   | jq -r '.assets[] | select(.name | test("linux_arm64\\.tar\\.gz$")) | .browser_download_url')
@@ -18,7 +28,7 @@ curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin s
 
 git clone --branch "${git_ref}" ${github_repo_url} /opt/cardgame
 cd /opt/cardgame
-/usr/local/bin/uv sync --extra web
+/usr/local/bin/uv sync --extra web --extra native
 
 install -m 600 /dev/null /etc/cardgame.env
 {
