@@ -156,6 +156,56 @@ from cardgame import analyse_moves
 analyse_moves(game)
 ```
 
+### Fast exact best-move solver
+
+`cardgame.solve` is a from-scratch expectiminimax built for one job:
+finding the optimal move at the greatest possible depth, fast. Instead
+of comparing outcome distributions with the `(w + d/2, w, s)` order
+above - whose "prefer decisive outcomes" middle term is not reversed by
+negation and therefore cannot support sound alpha-beta pruning (see the
+caveats in Position Evaluation) - every node value is a single integer
+
+```
+sum over leaves of  multiplicity * (SIGN_SCALE * sign(diff) + diff)
+```
+
+which ranks moves by win/draw/loss expectation first (identical to the
+`w + d/2` primary term) with cumulative score as the tie-break.
+Integers form an ordered abelian group, so fail-soft negamax alpha-beta
+plus Star1 chance-node windows are provably sound under any move
+ordering, with no guards needed. The only semantic change is the
+dropped middle tie-break: on the 12,572-position oracle corpus this
+changes the chosen move in ~1% of positions, always between moves with
+identical win/draw/loss expectation.
+
+```python
+from cardgame import solve
+result = solve(game)
+result["marker"]     # best move
+result["sign_sum"]   # wins - losses over all outcomes (2w+d = sign_sum + m)
+result["score_sum"]  # cumulative score difference, the tie-break term
+result["moves"]      # per-move (value, exact_flag); non-exact = upper bound
+```
+
+`solve_plain` is the exhaustive no-pruning reference used to validate
+it. The solver searches raw bitmask state with cached scoring (no Game
+object construction), and at 14-18 cards runs roughly 3-25x faster
+than `Game.evaluate` while returning the same best move; 19-card
+positions solve in seconds to minutes depending on facedown count.
+
+`solve_native` is the same solver backed by a Rust core (`native/`,
+PyO3 + maturin). It replicates the Python search's deterministic order
+and window arithmetic exactly, so its result dict is field-for-field
+identical to `solve`'s - verified on 120 oracle positions - while
+running a further ~9-20x faster (median 11x): 19-card positions solve
+in ~1-6s. The Python implementation remains the reference and works
+without any toolchain; the native core is an optional accelerator:
+
+```bash
+# requires a Rust toolchain (https://rustup.rs)
+uv pip install ./native
+```
+
 ### Iterative bounded search with live rankings
 
 `Game.evaluate` is depth-first, so it can say almost nothing until it is

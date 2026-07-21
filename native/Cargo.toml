@@ -1,0 +1,15 @@
+[package]
+name = "cardgame-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cardgame_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

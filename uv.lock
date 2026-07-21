@@ -29,6 +29,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+native = [
+    { name = "cardgame-native" },
+]
 web = [
     { name = "flask" },
     { name = "flask-socketio" },
@@ -37,12 +40,18 @@ web = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cardgame-native", marker = "extra == 'native'", directory = "native" },
     { name = "flask", marker = "extra == 'web'", specifier = ">=3.0" },
     { name = "flask-socketio", marker = "extra == 'web'", specifier = ">=5.3" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "simple-websocket", marker = "extra == 'web'", specifier = ">=1.0" },
 ]
-provides-extras = ["web"]
+provides-extras = ["web", "native"]
+
+[[package]]
+name = "cardgame-native"
+version = "0.1.0"
+source = { directory = "native" }
 
 [[package]]
 name = "click"

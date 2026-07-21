@@ -14,6 +14,15 @@ web = [
     "flask-socketio>=5.3",
     "simple-websocket>=1.0",
 ]
+# Rust-backed solver core (cardgame.solve_native); building it needs a
+# Rust toolchain + C linker. Everything falls back to the pure-Python
+# solver without it.
+native = [
+    "cardgame-native",
+]
+
+[tool.uv.sources]
+cardgame-native = { path = "native" }
 
 [project.scripts]
 cardgame = "cardgame:main"
