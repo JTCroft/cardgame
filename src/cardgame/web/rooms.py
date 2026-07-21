@@ -1039,16 +1039,21 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
         if grace_period_over:
             return {"calculable": True, "mover_name": mover_name, "history_index": history_index}
         return None
-    # A still-streaming entry (see _stream_analysis) carries the moves solved
-    # so far under a "streaming" wrapper, with the winner's heatmap not yet
-    # computed; a finished analysis is a plain {(row, col): stats} dict. The
-    # rows below render either - only the heatmap and a "still computing" note
-    # differ, both keyed off `streaming`.
-    streaming = isinstance(data, dict) and data.get("streaming")
+    # A partial entry (see _stream_analysis) carries the moves solved so far
+    # under a wrapper - "streaming" True while still calculating, False once a
+    # deadline stopped it short - with the winner's heatmap not yet computed.
+    # A finished analysis is a plain {(row, col): stats} dict (no "streaming"
+    # key, since its keys are all (row, col) tuples). The rows below render
+    # any of the three; only the heatmap, the note, and the still-uncomputed
+    # placeholder rows differ.
+    partial = isinstance(data, dict) and "streaming" in data
+    in_progress = bool(partial and data["streaming"])
     done_count = total_count = None
-    if streaming:
+    if partial:
         done_count, total_count = data["done"], data["total"]
-        data = data["moves"]
+        computed = data["moves"]
+    else:
+        computed = data
     played_marker = full_game.moves[history_index]
     rows = []
     # Same (eval, marker) tie-break analyse_moves itself uses to decide
@@ -1056,7 +1061,7 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
     # even disagree in sign) between moves with different win/draw shapes.
     # Sorting by it too keeps the badged best move first in the table.
     for marker, move in sorted(
-        data.items(), key=lambda item: (item[1]["eval"], item[0]), reverse=True
+        computed.items(), key=lambda item: (item[1]["eval"], item[0]), reverse=True
     ):
         card = move["card"]
         # analyse_moves reports win_pct/loss_pct/defensive/offensive from
@@ -1091,16 +1096,48 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
                 "p2_change": p2_change,
                 "best": move["best"],
                 "played": marker == played_marker,
+                "status": None,  # a solved row - see placeholders below
             }
         )
-    best = next(row for row in rows if row["best"])
+    # For a partial entry, list the moves not yet solved too, so the table
+    # shows the full slate from the start rather than growing a row at a time -
+    # tagged "calculating" while the walk is still running, "stopped" once a
+    # deadline cut it short. display_game is the position being reviewed, so
+    # its legal moves are exactly the ones the analysis covers.
+    if partial:
+        status = "calculating" if in_progress else "stopped"
+        for marker in sorted(set(display_game.legal_moves) - set(computed)):
+            card = display_game.board[marker[0]][marker[1]]
+            rows.append(
+                {
+                    "marker": marker,
+                    "card": card,
+                    "revealed": (
+                        full_game.board[marker[0]][marker[1]]
+                        if card.facedown and marker == played_marker
+                        else None
+                    ),
+                    "best": False,
+                    "played": marker == played_marker,
+                    "status": status,
+                }
+            )
     # The winner's distribution (and so the heatmap) is only there once the
-    # analysis has fully finished - a streaming entry shows the table alone
-    # until then.
-    best_distribution = None if streaming else data[best["marker"]]["distribution"]
+    # analysis has fully finished - a partial entry shows the table alone.
+    best_distribution = None
+    if not partial:
+        best = next(row for row in rows if row["best"])
+        best_distribution = computed[best["marker"]]["distribution"]
+    # Once every move is solved the walk is on its final, separate step - the
+    # winner's outcome distribution (see iter_move_analyses / the native
+    # `distribution` call), the one expensive piece - so the note flips from
+    # "solving moves" to "generating heatmap" for that window.
+    generating_heatmap = in_progress and done_count == total_count
     return {
         "pending": False,
-        "streaming": bool(streaming),
+        "streaming": in_progress and not generating_heatmap,
+        "generating_heatmap": generating_heatmap,
+        "incomplete": partial and not in_progress,
         "done_count": done_count,
         "total_count": total_count,
         "mover_name": mover_name,

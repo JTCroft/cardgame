@@ -119,6 +119,14 @@
         <p class="analysis-note">
             Solving each move&hellip; ({{ move_analysis.done_count }}/{{ move_analysis.total_count }} done)
         </p>
+        {% elif move_analysis.generating_heatmap %}
+        <p class="analysis-note">
+            Generating heatmap&hellip;
+        </p>
+        {% elif move_analysis.incomplete %}
+        <p class="analysis-note">
+            Analysis stopped before finishing &mdash; {{ move_analysis.done_count }} of {{ move_analysis.total_count }} moves solved.
+        </p>
         {% endif %}
         {% if move_analysis.heatmap %}
         <div class="outcome-heatmap">
@@ -157,8 +165,24 @@
                 </thead>
                 <tbody>
                     {% for row in move_analysis.rows %}
-                    <tr class="{% if row.played %}analysis-played{% endif %}">
+                    <tr class="{% if row.played %}analysis-played{% endif %}{% if row.status %} analysis-unsolved{% endif %}">
                         <td>{{ analysis_card(row) }}</td>
+                        {% if row.status %}
+                        <td class="num">&mdash;</td>
+                        <td class="num">&mdash;</td>
+                        <td class="num">&mdash;</td>
+                        <td class="num">&mdash;</td>
+                        <td class="num">&mdash;</td>
+                        <td class="num">&mdash;</td>
+                        <td class="badges">
+                            {%- if row.status == "calculating" -%}
+                                <span class="badge badge-calculating">calculating&hellip;</span>
+                            {%- else -%}
+                                <span class="badge badge-stopped">stopped</span>
+                            {%- endif -%}
+                            {%- if row.played %}<span class="badge badge-played">played</span>{% endif -%}
+                        </td>
+                        {% else %}
                         <td class="num">{{ "%.0f"|format(row.p1_win_pct) }}%</td>
                         <td class="num">{{ "%.0f"|format(row.p2_win_pct) }}%</td>
                         <td class="num">{{ "%.0f"|format(row.draw_pct) }}%</td>
@@ -169,6 +193,7 @@
                             {%- if row.best %}<span class="badge badge-best">best</span>{% endif -%}
                             {%- if row.played %}<span class="badge badge-played">played</span>{% endif -%}
                         </td>
+                        {% endif %}
                     </tr>
                     {% endfor %}
                 </tbody>

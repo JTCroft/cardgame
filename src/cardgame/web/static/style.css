@@ -260,7 +260,11 @@
     .badge-best { background: #2e5c34; color: #b8f0c0; }
     .badge-played { background: #2e4a6b; color: #bcd9ff; }
     .badge-out { background: #4a4a4a; color: #aaa; }
+    .badge-calculating { background: #4a4326; color: #f0dfa8; }
+    .badge-stopped { background: #4a2e2e; color: #f0b8b8; }
     .analysis-out td { opacity: 0.55; }
+    .analysis-unsolved td { color: #888; }
+    .analysis-unsolved .num { color: #666; }
     .outcome-heatmap {
         margin: 10px 0 14px;
     }
