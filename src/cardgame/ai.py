@@ -44,8 +44,15 @@ from functools import lru_cache
 
 from .cards import Card, Rank
 from .scoring import score_dp
-from .solver import solve
+from .solver import solve, _root_state
 from .solver_native import solve_native, NATIVE_AVAILABLE
+
+try:
+    from cardgame_native import heuristic_root as _heuristic_root
+except ImportError:
+    _heuristic_root = None
+
+HEURISTIC_NATIVE = _heuristic_root is not None
 
 __all__ = ("choose_move", "AlphaBetaBot", "SearchParams")
 
@@ -307,6 +314,17 @@ class SearchParams:
     deepen_fraction: float = 1.0
     # Defer to the exact solver inside the calibrated endgame region.
     exact_endgame: bool = True
+    # Run the opening/midgame iterative-deepening search in the Rust core
+    # (cardgame_native.heuristic_root) instead of pure Python. Same search
+    # and evaluation, bit-identical at equal depth (per-move values verified
+    # to ~1e-15); the win is speed - the native search reaches the same play
+    # far faster (often finishing well inside the budget) and is
+    # arena-neutral vs the Python path (+0.40 ± 0.50 pts/pair, p=0.43, 60
+    # pairs @6s), so it is the default. Falls back to Python automatically
+    # when the native core is unavailable (HEURISTIC_NATIVE) or when
+    # exact_leaf_cards is set (the native port implements exact_leaf_cards=0
+    # only). Set native=False to force the pure-Python reference search.
+    native: bool = True
 
 
 class AlphaBetaBot:
@@ -626,7 +644,37 @@ class AlphaBetaBot:
             self._tt[key] = (depth, flag, best, best_marker)
         return best
 
+    def _use_native(self):
+        return (
+            self.params.native
+            and HEURISTIC_NATIVE
+            and self.params.exact_leaf_cards == 0
+        )
+
+    def _native_params(self):
+        p = self.params
+        return [
+            p.value_bound, p.win_bonus, p.potential_weight, p.potential_slope,
+            p.centrality_weight, p.centrality_base, p.king_centrality,
+            p.mobility_weight, p.mobility_slope, p.tempo_bonus, p.tempo_slope,
+            p.phase_pivot,
+        ]
+
+    def _search_root_native(self, game):
+        cells, cell, rows, cols, mi, mk, oi, ok, _ = _root_state(game)
+        codes = [int(c[0]) * 4 + int(c[1]) for c in game.board.facedown_cards]
+        marker, completed, elapsed = _heuristic_root(
+            [-1 if c is None else c for c in cells], cell, rows, cols,
+            mi, mk, oi, ok, codes, self._native_params(),
+            self.params.resolution_cap, self.params.deepen_fraction,
+            self.time_budget,
+        )
+        self.last_search = {"completed_depth": completed, "elapsed": elapsed, "native": True}
+        return marker
+
     def _search_root(self, game):
+        if self._use_native():
+            return self._search_root_native(game)
         params = self.params
         bound = params.value_bound
         self._exact_cache = {}

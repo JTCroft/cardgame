@@ -715,10 +715,587 @@ fn solve_root(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Heuristic midgame search (port of ai.AlphaBetaBot._search_root and friends)
+//
+// Same iterative-deepening expectiminimax as the Python bot: negamax
+// alpha-beta at decision nodes, Star1 over *sampled* face-down resolutions
+// at chance nodes, a fitted heuristic leaf, fitted move ordering and a
+// transposition table. Node values are f64 in the bot's value scale
+// (score diff + win-bonus expectation), reproducing the Python arithmetic
+// operation-for-operation so the same evaluation is searched deeper.
+// ---------------------------------------------------------------------------
+
+// Move-ordering weights (ai._ORDER_*), fitted constants - speed only.
+const ORDER_ME: f64 = 0.5883;
+const ORDER_OPP: f64 = 0.1114;
+const ORDER_CENT: f64 = 2.8549;
+const ORDER_KING: f64 = 0.2874;
+const ORDER_FD: f64 = -0.1927;
+const ORDER_REPLIES: f64 = -0.4922;
+const KING_CENTRALITY: f64 = 1.0;
+
+/// ai._CENTRALITY: runs of length 3..8 covering each rank, scaled 0..1.
+fn centrality_table() -> &'static [f64; 8] {
+    static T: OnceLock<[f64; 8]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut counts = [0i32; 8];
+        for rank in 1..=8i32 {
+            let mut c = 0;
+            for length in 3..=8i32 {
+                for start in 1..(10 - length) {
+                    if start <= rank && rank <= start + length - 1 {
+                        c += 1;
+                    }
+                }
+            }
+            counts[(rank - 1) as usize] = c;
+        }
+        let lo = *counts.iter().min().unwrap();
+        let hi = *counts.iter().max().unwrap();
+        let mut out = [0.0; 8];
+        for i in 0..8 {
+            out[i] = (counts[i] - lo) as f64 / (hi - lo) as f64;
+        }
+        out
+    })
+}
+
+/// ai._REPLY_MASK: for each cell, its row+column cells (self excluded),
+/// bit t = cell r*6+c - the same indexing as the taken-cell `rows` mask.
+fn reply_masks() -> &'static [u64; 36] {
+    static T: OnceLock<[u64; 36]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut out = [0u64; 36];
+        for i in 0..6usize {
+            for j in 0..6usize {
+                let cell = i * 6 + j;
+                let mut m = 0u64;
+                for j2 in 0..6 {
+                    m |= 1 << (i * 6 + j2);
+                }
+                for i2 in 0..6 {
+                    m |= 1 << (i2 * 6 + j);
+                }
+                out[cell] = m & !(1u64 << cell);
+            }
+        }
+        out
+    })
+}
+
+/// A hidden-card code (rank*4 + suit, K=rank 9) -> (is_king, hand bit).
+#[inline]
+fn code_bit(code: i64) -> (bool, u32) {
+    let rank = code / 4;
+    let suit = (code % 4) as u32;
+    if rank == 9 {
+        (true, 0)
+    } else {
+        (false, 1u32 << (suit * 8 + (rank as u32 - 1)))
+    }
+}
+
+/// ai._marginal: score gained by adding this card to (hi, hk). No guards -
+/// an already-held bit ORs to a no-op (marginal 0), matching Python.
+#[inline]
+fn h_marginal(hi: u32, hk: u8, king: bool, bit: u32) -> f64 {
+    if king {
+        (score(hi, hk + 1) - score(hi, hk)) as f64
+    } else {
+        (score(hi | bit, hk) - score(hi, hk)) as f64
+    }
+}
+
+/// Python round(): round-half-to-even. Inputs here are exact k*(nu-1)/(cap-1).
+#[inline]
+fn py_round(x: f64) -> usize {
+    let f = x.floor();
+    let diff = x - f;
+    let fi = f as i64;
+    let r = if diff < 0.5 {
+        fi
+    } else if diff > 0.5 {
+        fi + 1
+    } else if fi % 2 == 0 {
+        fi
+    } else {
+        fi + 1
+    };
+    r as usize
+}
+
+/// ai._sample_resolutions indices into the sorted hidden multiset.
+fn sample_indices(nu: usize, cap: usize) -> Vec<usize> {
+    if nu <= cap {
+        (0..nu).collect()
+    } else {
+        let last = (nu - 1) as f64;
+        (0..cap)
+            .map(|k| py_round(k as f64 * last / (cap - 1) as f64))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HParams {
+    value_bound: f64,
+    win_bonus: f64,
+    potential_weight: f64,
+    potential_slope: f64,
+    centrality_weight: f64,
+    centrality_base: f64,
+    king_centrality: f64,
+    mobility_weight: f64,
+    mobility_slope: f64,
+    tempo_bonus: f64,
+    tempo_slope: f64,
+    phase_pivot: f64,
+    resolution_cap: usize,
+    deepen_fraction: f64,
+}
+
+// (rows, marker cell, mover int/kings, other int/kings) -> the subgame.
+type TTKey = (u64, u8, u32, u8, u32, u8);
+// (depth, flag: 0 exact / 1 lower / -1 upper, value, best target or 36=none)
+type TTEntry = (i64, i8, f64, usize);
+
+struct HCtx {
+    cells: [i64; 36],
+    unknowns: [i64; 12], // sorted hidden-card codes; chance shifts+restores
+    p: HParams,
+    deadline: Option<Instant>,
+    nodes: u64,
+    aborted: bool,
+    tt: HashMap<TTKey, TTEntry>,
+}
+
+impl HCtx {
+    #[inline]
+    fn tick(&mut self) {
+        self.nodes += 1;
+        if self.nodes & 0x3ff == 0 {
+            if let Some(dl) = self.deadline {
+                if Instant::now() >= dl {
+                    self.aborted = true;
+                }
+            }
+        }
+    }
+
+    /// ai._terminal_value.
+    #[inline]
+    fn terminal(&self, mi: u32, mk: u8, oi: u32, ok: u8) -> f64 {
+        let diff = (score(mi, mk) - score(oi, ok)) as f64;
+        let b = self.p.value_bound;
+        if diff > 0.0 {
+            (diff + self.p.win_bonus).min(b)
+        } else if diff < 0.0 {
+            (diff - self.p.win_bonus).max(-b)
+        } else {
+            0.0
+        }
+    }
+
+    /// Sum of a hand's marginals over every card still on the board:
+    /// untaken face-up cells + the unresolved hidden multiset. Integer, so
+    /// order-independent (matches ai._evaluate_leaf's potential exactly).
+    fn potential(&self, hi: u32, hk: u8, rows: u64, nu: usize) -> i64 {
+        let base = score(hi, hk);
+        let mut total = 0i64;
+        for t in 0..36 {
+            if (rows >> t) & 1 == 1 {
+                continue;
+            }
+            let payload = self.cells[t];
+            if payload < 0 {
+                continue; // face-down: counted via unknowns
+            } else if payload == 0 {
+                if hk < 4 {
+                    total += score(hi, hk + 1) - base;
+                }
+            } else {
+                let bit = payload as u32;
+                if hi & bit == 0 {
+                    total += score(hi | bit, hk) - base;
+                }
+            }
+        }
+        for i in 0..nu {
+            let (king, bit) = code_bit(self.unknowns[i]);
+            if king {
+                if hk < 4 {
+                    total += score(hi, hk + 1) - base;
+                }
+            } else if hi & bit == 0 {
+                total += score(hi | bit, hk) - base;
+            }
+        }
+        total
+    }
+
+    /// ai._centrality_sum.
+    #[inline]
+    fn centrality(&self, hi: u32, hk: u8) -> f64 {
+        let mut total = hk as f64 * self.p.king_centrality;
+        let cent = centrality_table();
+        for rank in 0..8u32 {
+            total += cent[rank as usize] * ((hi >> rank) & 0x0101_0101).count_ones() as f64;
+        }
+        total
+    }
+
+    /// ai._evaluate_leaf, operation-for-operation.
+    fn eval_leaf(&self, mi: u32, mk: u8, oi: u32, ok: u8, rows: u64, nu: usize, n_legal: usize) -> f64 {
+        let p = &self.p;
+        let my_base = score(mi, mk);
+        let opp_base = score(oi, ok);
+        let my_pot = self.potential(mi, mk, rows, nu);
+        let opp_pot = self.potential(oi, ok, rows, nu);
+        let cards_left = 36.0 - rows.count_ones() as f64;
+        let phase = if cards_left > p.phase_pivot {
+            cards_left - p.phase_pivot
+        } else {
+            0.0
+        };
+        let mut value = (my_base - opp_base) as f64 + p.tempo_bonus;
+        value += p.tempo_slope * phase;
+        value += (p.potential_weight + p.potential_slope * phase) * (my_pot - opp_pot) as f64;
+        let decay = cards_left / 36.0;
+        if decay > 0.0 {
+            value += (p.centrality_base + p.centrality_weight * decay)
+                * (self.centrality(mi, mk) - self.centrality(oi, ok));
+        }
+        value += (p.mobility_weight + p.mobility_slope * phase) * n_legal as f64;
+        value.min(p.value_bound).max(-p.value_bound)
+    }
+
+    /// ai._ordered_markers: (target, is_facedown) best-first for the mover.
+    fn ordered(
+        &self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8, nu: usize,
+    ) -> Vec<(usize, bool)> {
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        let cent = centrality_table();
+        let masks = reply_masks();
+        let mut facedown_key: Option<f64> = None;
+        let mut items: Vec<(f64, usize, bool)> = Vec::with_capacity(n);
+        for &target in &buf[..n] {
+            let replies = (masks[target] & !rows).count_ones() as f64;
+            let payload = self.cells[target];
+            let (key, fd) = if payload < 0 {
+                let fk = *facedown_key.get_or_insert_with(|| {
+                    let mut total = 0.0;
+                    for i in 0..nu {
+                        let (king, bit) = code_bit(self.unknowns[i]);
+                        total += ORDER_ME * h_marginal(mi, mk, king, bit)
+                            + ORDER_OPP * h_marginal(oi, ok, king, bit);
+                        if king {
+                            total += ORDER_CENT * KING_CENTRALITY + ORDER_KING;
+                        } else {
+                            total += ORDER_CENT * cent[(bit.trailing_zeros() % 8) as usize];
+                        }
+                    }
+                    total / nu as f64 + ORDER_FD
+                });
+                (fk, true)
+            } else {
+                let (king, bit) = if payload == 0 { (true, 0u32) } else { (false, payload as u32) };
+                let mut key = ORDER_ME * h_marginal(mi, mk, king, bit)
+                    + ORDER_OPP * h_marginal(oi, ok, king, bit);
+                if king {
+                    key += ORDER_CENT * KING_CENTRALITY + ORDER_KING;
+                } else {
+                    key += ORDER_CENT * cent[(bit.trailing_zeros() % 8) as usize];
+                }
+                (key, false)
+            };
+            items.push((key + ORDER_REPLIES * replies, target, fd));
+        }
+        // Python sort key (-score, marker): score desc, then target asc.
+        items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        items.into_iter().map(|(_, t, fd)| (t, fd)).collect()
+    }
+
+    /// The single decision node's child value for a chosen (target, fd),
+    /// negamax perspective (already negated for the caller). `nu` is the
+    /// hidden count at this node.
+    #[allow(clippy::too_many_arguments)]
+    fn child_value(
+        &mut self, target: usize, fd: bool, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+        ok: u8, nu: usize, depth: i64, alpha: f64, beta: f64,
+    ) -> f64 {
+        let nrows = rows | (1 << target);
+        let ncols = cols | col_bit(target);
+        if fd {
+            if nu == 1 {
+                let (king, bit) = code_bit(self.unknowns[0]);
+                let (nmi, nmk) = if king { (mi, mk + 1) } else { (mi | bit, mk) };
+                -self.search(target, nrows, ncols, oi, ok, nmi, nmk, 0, depth - 1, -beta, -alpha)
+            } else {
+                self.chance(target, nrows, ncols, mi, mk, oi, ok, nu, depth, alpha, beta)
+            }
+        } else {
+            let payload = self.cells[target];
+            let (nmi, nmk) = if payload == 0 { (mi, mk + 1) } else { (mi | payload as u32, mk) };
+            -self.search(target, nrows, ncols, oi, ok, nmi, nmk, nu, depth - 1, -beta, -alpha)
+        }
+    }
+
+    /// ai._search: fail-soft negamax with a transposition table.
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8, nu: usize,
+        depth: i64, mut alpha: f64, beta: f64,
+    ) -> f64 {
+        self.tick();
+        if self.aborted {
+            return 0.0;
+        }
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            return self.terminal(mi, mk, oi, ok);
+        }
+        let key: TTKey = (rows, cell as u8, mi, mk, oi, ok);
+        let mut tt_move: Option<usize> = None;
+        if let Some(&(td, flag, val, bm)) = self.tt.get(&key) {
+            if bm < 36 {
+                tt_move = Some(bm);
+            }
+            if td >= depth
+                && (flag == 0 || (flag == 1 && val >= beta) || (flag == -1 && val <= alpha))
+            {
+                return val;
+            }
+        }
+        if depth == 0 {
+            return self.eval_leaf(mi, mk, oi, ok, rows, nu, n);
+        }
+        let mut markers = self.ordered(cell, rows, cols, mi, mk, oi, ok, nu);
+        if let Some(tm) = tt_move {
+            if markers[0].0 != tm {
+                if let Some(pos) = markers.iter().position(|&(t, _)| t == tm) {
+                    let it = markers.remove(pos);
+                    markers.insert(0, it);
+                }
+            }
+        }
+        let alpha0 = alpha;
+        let mut best = -self.p.value_bound;
+        let mut best_marker = 36usize;
+        for (target, fd) in markers {
+            let value =
+                self.child_value(target, fd, rows, cols, mi, mk, oi, ok, nu, depth, alpha, beta);
+            if self.aborted {
+                return 0.0;
+            }
+            if value > best {
+                best = value;
+                best_marker = target;
+                if value > alpha {
+                    alpha = value;
+                }
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+        let store = match self.tt.get(&key) {
+            None => true,
+            Some(&(td, _, _, _)) => td <= depth,
+        };
+        if store {
+            let flag = if best <= alpha0 {
+                -1
+            } else if best >= beta {
+                1
+            } else {
+                0
+            };
+            self.tt.insert(key, (depth, flag, best, best_marker));
+        }
+        best
+    }
+
+    /// ai._chance_value: Star1 expectation over sampled face-down
+    /// resolutions, each searched in the window that could still move the
+    /// running mean into (alpha, beta).
+    #[allow(clippy::too_many_arguments)]
+    fn chance(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        nu: usize, depth: i64, alpha: f64, beta: f64,
+    ) -> f64 {
+        let bound = self.p.value_bound;
+        let indices = sample_indices(nu, self.p.resolution_cap);
+        let n = indices.len();
+        let nf = n as f64;
+        let mut total = 0.0f64;
+        for (k, &idx) in indices.iter().enumerate() {
+            let spread = (n - k - 1) as f64 * bound;
+            let lo = (nf * alpha - total - spread).max(-bound);
+            let hi = (nf * beta - total + spread).min(bound);
+            let code = self.unknowns[idx];
+            let (king, bit) = code_bit(code);
+            let (nmi, nmk) = if king { (mi, mk + 1) } else { (mi | bit, mk) };
+            for j in idx..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            let child =
+                self.search(target, nrows, ncols, oi, ok, nmi, nmk, nu - 1, depth - 1, -hi, -lo);
+            for j in (idx..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[idx] = code;
+            if self.aborted {
+                return 0.0;
+            }
+            total -= child;
+            let upper = (total + spread) / nf;
+            if upper <= alpha {
+                return upper;
+            }
+            let lower = (total - spread) / nf;
+            if lower >= beta {
+                return lower;
+            }
+        }
+        total / nf
+    }
+}
+
+fn new_hctx(cells: Vec<i64>, unknowns: Vec<i64>, params: &[f64], budget: Option<f64>) -> PyResult<(HCtx, usize)> {
+    if cells.len() != 36 || unknowns.len() > 12 || params.len() != 12 {
+        return Err(pyo3::exceptions::PyValueError::new_err("bad state shape"));
+    }
+    let mut u = [0i64; 12];
+    let nu = unknowns.len();
+    u[..nu].copy_from_slice(&unknowns);
+    u[..nu].sort_unstable(); // sort hidden codes = sort by (rank, suit)
+    let p = HParams {
+        value_bound: params[0],
+        win_bonus: params[1],
+        potential_weight: params[2],
+        potential_slope: params[3],
+        centrality_weight: params[4],
+        centrality_base: params[5],
+        king_centrality: params[6],
+        mobility_weight: params[7],
+        mobility_slope: params[8],
+        tempo_bonus: params[9],
+        tempo_slope: params[10],
+        phase_pivot: params[11],
+        resolution_cap: 0, // filled by caller
+        deepen_fraction: 1.0,
+    };
+    Ok((
+        HCtx {
+            cells: cells.try_into().unwrap(),
+            unknowns: u,
+            p,
+            deadline: budget.map(|s| Instant::now() + Duration::from_secs_f64(s)),
+            nodes: 0,
+            aborted: false,
+            tt: HashMap::new(),
+        },
+        nu,
+    ))
+}
+
+/// Iterative-deepening heuristic search from the root (ai._search_root).
+/// `mi,mk / oi,ok` are the mover / opponent hands. Returns
+/// (best_marker, completed_depth, elapsed_secs).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn heuristic_root(
+    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+    ok: u8, unknowns: Vec<i64>, params: Vec<f64>, resolution_cap: usize, deepen_fraction: f64,
+    time_budget: f64,
+) -> PyResult<((usize, usize), i64, f64)> {
+    let (mut ctx, nu) = new_hctx(cells, unknowns, &params, Some(time_budget))?;
+    ctx.p.resolution_cap = resolution_cap;
+    ctx.p.deepen_fraction = deepen_fraction;
+    py.detach(move || {
+        let start = Instant::now();
+        let bound = ctx.p.value_bound;
+        let mut move_list = ctx.ordered(cell, rows, cols, mi, mk, oi, ok, nu);
+        let mut best_marker = move_list[0].0;
+        let max_depth = 36 - rows.count_ones() as i64;
+        let mut completed = 0i64;
+        let mut depth = 1i64;
+        while depth <= max_depth {
+            let mut alpha = -bound;
+            let mut iteration_best: Option<usize> = None;
+            let mut scores: HashMap<usize, f64> = HashMap::with_capacity(move_list.len());
+            for &(target, fd) in &move_list {
+                let value =
+                    ctx.child_value(target, fd, rows, cols, mi, mk, oi, ok, nu, depth, alpha, bound);
+                if ctx.aborted {
+                    break;
+                }
+                scores.insert(target, value);
+                if value > alpha {
+                    alpha = value;
+                    iteration_best = Some(target);
+                }
+            }
+            if ctx.aborted {
+                if let Some(ib) = iteration_best {
+                    best_marker = ib;
+                }
+                break;
+            }
+            if let Some(ib) = iteration_best {
+                best_marker = ib;
+            }
+            completed = depth;
+            move_list.sort_by(|a, b| {
+                let sa = scores.get(&a.0).copied().unwrap_or(f64::NEG_INFINITY);
+                let sb = scores.get(&b.0).copied().unwrap_or(f64::NEG_INFINITY);
+                sb.partial_cmp(&sa).unwrap().then(a.0.cmp(&b.0))
+            });
+            depth += 1;
+            if start.elapsed().as_secs_f64() > ctx.p.deepen_fraction * time_budget {
+                break;
+            }
+        }
+        Ok((
+            (best_marker / 6, best_marker % 6),
+            completed,
+            start.elapsed().as_secs_f64(),
+        ))
+    })
+}
+
+/// Validation probe: every root move's exact full-window value at a fixed
+/// depth (no deepening, no time limit). Used to check the port against the
+/// Python search. Returns (marker, value) per legal move.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn heuristic_probe(
+    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+    ok: u8, unknowns: Vec<i64>, params: Vec<f64>, resolution_cap: usize, depth: i64,
+) -> PyResult<Vec<((usize, usize), f64)>> {
+    let (mut ctx, nu) = new_hctx(cells, unknowns, &params, None)?;
+    ctx.p.resolution_cap = resolution_cap;
+    py.detach(move || {
+        let bound = ctx.p.value_bound;
+        let mut out = Vec::new();
+        for (target, fd) in ctx.ordered(cell, rows, cols, mi, mk, oi, ok, nu) {
+            let value =
+                ctx.child_value(target, fd, rows, cols, mi, mk, oi, ok, nu, depth, -bound, bound);
+            out.push(((target / 6, target % 6), value));
+        }
+        Ok(out)
+    })
+}
+
 #[pymodule]
 fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_root, m)?)?;
     m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
     m.add_function(wrap_pyfunction!(distribution, m)?)?;
+    m.add_function(wrap_pyfunction!(heuristic_root, m)?)?;
+    m.add_function(wrap_pyfunction!(heuristic_probe, m)?)?;
     Ok(())
 }
