@@ -25,5 +25,8 @@
     ROOM_KEY = {{ (spectate_player_id or none) | tojson }} || PLAYER_ID;
     REVIEW_ENTRY_ID = {{ (review_entry_id or none) | tojson }};
     LIVE_EVAL = {{ (live_eval or false) | tojson }};
+    // "Play from here" (see the play_from route): a saved position to seed a
+    // fresh solo game from, sent up once with the first join, then dropped.
+    LOAD_STATE = {{ (load_state or none) | tojson }};
 </script>
 {% endblock %}

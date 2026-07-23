@@ -122,6 +122,10 @@
     // the server for live-eval mode on join. null (every other page) means
     // "send no flag at all", leaving the room's mode untouched.
     let LIVE_EVAL = null;
+    // A "Play from here" saved position (play.html.jinja2, /play-from route).
+    // Sent up with the *first* join to seed a fresh solo game, then cleared
+    // so a later reconnect's re-join doesn't reset the game back to it.
+    let LOAD_STATE = null;
 
     // The routing fields alone, with no identity attached yet - passed to
     // requireNameThen() for "join" so a retry (after a name prompt) can
@@ -131,6 +135,7 @@
         const fields = { code: ROOM_KEY };
         if (REVIEW_ENTRY_ID) fields.review_entry_id = REVIEW_ENTRY_ID;
         if (LIVE_EVAL !== null) fields.live_eval = LIVE_EVAL;
+        if (LOAD_STATE) fields.load_state = LOAD_STATE;
         return fields;
     }
     function withTarget(data) {
@@ -144,6 +149,13 @@
         // through requireNameThen() here: the server simply won't ask for
         // one in the cases that don't need it.
         if (ROOM_KEY || REVIEW_ENTRY_ID) requireNameThen("join", targetFields());
+        // The seed only applies to the first join; drop it (and scrub it from
+        // the address bar) so a reconnect - or a refresh - resumes the game
+        // in progress instead of resetting it back to the loaded position.
+        if (LOAD_STATE) {
+            LOAD_STATE = null;
+            history.replaceState({}, "", "/play");
+        }
     });
 
     function sendMove(row, col) {

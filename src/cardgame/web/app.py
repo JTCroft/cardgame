@@ -75,6 +75,8 @@ from .extensions import app_holder, socketio
 from .identity import _MAX_NAME_LENGTH, _normalize_player_id
 from .rooms import (
     _broadcast_state,
+    create_solo_room_from_state,
+    decode_game_state,
     _ensure_analysis_worker,
     _ensure_live_eval,
     _finished_rooms_lock,
@@ -180,6 +182,20 @@ def create_app():
         )
         return render_template("play.html.jinja2", live_eval=show_live_eval)
 
+    @app.get("/play-from/<state>")
+    def play_from(state):
+        # "Play from here": open a fresh solo game seeded at a position saved
+        # into the URL (see rooms.encode_game_state, and the button in
+        # _game_state.html.jinja2). Validated eagerly so a mangled link 404s
+        # here rather than silently doing nothing; the page's own JS then
+        # carries `state` up with its "join" (see the handler below), which is
+        # where the room is actually created - the same deferred-identity flow
+        # /play uses, since the player id is only known client-side.
+        game = decode_game_state(state)
+        if game is None or not game.legal_moves:
+            abort(404, description="That saved position could not be loaded.")
+        return render_template("play.html.jinja2", load_state=state)
+
     @app.get("/play/<player_id>")
     def spectate_solo(player_id):
         target_id = _normalize_player_id(player_id)
@@ -251,10 +267,28 @@ def handle_join(data):
         return
 
     name = (data.get("name") or "").strip()[:_MAX_NAME_LENGTH]
-    code, room, error = _resolve_or_create_room_for_join(data.get("code", ""), player_id)
-    if room is None:
-        socketio.emit("error_message", {"message": error}, to=request.sid)
-        return
+    # load_state names a "Play from here" position (see the play_from route
+    # and rooms.encode_game_state): seed the player's own solo room at it,
+    # replacing any game in progress, rather than resolving an existing room.
+    # The seat on the move is assigned to this player below, so the auto-seat
+    # step is a no-op and it's their turn from the off (see
+    # create_solo_room_from_state).
+    load_state = (data.get("load_state") or "").strip()
+    if load_state:
+        game = decode_game_state(load_state)
+        if game is None or not game.legal_moves:
+            socketio.emit(
+                "error_message",
+                {"message": "That saved position could not be loaded."},
+                to=request.sid,
+            )
+            return
+        code, room = create_solo_room_from_state(player_id, game)
+    else:
+        code, room, error = _resolve_or_create_room_for_join(data.get("code", ""), player_id)
+        if room is None:
+            socketio.emit("error_message", {"message": error}, to=request.sid)
+            return
 
     sid = request.sid
     with room.lock:
@@ -706,6 +740,11 @@ def handle_request_rematch(data):
 
     _broadcast_state(code, room)
     _broadcast_lobby()
+    # If the rematch dealt a fresh solo game with the computer in seat 1, it's
+    # already the computer's turn but no move has been played to trigger the
+    # usual post-move check - kick it here, exactly as swap_seats does (a
+    # no-op for a human's turn or a multiplayer room).
+    _maybe_play_computer_move(code, room)
 
 
 @socketio.on("respond_rematch")

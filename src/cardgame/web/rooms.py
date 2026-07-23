@@ -19,6 +19,7 @@ call into, kept separate so app.py can stay focused on request/event
 wiring.
 """
 
+import base64
 import os
 import random
 import re
@@ -342,7 +343,7 @@ _ANALYSIS_TIME_CAP = 120.0
 # slot's role.
 _ANALYSIS_CALL_SAFETY_CAP = 30 * 60
 
-# Shared, app-wide pool that runs analyse_moves calls. Threads, not
+# Shared, app-wide pools that run analyse_moves calls. Threads, not
 # processes: the native solver (cardgame_native) releases the GIL for the
 # whole walk, so concurrent calls genuinely use multiple cores, and running
 # in-process lets a call stream its per-move results straight into the room
@@ -350,18 +351,53 @@ _ANALYSIS_CALL_SAFETY_CAP = 30 * 60
 # Future (all-or-nothing) can't do. Without the native core the walk is
 # pure-Python and holds the GIL, so those calls serialise; that path is the
 # untuned fallback and streams nothing (analyse_moves_by_deadline returns the
-# whole dict at once). Lazily created; bounded by CPU count regardless of how
-# many rooms are active, since the pool queues submissions beyond max_workers.
-_analysis_pool = None
+# whole dict at once).
+#
+# The forward and backward slots (see _analysis_worker_loop) get *separate*
+# pools rather than sharing one. A single shared pool only reserves the two
+# roles per-worker, not at the point of execution: forward submissions still
+# queue behind whatever backward calls are already occupying the pool's
+# threads - across *all* rooms - and a backward call can run for the whole
+# grace period. On a small box (os.cpu_count() is 1-2) or after many games
+# have piled leftover backward calls into the pool, the cheap, feasible deep
+# positions a finishing game hands to the forward slot then never get a thread
+# before their grace expires, and are left stuck showing "still being computed"
+# forever. Dedicating a pool to each role keeps forward work from ever queuing
+# behind expensive backward work, so the reserved-role guarantee holds in
+# execution too. Floored at two workers each so both roles get a real slot even
+# on a single-CPU host (native calls release the GIL, so oversubscribing one
+# core just time-slices - a cheap forward call still finishes promptly rather
+# than waiting out a backward call ahead of it in a queue).
+# A third pool serves explicit "Calculate" requests (start_ondemand_analysis),
+# kept separate again so a user-clicked calculation is neither blocked by the
+# automatic slots nor able to starve them in turn.
+_analysis_forward_pool = None
+_analysis_backward_pool = None
+_analysis_ondemand_pool = None
 _analysis_pool_lock = threading.Lock()
 
 
-def _get_analysis_pool():
-    global _analysis_pool
+def _init_analysis_pools_locked():
+    global _analysis_forward_pool, _analysis_backward_pool, _analysis_ondemand_pool
+    if _analysis_forward_pool is None:
+        workers = max(2, os.cpu_count() or 2)
+        _analysis_forward_pool = ThreadPoolExecutor(max_workers=workers)
+        _analysis_backward_pool = ThreadPoolExecutor(max_workers=workers)
+        _analysis_ondemand_pool = ThreadPoolExecutor(max_workers=workers)
+
+
+def _get_analysis_pools():
+    """Return (forward_pool, backward_pool), creating them on first use."""
     with _analysis_pool_lock:
-        if _analysis_pool is None:
-            _analysis_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 2)
-        return _analysis_pool
+        _init_analysis_pools_locked()
+        return _analysis_forward_pool, _analysis_backward_pool
+
+
+def _get_ondemand_pool():
+    """Pool for explicit "Calculate" requests - see start_ondemand_analysis."""
+    with _analysis_pool_lock:
+        _init_analysis_pools_locked()
+        return _analysis_ondemand_pool
 
 
 def _stream_analysis(cache, lock, position, index, deadline, broadcast):
@@ -472,7 +508,7 @@ def start_ondemand_analysis(cache, inflight, calc_started, lock, game, index, on
 
     def worker():
         position = game.undo(total - index)
-        pool = _get_analysis_pool()
+        pool = _get_ondemand_pool()
         call_deadline = time.monotonic() + _ONDEMAND_ANALYSIS_DEADLINE
         broadcast = (lambda: _in_app_context(on_done)) if on_done is not None else (lambda: None)
         # _stream_analysis folds results (and streamed partials) into cache
@@ -611,9 +647,11 @@ def _analysis_worker_loop(code, room):
     thrown away.
 
     Runs exactly two concurrent analyse_moves calls, each on its own pool
-    thread (see _get_analysis_pool; the native walk releases the GIL, so the
-    two genuinely run in parallel and stream their per-move results straight
-    into the shared cache), with a fixed, reserved role that never borrows
+    thread (see _get_analysis_pools - the two slots get separate pools so the
+    forward slot can never queue behind expensive backward work; the native
+    walk releases the GIL, so the two genuinely run in parallel and stream
+    their per-move results straight into the shared cache), with a fixed,
+    reserved role that never borrows
     the other's slot:
 
     - The backward slot always extends one position further back into
@@ -655,7 +693,7 @@ def _analysis_worker_loop(code, room):
     Exits when the room empties (game still in progress), the post-game
     grace period elapses, or there's nothing left to analyse.
     """
-    pool = _get_analysis_pool()
+    forward_pool, backward_pool = _get_analysis_pools()
     futures = {}  # move_index -> Future, this room's own outstanding submissions
     forward_index = None  # key in `futures` currently owned by the forward slot
     backward_index = None  # key in `futures` currently owned by the backward slot
@@ -765,7 +803,7 @@ def _analysis_worker_loop(code, room):
                     index = _newest_attemptable_index(game, total, done, upper)
                 if index is not None:
                     futures[index] = _submit(
-                        pool, code, room, cache, inflight, game, index, ended, deadline
+                        backward_pool, code, room, cache, inflight, game, index, ended, deadline
                     )
                     backward_index = index
 
@@ -782,7 +820,7 @@ def _analysis_worker_loop(code, room):
                 index = _newest_attemptable_index(game, total, done, upper)
                 if index is not None:
                     futures[index] = _submit(
-                        pool, code, room, cache, inflight, game, index, ended, deadline
+                        forward_pool, code, room, cache, inflight, game, index, ended, deadline
                     )
                     forward_index = index
 
@@ -942,6 +980,43 @@ def _resolve_or_create_room_for_join(raw_code, player_id):
     return target_id, room, None
 
 
+def encode_game_state(game):
+    """URL-safe token carrying a full game position - the payload of a
+    "Play from here" link (see decode_game_state and app.py's play_from
+    route). Wraps Game.save's alnum form in urlsafe base64 so the '/' and
+    '?' separators it uses survive being dropped into a URL path."""
+    raw = game.save(alnum=True).encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_game_state(token):
+    """Inverse of encode_game_state; returns a Game, or None if `token`
+    isn't a valid saved position (so callers can 404 on a mangled link)."""
+    try:
+        pad = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(token + pad).decode("ascii")
+        return Game.load(raw)
+    except Exception:
+        return None
+
+
+def create_solo_room_from_state(player_id, game):
+    """Create the player's solo room (replacing any existing one) seeded at
+    `game`, seating them in whichever side is on the move and the computer
+    in the other. A "Play from here" link therefore always opens with its
+    user as the player to move against the computer, whichever seat they
+    held in the game it came from and whether that was solo or multiplayer.
+    Returns (code, room), the code being the player's own id (the solo-room
+    key - see this module's docstring)."""
+    mover_seat = 1 if len(game.moves) % 2 == 0 else 2
+    room = RoomState(game=game)
+    room.computer_seat = 3 - mover_seat
+    room.seats = {mover_seat: player_id}
+    with _rooms_lock:
+        _rooms[player_id] = room
+    return player_id, room
+
+
 # Sequential ramp for the outcome heatmap's cells: dark (0% of outcomes,
 # matching .move-analysis's own background so an empty cell reads as
 # "nothing here") up to this site's existing accent blue (100%). A single
@@ -1034,7 +1109,14 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
             if calc_started is not None and history_index in calc_started:
                 started_ago = time.monotonic() - calc_started[history_index]
             return {"pending": True, "mover_name": mover_name, "started_ago": started_ago}
-        if _analysis_feasible(display_game):
+        # A feasible position the worker hasn't reached yet is "coming soon" -
+        # but only while the grace period is still running. Once it's over the
+        # worker has stopped for good, so a position it never got to (e.g. the
+        # forward slot was starved of a pool thread - see _get_analysis_pools)
+        # would otherwise be stuck showing "still being computed" forever with
+        # no way to trigger it. Fall through to the "Calculate" button instead,
+        # exactly as an infeasible position does.
+        if _analysis_feasible(display_game) and not grace_period_over:
             return {"pending": True, "mover_name": mover_name, "started_ago": None}
         if grace_period_over:
             return {"calculable": True, "mover_name": mover_name, "history_index": history_index}
@@ -1198,6 +1280,15 @@ def _room_context(code, room, player_id):
             grace_period_over=_grace_period_over(room.analysis_deadline),
         )
 
+    # "Play from here" - a link to open a fresh solo game from the position
+    # currently under review (see create_solo_room_from_state). Only offered
+    # for a non-terminal reviewed position; the final one has nothing to play.
+    play_from_state = (
+        encode_game_state(display_game)
+        if game_over and display_game.legal_moves
+        else None
+    )
+
     return {
         "code": code,
         "vs_computer": room.computer_seat is not None,
@@ -1230,6 +1321,7 @@ def _room_context(code, room, player_id):
         "rematch_requested_by_me": rematch_requested_by_me,
         "rematch_requested_by_name": rematch_requested_by_name,
         "move_analysis": move_analysis,
+        "play_from_state": play_from_state,
     }
 
 
@@ -1301,6 +1393,10 @@ def _room_review_context(entry, viewer_id):
             inflight=entry.get("analysis_inflight", frozenset()),
             calc_started=entry.get("analysis_calc_started"),
             grace_period_over=_grace_period_over(entry.get("analysis_deadline")),
+        ),
+        # See _room_context - a link to play on from the reviewed position.
+        "play_from_state": (
+            encode_game_state(display_game) if display_game.legal_moves else None
         ),
     }
 
