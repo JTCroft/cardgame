@@ -44,6 +44,11 @@ from .identity import _normalize_player_id
 
 _CODE_RE = re.compile(r"^[A-Za-z]{4}$")
 _COMPUTER_NAME = "Computer"
+# Floor on how long the computer takes to play, so a move it solves near-
+# instantly (e.g. a forced move or a shallow endgame) still reads as a
+# deliberate turn rather than snapping onto the board. Only ever pads a fast
+# move up to this; a longer think is left alone.
+_COMPUTER_MIN_MOVE_SECONDS = 1.0
 
 # How many finished games (rooms and solo games together) the /rooms
 # "Recently finished games" table keeps around - see
@@ -787,18 +792,28 @@ def _analysis_worker_loop(code, room):
 
             # Backward slot: one position further back into history than
             # anything analysed so far, unconditionally. With nothing
-            # analysed yet at all there's no existing frontier to extend,
-            # so it bootstraps itself from the newest attemptable position
-            # instead (the same search the forward slot uses below) - that
-            # way this slot is the one that ends up owning the earliest
-            # analysed position and everything behind it, rather than the
-            # forward slot claiming it as a side effect of merely running
-            # first.
+            # analysed yet at all there's no existing frontier to extend, so
+            # it bootstraps one:
+            # - Once the game has ended, from the last playable position
+            #   (upper - 1) regardless of whether anything is "attemptable" -
+            #   post-game every call is bounded by the grace deadline, so it
+            #   can safely backtrack without a cost ceiling, exactly as it
+            #   does when a live worker carries a frontier into the endgame.
+            #   This is what lets a game that ended early (the marker trapped
+            #   with only deep, un-attemptable positions left, so live
+            #   analysis never got started) still get filled in afterwards
+            #   rather than the worker finding nothing to do and exiting.
+            # - While still live, from the newest attemptable position (the
+            #   same search the forward slot uses below), so it waits for a
+            #   position to come within the affordable ceiling rather than
+            #   kicking off unbounded work mid-game.
             if backward_index is None:
                 done = cache.keys() | inflight
                 if done:
                     frontier = min(done)
                     index = frontier - 1 if frontier > 0 else None
+                elif ended:
+                    index = upper - 1
                 else:
                     index = _newest_attemptable_index(game, total, done, upper)
                 if index is not None:
@@ -1564,9 +1579,29 @@ def _maybe_play_computer_move(code, room):
                 return
             if room.current_turn_seat != room.computer_seat:
                 return
-            row, col = choose_move(room.game)
-            outcomes = room.game.move(row, col)
-            room.game = random.choice(outcomes)
+            game, game_id = room.game, room.game_id
+        # Think (and enforce the minimum move time) outside the lock, so a
+        # slow think no longer holds the room's lock and the padding sleep
+        # never blocks broadcasts or the analysis worker.
+        start = time.monotonic()
+        row, col = choose_move(game)
+        remaining = _COMPUTER_MIN_MOVE_SECONDS - (time.monotonic() - start)
+        if remaining > 0:
+            time.sleep(remaining)
+        with room.lock:
+            # The game may have moved on while we were thinking (a rematch
+            # dealt a fresh game, a seat was swapped, the move was played by
+            # another caller): only apply if it's still exactly the position
+            # we solved and still the computer's turn.
+            if (
+                room.game is not game
+                or room.game_id != game_id
+                or room.computer_seat is None
+                or room.game_over
+                or room.current_turn_seat != room.computer_seat
+            ):
+                return
+            room.game = random.choice(room.game.move(row, col))
             if room.game_over:
                 _record_room_finished_locked(code, room)
         _broadcast_state(code, room)

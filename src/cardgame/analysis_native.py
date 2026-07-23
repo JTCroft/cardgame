@@ -27,7 +27,30 @@ NATIVE_AVAILABLE = _analyse_move is not None
 # (row, col) marker.
 FINAL = object()
 
-__all__ = ("analyse_moves_native", "iter_move_analyses", "NATIVE_AVAILABLE", "FINAL")
+__all__ = (
+    "analyse_moves_native",
+    "iter_move_analyses",
+    "move_eval_native",
+    "NATIVE_AVAILABLE",
+    "FINAL",
+)
+
+
+def move_eval_native(game, marker, deadline=None):
+    """Exact Eval(m, w, d, s) for a single legal move, current player's
+    perspective - the native per-move aggregate without the full-slate walk
+    iter_move_analyses does. Used to break the exact solver's (2w+d, s) ties
+    by Game.evaluate's full (2w+d, w, s) order (see ai._exact_move)."""
+    if _analyse_move is None:
+        raise ImportError("cardgame-native is not installed")
+    cells, cell, rows, cols, mi, mk, oi, ok, unknowns = _root_state(game)
+    cells_i = [-1 if c is None else c for c in cells]
+    target = marker[0] * 6 + marker[1]
+    agg = _analyse_move(
+        cells_i, target, rows, cols, mi, mk, oi, ok, list(unknowns), _remaining(deadline)
+    )
+    m, w, d, s, _mover_sum = agg
+    return Eval(m, w, d, s)
 
 
 def _remaining(deadline):

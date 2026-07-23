@@ -119,15 +119,7 @@
         text-decoration: none;
     }
     .play-from {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        flex-wrap: wrap;
         margin: 12px 0;
-    }
-    .play-from-note {
-        font-size: 0.85em;
-        color: #aaa;
     }
     button:hover, .button:hover {
         background: #5a5a5a;

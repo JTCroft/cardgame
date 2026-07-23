@@ -42,9 +42,10 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 
+from .analysis import move_eval
 from .cards import Card, Rank
 from .scoring import score_dp
-from .solver import solve, _root_state
+from .solver import solve, _root_state, decode
 from .solver_native import solve_native, NATIVE_AVAILABLE
 
 try:
@@ -205,7 +206,26 @@ def _exact_feasible(game, budget):
 
 
 def _exact_move(game):
-    marker = _EXACT_SOLVE(game)["marker"]
+    result = _EXACT_SOLVE(game)
+    marker = result["marker"]
+    if marker is None:
+        return None
+    # The solver ranks by (2w+d, s) - it drops Game.evaluate's middle "prefer
+    # decisive" term (w) for sound pruning (see solver.py). Restore it only
+    # where it can matter: among the moves tying the winner on the first term
+    # (2w+d, i.e. sign_sum), re-rank by evaluate's full (2w+d, w, s) so a
+    # guaranteed draw never beats an equal-expectation move that can still win.
+    # An untied winner (the common case) skips this - so the solve itself is
+    # unchanged and only a genuine top-tie pays for the exact per-move re-eval.
+    moves = result["moves"]
+    best_sign = max(decode(value)[0] for value, _exact in moves.values())
+    tied = [mk for mk, (value, _exact) in moves.items() if decode(value)[0] == best_sign]
+    if len(tied) > 1:
+        best_key = None
+        for mk in tied:
+            candidate = (move_eval(game, mk), mk)
+            if best_key is None or candidate > best_key:
+                best_key, marker = candidate, mk
     return marker if marker in game.legal_moves else None
 
 
