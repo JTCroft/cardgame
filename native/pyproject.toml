@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cardgame-native"
-version = "0.2.0"
+version = "0.2.1"
 description = "Rust core for cardgame.solver (exposes solve_root; use cardgame.solve_native)"
 requires-python = ">=3.9"
 
