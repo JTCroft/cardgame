@@ -1,0 +1,164 @@
+{% extends "base.html.jinja2" %}
+{% import "components.html.jinja2" as macros %}
+{% block title %}How to play - Cross Kings{% endblock %}
+
+{# A board diagram in the compact mobile-card style, with the marker on
+   `marker`, gold outlines on every cell in `legal`, blue outlines on every
+   cell in `pick`, and `taken` cells drawn as gaps. With `dim` set, every
+   cell that isn't the marker or highlighted is greyed out. #}
+{% macro diagram(board, marker, legal, taken, caption, pick=none, dim=false) %}
+<figure class="htp-diagram">
+    <div class="diagram-board">
+        {% for row in board %}
+            {% set r = loop.index0 %}
+            {% for card in row %}
+                {% set c = loop.index0 %}
+                {% set cell = (r, c) %}
+                {% set highlighted = (cell in legal) or (pick and cell in pick) or (marker and cell == marker) %}
+                <div class="diagram-cell{% if cell in legal %} legal{% endif %}{% if pick and cell in pick %} pick{% endif %}{% if dim and not highlighted %} dim{% endif %}">
+                    {% if cell in taken %}
+                        {{ macros.draw_card(None, marker=(cell == marker)) }}
+                    {% else %}
+                        {{ macros.draw_card(card, marker=(cell == marker)) }}
+                    {% endif %}
+                </div>
+            {% endfor %}
+        {% endfor %}
+    </div>
+    <figcaption>{{ caption }}</figcaption>
+</figure>
+{% endmacro %}
+
+{# A single row of cards for the scoring examples. #}
+{% macro cardrow(cards, caption) %}
+<figure class="htp-diagram">
+    <div class="diagram-hand">
+        {% for card in cards %}{{ macros.draw_card(card) }}{% endfor %}
+    </div>
+    <figcaption>{{ caption }}</figcaption>
+</figure>
+{% endmacro %}
+
+{% block content %}
+<div class="how-to-play">
+<h1>How to play Cross Kings</h1>
+
+<p>Cross Kings is a two player card game. It uses a small deck &mdash; Ace
+through 8 in every suit, plus the four Kings, 36 cards in all. Over the
+course of a game you each collect cards from a grid, and at the end you
+score the cards in your hand for runs and sets. The player with more
+points wins.</p>
+
+<h2>The board</h2>
+
+<p>The 36 cards are dealt into a 6&times;6 grid. The cards on the two
+diagonals are dealt <strong>face down</strong>; every other card is face
+up.</p>
+
+{{ diagram(board, none, [], [],
+   "The deal: the two diagonals are dealt face down (green); every other
+    card is face up.") }}
+
+<p>A single marker &mdash; a blue dot &mdash; sits on the grid and
+shows the current position. It starts on one of the four central cards. 
+The player who is <em>not</em> moving first chooses which of the four 
+central face-down cards to start the marker on at the start of the game</p>
+
+{{ diagram(board, none, [], [],
+   "The four central face-down cards: whoever isn't moving first picks
+    which one the marker starts on.", pick=central_cells, dim=true) }}
+
+<h2>Making a move</h2>
+
+<p>When the marker has been placed, the game starts and players take 
+alternating turns. On your turn you move the marker to any card in the 
+<strong>same row or column</strong> as its current cell, and collect that 
+card into your hand. You must move the marker on the very first turn 
+&mdash; you can't take the card the marker starts on</p>
+
+<div class="htp-legend">
+    <span><span class="swatch htp-swatch-marker"></span>marker (current position)</span>
+    <span><span class="swatch htp-swatch-legal"></span>a card you could move to</span>
+</div>
+
+{{ diagram(board, move_marker, move_legal, [],
+   "Every gold-outlined card is a legal move from the marker: the whole
+    of its row and its column.", dim=true) }}
+
+<h2>Gaps, and the end of the game</h2>
+
+<p>Taking a card leaves a gap in the grid. The marker can slide straight
+<strong>over any gaps</strong> left by cards already taken, so it can
+still reach a card further along the same row or column.</p>
+
+{{ diagram(gap_board, gap_marker, gap_legal, gap_taken,
+   "Later in the game: the marker sits in a gap and reaches cards beyond
+    the other empty gaps in its row and column.", dim=true) }}
+
+<p>The game ends when the marker is left with no card remaining in its row
+or column &mdash; there is nowhere left to move. Both players then score
+the cards they have collected.</p>
+
+<p>Both hands are open the whole game: you can always see which cards your
+opponent has taken. When a face-down card is collected, it is revealed to
+both players.</p>
+
+<h2>Scoring</h2>
+
+<p>At the end, each player scores the cards they collected. You earn
+points for two kinds of group:</p>
+
+<div class="htp-columns">
+    <div>
+        <p><strong>Runs</strong> &mdash; consecutive cards of the same suit.</p>
+        {{ cardrow(run_cards, "A run of three clubs, 4-5-6.") }}
+    </div>
+    <div>
+        <p><strong>Sets</strong> &mdash; cards that share the same rank.</p>
+        {{ cardrow(set_cards, "A set of three 7s.") }}
+    </div>
+</div>
+
+<p>A single card can count towards a run <em>and</em> a set at the same
+time. A group needs at least three cards to score: three cards are worth 3
+points, and every additional card beyond that adds another 2 points.</p>
+
+<details class="htp-details">
+    <summary>Show scoring table</summary>
+    <div class="table-scroll">
+    <table class="score-table">
+        <thead><tr><th>Run or set length</th><th>Points</th></tr></thead>
+        <tbody>
+            {% for length, points in points_table %}
+            <tr><td>{{ length }}</td><td>{{ points }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</details>
+
+<h2>Kings are wild</h2>
+
+<p>A King can stand in for any card to help complete a run or a set,
+whichever scores you the most. There is a catch: each King that forms
+part of a scoring group makes that group worth <strong>one point
+less</strong> than it otherwise would be.</p>
+
+<p>Any Kings you collect will be automatically placed in the highest
+scoring positions for you as you play</p>
+
+{{ cardrow(king_cards,
+   "5-6 of hearts with a King filling in for the 7: a run of three worth
+    3 - 1 = 2 points.") }}
+
+<p>Your total score is the sum of every run and set you can form from your
+hand. The higher total wins; equal totals are a draw.</p>
+
+<h2>Ready to play?</h2>
+
+<p>
+    <a href="{{ url_for('play') }}"><button type="button">Play vs computer</button></a>
+    <a href="{{ url_for('index') }}"><button type="button">Create or join a room</button></a>
+</p>
+</div>
+{% endblock %}

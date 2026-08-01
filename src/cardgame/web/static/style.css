@@ -693,3 +693,86 @@
         }
         .hand-slot.open { transform: translateY(0); }
     }
+
+    /* --- How to play page --- */
+    /* Diagrams reuse the game's card markup but force the compact
+       simplified card style at every width (the game only shows it below
+       900px), so the rules read the same on desktop and mobile. */
+    .how-to-play { max-width: 720px; }
+    .how-to-play h2 { margin-top: 1.7em; }
+    .how-to-play p { line-height: 1.6; }
+    .how-to-play button { margin: 4px 6px 4px 0; }
+    .htp-diagram { margin: 18px 0; overflow-x: auto; }
+    .htp-diagram figcaption {
+        margin: 8px auto 0;
+        font-size: 0.9em;
+        color: #bbb;
+        max-width: 400px;
+        text-align: center;
+    }
+    /* Centre the board so the outline on the left-edge cards has room and
+       isn't clipped by the figure's overflow. auto margins collapse to 0
+       when it can't fit (narrow screens), leaving it scrollable. */
+    .htp-diagram .diagram-board {
+        display: grid;
+        grid-template-columns: repeat(6, 40px);
+        grid-auto-rows: 56px;
+        gap: 4px;
+        width: max-content;
+        margin: 0 auto;
+    }
+    .htp-diagram .diagram-cell { position: relative; width: 40px; height: 56px; }
+    .htp-diagram .diagram-cell.legal .card { outline: 3px solid #d4a017; }
+    .htp-diagram .diagram-cell.pick .card { outline: 3px solid #4aa3df; }
+    .htp-diagram .diagram-cell.dim .card { opacity: 0.22; }
+    .htp-diagram .diagram-hand { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; justify-content: center; }
+    /* Runs and sets side by side, stacking on narrow screens. */
+    .how-to-play .htp-columns { display: flex; gap: 24px; flex-wrap: wrap; }
+    .how-to-play .htp-columns > div { flex: 1 1 240px; }
+    .htp-diagram .card {
+        width: 40px;
+        height: 56px;
+        border-radius: 4px;
+        box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.4);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .htp-diagram .card .corner, .htp-diagram .card > .suit { display: none; }
+    .htp-diagram .card .simple-label {
+        display: flex !important;
+        flex-direction: column;
+        align-items: center;
+        line-height: 1.1;
+    }
+    .htp-diagram .card .simple-label span:first-child { font-size: 19px; font-weight: bold; }
+    .htp-diagram .card .simple-label span:last-child { font-size: 18px; }
+    .htp-legend {
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+        font-size: 0.9em;
+        color: #bbb;
+        margin: 10px 0;
+    }
+    .htp-legend .swatch {
+        display: inline-block;
+        width: 0.9em;
+        height: 0.9em;
+        vertical-align: middle;
+        margin-right: 0.4em;
+        box-sizing: border-box;
+    }
+    .htp-swatch-marker { background: blue; border-radius: 50%; }
+    .htp-swatch-legal { outline: 3px solid #d4a017; background: white; }
+    .htp-details { margin: 12px 0; }
+    .htp-details summary { cursor: pointer; color: #7cb8ff; width: fit-content; }
+    .htp-details summary:hover { text-decoration: underline; }
+    .htp-details .table-scroll { margin-top: 10px; }
+    .table-scroll { overflow-x: auto; }
+    .score-table { border-collapse: collapse; margin: 10px 0; }
+    .score-table th, .score-table td {
+        border: 1px solid #555;
+        padding: 4px 14px;
+        text-align: center;
+    }

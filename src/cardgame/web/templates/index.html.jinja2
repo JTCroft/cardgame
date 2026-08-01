@@ -4,6 +4,7 @@
 <h1>Cross Kings</h1>
 <p>A 2 player card game. Start a new room and share the link with an opponent,
 or join a room someone shared with you.</p>
+<p>New here? <a href="{{ url_for('how_to_play') }}">Learn how to play &rarr;</a></p>
 
 <form method="post" action="{{ url_for('create_room') }}">
     <button type="submit">Create a new room</button>

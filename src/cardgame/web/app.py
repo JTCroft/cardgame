@@ -71,6 +71,7 @@ from flask_socketio import join_room as sio_join_room
 from flask_socketio import leave_room as sio_leave_room
 from jinja2 import ChoiceLoader, PackageLoader
 
+from ..cards import Card
 from ..game import Game
 from .extensions import app_holder, socketio
 from .identity import _MAX_NAME_LENGTH, _normalize_player_id
@@ -116,6 +117,40 @@ def _render_lobby():
     )
 
 
+def _how_to_play_context():
+    """Data for the illustrated rules page: a real dealt board plus, for
+    each diagram, the marker cell, the highlighted legal moves and any
+    taken cells (gaps). The scoring diagrams are hand-built card rows."""
+    game = Game.deal()  # diagonals face down, marker starts central
+    board = game.board
+
+    # A real, reachable position for the "passing over gaps" diagram: play
+    # a short legal sequence (the exact cards don't matter, only that every
+    # step is a legal rook move) so the marker ends up sitting in a gap -
+    # the card it collected - with further gaps in its row and column to
+    # reach past. Facedown destinations resolve to several children; any
+    # one will do since those cells become gaps.
+    gap_game = game
+    for move in [(2, 3), (4, 3), (4, 1), (1, 1), (1, 3)]:
+        gap_game = gap_game.move(*move)[0]
+
+    cards = lambda strs: [Card.from_str(s) for s in strs]
+    return {
+        "board": board,
+        "central_cells": {(2, 2), (2, 3), (3, 2), (3, 3)},
+        "move_marker": Game.starting_position,
+        "move_legal": game.legal_moves,
+        "gap_board": gap_game.board,
+        "gap_marker": gap_game.marker,
+        "gap_taken": set(gap_game.moves),
+        "gap_legal": gap_game.legal_moves,
+        "run_cards": cards(["4C", "5C", "6C"]),
+        "set_cards": cards(["7H", "7D", "7C"]),
+        "king_cards": cards(["5H", "6H", "KS"]),
+        "points_table": [(1, 0), (2, 0), (3, 3), (4, 5), (5, 7), (6, 9), (7, 11), (8, 13)],
+    }
+
+
 def _broadcast_lobby():
     socketio.emit("lobby_state", {"html": _render_lobby()}, to=_LOBBY_GROUP)
 
@@ -143,6 +178,10 @@ def create_app():
     @app.get("/")
     def index():
         return render_template("index.html.jinja2")
+
+    @app.get("/how-to-play")
+    def how_to_play():
+        return render_template("how_to_play.html.jinja2", **_how_to_play_context())
 
     @app.get("/favicon.ico")
     def favicon():
