@@ -25,24 +25,40 @@
         font-weight: bold;
         font-size: 1.2em;
         text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .site-nav .brand-logo {
+        height: 1.9em;
+        width: auto;
     }
     .hamburger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         background: none;
         border: none;
-        font-size: 1.4em;
-        line-height: 1;
-        padding: 4px 8px;
+        padding: 6px 8px;
         color: #eee;
         cursor: pointer;
     }
     .hamburger:hover { background: #3a3a3a; }
+    .hamburger-icon {
+        width: 22px;
+        height: 22px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+    }
     .nav-menu {
         display: none;
         flex-direction: column;
         gap: 2px;
         position: absolute;
         top: 100%;
-        left: 10px;
+        right: 10px;
         background: #2e2e2e;
         border: 1px solid #555;
         border-radius: 0 0 8px 8px;

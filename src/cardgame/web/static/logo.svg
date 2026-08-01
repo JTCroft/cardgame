@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="15.9 32.6 169.1 98.7" role="img" aria-label="Cross Kings">
+  <defs>
+    <!-- Suit glyphs in a 100x100 box, centred, no stroke -->
+    <path id="ck-spade" d="M50 14 C64 28 84 42 84 58 C84 70 76 76 68 76 C61 76 56 72 53 66 C53 74 56 82 64 88 L36 88 C44 82 47 74 47 66 C44 72 39 76 32 76 C24 76 16 70 16 58 C16 42 36 28 50 14 Z"/>
+    <path id="ck-heart" d="M50 86 C34.6 72 12.6 58 12.6 36 C12.6 23 22.5 15 33.5 15 C42.3 15 47.8 21 50 27 C52.2 21 57.7 15 66.5 15 C77.5 15 87.4 23 87.4 36 C87.4 58 65.4 72 50 86 Z"/>
+    <path id="ck-diamond" d="M50 12 L84 50 L50 88 L16 50 Z"/>
+    <g id="ck-club">
+      <circle cx="50" cy="30" r="17"/>
+      <circle cx="31" cy="53" r="17"/>
+      <circle cx="69" cy="53" r="17"/>
+      <path d="M50 30 L31 53 L69 53 Z"/>
+      <path d="M50 44 C55 61 57 75 64 88 L36 88 C43 75 45 61 50 44 Z"/>
+    </g>
+  </defs>
+
+  <!-- Gentle spread, back to front, with the two inner cards raised into a shallow arch.
+       Each card: rounded rect + one big suit nudged toward the exposed left side. -->
+  <g stroke="#2b2b2b" stroke-width="5.25" stroke-linejoin="round">
+    <!-- spade -->
+    <g transform="translate(54 86) rotate(-11)">
+      <rect x="-28" y="-42" width="56" height="80" rx="9" fill="#fff"/>
+      <g transform="translate(-26 -23) scale(0.46)" fill="#2b2b2b" stroke="none"><use href="#ck-spade"/></g>
+    </g>
+    <!-- diamond -->
+    <g transform="translate(85 80) rotate(-4)">
+      <rect x="-28" y="-42" width="56" height="80" rx="9" fill="#fff"/>
+      <g transform="translate(-26 -23) scale(0.46)" fill="#d13b3b" stroke="none"><use href="#ck-diamond"/></g>
+    </g>
+    <!-- club -->
+    <g transform="translate(116 80) rotate(4)">
+      <rect x="-28" y="-42" width="56" height="80" rx="9" fill="#fff"/>
+      <g transform="translate(-26 -23) scale(0.46)" fill="#2b2b2b" stroke="none"><use href="#ck-club"/></g>
+    </g>
+    <!-- heart (front) -->
+    <g transform="translate(147 86) rotate(11)">
+      <rect x="-28" y="-42" width="56" height="80" rx="9" fill="#fff"/>
+      <g transform="translate(-23 -23) scale(0.46)" fill="#d13b3b" stroke="none"><use href="#ck-heart"/></g>
+    </g>
+  </g>
+</svg>
