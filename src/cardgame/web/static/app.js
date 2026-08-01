@@ -118,10 +118,6 @@
     // including their own scripts block, has already run).
     let ROOM_KEY = null;
     let REVIEW_ENTRY_ID = null;
-    // Solo-vs-computer pages set this (play.html.jinja2): whether to ask
-    // the server for live-eval mode on join. null (every other page) means
-    // "send no flag at all", leaving the room's mode untouched.
-    let LIVE_EVAL = null;
     // A "Play from here" saved position (play.html.jinja2, /play-from route).
     // Sent up with the *first* join to seed a fresh solo game, then cleared
     // so a later reconnect's re-join doesn't reset the game back to it.
@@ -134,7 +130,6 @@
     function targetFields() {
         const fields = { code: ROOM_KEY };
         if (REVIEW_ENTRY_ID) fields.review_entry_id = REVIEW_ENTRY_ID;
-        if (LIVE_EVAL !== null) fields.live_eval = LIVE_EVAL;
         if (LOAD_STATE) fields.load_state = LOAD_STATE;
         return fields;
     }
@@ -227,12 +222,6 @@
         if (el) el.innerHTML = payload.html;
         applyActiveHand();
         applyAnalysisTimer();
-    });
-    // Live-eval pushes update their own container (only present on
-    // /play?show_live_eval=true pages), independent of #game-state re-renders.
-    socket.on("live_eval", (payload) => {
-        const el = document.getElementById("live-eval");
-        if (el) el.innerHTML = payload.html;
     });
     socket.on("disconnect", () => {
         const el = document.getElementById("flash-container");

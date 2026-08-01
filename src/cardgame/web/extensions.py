@@ -11,7 +11,7 @@ from flask_socketio import SocketIO
 socketio = SocketIO()
 
 # The Flask app, stashed by app.py once it's constructed, so background
-# threads in rooms.py (post-game analysis broadcasts, live-eval pushes) can
+# threads in rooms.py (post-game analysis broadcasts) can
 # enter an app context to render templates - render_template needs one, and
 # plain threads don't inherit it.
 app_holder = {}

@@ -109,7 +109,7 @@
     {% else %}
         {% macro analysis_card(row) %}
             {%- if row.card.facedown -%}
-                Face-down (row {{ row.marker[0] + 1 }}, col {{ row.marker[1] + 1 }}){% if row.revealed %} &rarr; <span class="cardtext{% if row.revealed.suit_name in ("hearts", "diamonds") %} red{% endif %}">{{ row.revealed }}</span>{% endif %}
+                R{{ row.marker[0] + 1 }}C{{ row.marker[1] + 1 }}{% if row.revealed %} &rarr; <span class="cardtext{% if row.revealed.suit_name in ("hearts", "diamonds") %} red{% endif %}">{{ row.revealed }}</span>{% endif %}
             {%- else -%}
                 <span class="cardtext{% if row.card.suit_name in ("hearts", "diamonds") %} red{% endif %}">{{ row.card }}</span>
             {%- endif -%}

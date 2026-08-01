@@ -37,8 +37,6 @@ from ..ai import choose_move
 from ..analysis import AnalysisAborted, analyse_moves_by_deadline
 from ..analysis_native import FINAL, NATIVE_AVAILABLE, iter_move_analyses
 from ..game import Game
-from ..search_alt import _snapshot as _search_snapshot
-from ..search_alt import move_search_iterator
 from .extensions import app_holder, socketio
 from .identity import _normalize_player_id
 
@@ -155,16 +153,6 @@ class RoomState:
     # _analysis_worker_loop), so a still-draining previous game keeps its
     # own correct cutoff instead of being cut short or freed to run forever.
     analysis_deadline: float | None = None
-    # Whether this (solo) room is in "live eval" mode: a background thread
-    # runs the anytime search (cardgame.search_alt) on whatever the current
-    # position is, pushing a continuously-updating move ranking to every
-    # connected socket. Set by the owner's entry point
-    # (/play?show_live_eval=true vs /play) at join time.
-    live_eval: bool = False
-    # Guard so at most one live-eval thread runs per room; the thread
-    # clears it when it exits (no viewers / mode switched off) so a later
-    # join can start a fresh one.
-    live_eval_running: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def seat_of(self, player_id):
@@ -1439,130 +1427,6 @@ def _broadcast_state(code, room):
     for sid, player_id in sid_players.items():
         html = _render_state(code, room, player_id)
         socketio.emit("state", {"html": html}, to=sid)
-
-
-# Live-eval pacing: per-position caps keep an early-game search (which can
-# never finish - the opening's tree is astronomically large) from pinning
-# the CPU and growing its node tree forever; deeper positions solve well
-# inside them. Batches are bounded by wall clock, not quantum count - a
-# single quantum ranges from microseconds (an expansion) to a few hundred
-# milliseconds (an exact leaf solve), so only time-batching keeps the
-# emit/position-change checks responsive. Small sleeps between batches
-# keep the request threads breathing under the GIL.
-_LIVE_EVAL_BUDGET = 60.0
-_LIVE_EVAL_WORK_CAP = 30000
-_LIVE_EVAL_BATCH_SECONDS = 0.25
-_LIVE_EVAL_EMIT_INTERVAL = 0.8
-
-
-def _render_live_eval(room, game, snapshot, status):
-    mover_seat = 1 if len(game.moves) % 2 == 0 else 2
-    return render_template(
-        "_live_eval.html.jinja2",
-        snapshot=snapshot,
-        mover_name=room.name_for_seat(mover_seat) or f"Player {mover_seat}",
-        status=status,
-    )
-
-
-def _emit_live_eval(room, game, snapshot, status):
-    with room.lock:
-        sids = list(room.sid_players)
-    if not sids:
-        return
-    html = []
-    _in_app_context(
-        lambda: html.append(_render_live_eval(room, game, snapshot, status))
-    )
-    if not html:
-        return
-    for sid in sids:
-        socketio.emit("live_eval", {"html": html[0]}, to=sid)
-
-
-def _live_eval_status(root, capped):
-    if root.resolved:
-        return "solved - exact value known"
-    if root.proven:
-        return "best move proven"
-    if capped:
-        return "paused - search limit for this position reached"
-    return f"searching ({root.ctx.work} solves)"
-
-
-def _live_eval_loop(code, room):
-    """Continuously evaluate the room's current position with the anytime
-    search, pushing ranking updates to everyone connected. The search on a
-    position runs for as long as that position stays current (or until it
-    is solved / hits its caps); a move or a fresh deal abandons it and
-    starts over on the new position. Exits when the room empties or leaves
-    live-eval mode - a later join starts a new thread."""
-    try:
-        while True:
-            with room.lock:
-                if not room.live_eval or not room.sid_players:
-                    return
-                game = room.game
-            if not game.legal_moves:
-                # game over - the post-game analysis panel takes over; wait
-                # here for a rematch to swap in a new game
-                time.sleep(1.0)
-                continue
-            root = move_search_iterator(game)
-            started = time.monotonic()
-            last_emit = 0.0
-            final_emitted = False
-            while True:
-                with room.lock:
-                    if not room.live_eval or not room.sid_players:
-                        return
-                    if room.game is not game:
-                        break  # position moved on - restart on the new one
-                capped = (
-                    time.monotonic() - started > _LIVE_EVAL_BUDGET
-                    or root.ctx.work >= _LIVE_EVAL_WORK_CAP
-                )
-                if root.resolved or capped:
-                    if not final_emitted:
-                        _emit_live_eval(
-                            room,
-                            game,
-                            _search_snapshot(root, time.monotonic() - started),
-                            _live_eval_status(root, capped),
-                        )
-                        final_emitted = True
-                    time.sleep(0.5)
-                    continue
-                batch_end = time.monotonic() + _LIVE_EVAL_BATCH_SECONDS
-                while time.monotonic() < batch_end and not root.resolved:
-                    try:
-                        next(root)
-                    except StopIteration:
-                        break
-                now = time.monotonic()
-                if root.moves is not None and now - last_emit >= _LIVE_EVAL_EMIT_INTERVAL:
-                    _emit_live_eval(
-                        room,
-                        game,
-                        _search_snapshot(root, now - started),
-                        _live_eval_status(root, capped=False),
-                    )
-                    last_emit = now
-                time.sleep(0.02)
-    finally:
-        with room.lock:
-            room.live_eval_running = False
-
-
-def _ensure_live_eval(code, room):
-    """Start the room's live-eval thread if its mode calls for one and none
-    is running. Callers invoke this unconditionally after joins; it's a
-    no-op for ordinary rooms."""
-    with room.lock:
-        if not room.live_eval or room.live_eval_running or not room.sid_players:
-            return
-        room.live_eval_running = True
-    threading.Thread(target=_live_eval_loop, args=(code, room), daemon=True).start()
 
 
 def _maybe_play_computer_move(code, room):

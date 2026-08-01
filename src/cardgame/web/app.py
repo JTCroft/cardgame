@@ -78,7 +78,6 @@ from .rooms import (
     create_solo_room_from_state,
     decode_game_state,
     _ensure_analysis_worker,
-    _ensure_live_eval,
     _finished_rooms_lock,
     _find_finished_room_entry,
     _get_or_create_room,
@@ -169,18 +168,8 @@ def create_app():
         # No known player id yet at this point - see module docstring. The
         # page's own JS reads/creates its client-side identity and asks for
         # its actual game over the socket (see "join" below) moments after
-        # this loads. ?show_live_eval=true additionally turns on the
-        # anytime search (cardgame.search_alt), continuously evaluating the
-        # current position and streaming a live move ranking to the page -
-        # the mode flag travels with the page's "join" (see handler below)
-        # since the room itself is only resolved/created there.
-        show_live_eval = request.args.get("show_live_eval", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        return render_template("play.html.jinja2", live_eval=show_live_eval)
+        # this loads.
+        return render_template("play.html.jinja2")
 
     @app.get("/play-from/<state>")
     def play_from(state):
@@ -293,12 +282,6 @@ def handle_join(data):
     sid = request.sid
     with room.lock:
         room.sid_players[sid] = player_id
-        # Live-eval mode is an owner's choice of entry point
-        # (/play?show_live_eval=true vs /play) for their own solo room;
-        # other pages send no flag at all
-        # and leave the mode as it is.
-        if room.computer_seat is not None and code == player_id and "live_eval" in data:
-            room.live_eval = bool(data.get("live_eval"))
         # Pick up this player's client-stored name (if any), in case they
         # set it while visiting a different room.
         if name:
@@ -338,7 +321,6 @@ def handle_join(data):
         socketio.emit("need_name", {}, to=sid)
     else:
         _broadcast_state(code, room)
-    _ensure_live_eval(code, room)
     _ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
