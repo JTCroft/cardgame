@@ -442,9 +442,8 @@
         outline: 3px solid #ffd43b;
         box-shadow: 0 0 12px 2px rgba(255, 212, 59, 0.8);
     }
-    /* Marker placement phase: dim every non-target card and outline the
-       central cells the marker can start on. */
-    .card.dimmed { opacity: 0.3; }
+    /* Marker placement phase: outline the central cells the marker can
+       start on. */
     .cell-button.place-target .card { outline: 3px solid #4aa3df; }
     .cell-button.place-target:hover .card,
     .cell-button.place-target:focus .card { outline-color: #7cc4f0; }

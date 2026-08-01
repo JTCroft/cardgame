@@ -121,6 +121,14 @@ It has the branch name (`web-ui` right now) hardcoded in the function body
 `git reset --hard origin/<branch>` line in `~/.zshrc` too, they don't stay
 in sync automatically.
 
+`cardgame-update` also **forces a fresh build of the native solver and
+verifies it loaded** before restarting (see the native rebuild gotcha
+below). It runs under `set -e`, so if the native build fails the command
+aborts and reports the error rather than printing a false "Updated".
+
+`cardgame-start` and `cardgame-stop` just start/stop the instance and need
+no such handling.
+
 **Or manually**, if you want to see output live or debug a failure:
 
 ```bash
@@ -128,7 +136,9 @@ aws ssm start-session --target "$(cardgame-id)" --profile cardgame
 # once connected (replace <branch> with your actual git_ref):
 cd /opt/cardgame
 sudo git fetch origin && sudo git reset --hard "origin/<branch>"
-sudo /usr/local/bin/uv sync --extra web --extra native
+sudo /usr/local/bin/uv sync --extra web --extra native \
+  --refresh-package cardgame-native --reinstall-package cardgame-native
+sudo /usr/local/bin/uv run python -c 'from cardgame.solver_native import NATIVE_AVAILABLE; assert NATIVE_AVAILABLE'
 sudo systemctl restart cardgame-web
 ```
 
@@ -148,6 +158,29 @@ aws ssm send-command --instance-ids "$(cardgame-id)" \
 If the extra isn't installed the app still works - `solve_native`'s
 callers fall back to the pure-Python solver (the bot's exact-endgame
 gate scales its cost thresholds accordingly).
+
+**Native rebuild gotcha (why the `--refresh`/`--reinstall` flags).** `uv
+sync` treats the `native/` package like any resolved dependency: once a
+build is installed it won't rebuild it against changed source - even across
+a version bump - so a plain `uv sync` can silently keep a stale (or
+missing-symbol) build, dropping the app to the pure-Python solver with no
+error. Bumping `native`'s version used to be the workaround, but it isn't
+reliable. The commands above instead pass
+`--refresh-package cardgame-native --reinstall-package cardgame-native`,
+which forces a fresh build and reinstall on every deploy regardless of
+version, and then assert `NATIVE_AVAILABLE` so a bad build fails the deploy
+loudly rather than restarting on the fallback.
+
+Confirm which solver is live at any time via the status endpoint:
+
+```bash
+curl -s https://<your subdomain>/status
+# "native": {"solver": true, "analysis": true}  -> Rust core in use
+# both false                                     -> pure-Python fallback
+```
+
+`solver` backs the computer opponent (`cardgame.choose_move`); `analysis`
+backs the post-game move analysis.
 
 If you'd rather always get a fully clean instance (e.g. after bigger infra
 changes), `terraform taint aws_instance.web && terraform apply` replaces it
