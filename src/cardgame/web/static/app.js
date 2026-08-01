@@ -138,6 +138,9 @@
     }
 
     socket.on("connect", () => {
+        // Clear any "Connection lost" flash left over from a prior drop.
+        const flash = document.getElementById("flash-container");
+        if (flash) flash.innerHTML = "";
         // Solo games (see app.py's module docstring) never need a name to
         // auto-seat you - only multiplayer rooms do, and only when there's
         // actually a vacant seat to claim - so it's fine to always route
@@ -220,11 +223,25 @@
         }, 1000);
     }
 
+    // After a full re-render the pointer may already sit over a freshly
+    // created cell button, so the browser paints its :hover state with no
+    // mouse movement - e.g. the cell you clicked to place the marker looks
+    // pre-selected on your next turn. Suppress board hover until a real move.
+    function suppressBoardHover() {
+        const board = document.querySelector(".board");
+        if (board) board.classList.add("no-hover");
+    }
+    document.addEventListener("mousemove", () => {
+        const board = document.querySelector(".board");
+        if (board) board.classList.remove("no-hover");
+    });
+
     socket.on("state", (payload) => {
         const el = document.getElementById("game-state");
         if (el) el.innerHTML = payload.html;
         applyActiveHand();
         applyAnalysisTimer();
+        suppressBoardHover();
     });
     socket.on("disconnect", () => {
         const el = document.getElementById("flash-container");

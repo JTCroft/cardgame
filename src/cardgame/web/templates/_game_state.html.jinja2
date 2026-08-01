@@ -34,14 +34,6 @@
    the turn indicator is restored at every earlier one. #}
 {% set position_over = game.marker is not none and not game.legal_moves %}
 
-{% if needs_marker %}
-    {% if your_placement %}
-    <div class="placement-banner">Place the marker: choose one of the highlighted central cards.</div>
-    {% else %}
-    <div class="placement-banner">Waiting for {{ placer_name or "Player 2" }} to place the marker&hellip;</div>
-    {% endif %}
-{% endif %}
-
 <div class="game-container">
     {% if needs_marker and your_placement %}
         {{ macros.draw_board(game.board, game.moves, marker_pos=None, legal_moves=starting_positions, move_handler="placeMarker", placement=True) }}
