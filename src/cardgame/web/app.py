@@ -60,6 +60,7 @@ import secrets
 
 from flask import (
     Flask,
+    Response,
     abort,
     redirect,
     render_template,
@@ -143,6 +144,41 @@ def create_app():
     def index():
         return render_template("index.html.jinja2")
 
+    @app.get("/favicon.ico")
+    def favicon():
+        # Browsers/crawlers request /favicon.ico at the root; serve the
+        # static file rather than falling through to the 404 page.
+        return redirect(url_for("static", filename="favicon.ico"))
+
+    @app.get("/robots.txt")
+    def robots_txt():
+        # Only the two landing pages are worth indexing; live games,
+        # reviews and joinable rooms are transient/per-user.
+        body = (
+            "User-agent: *\n"
+            "Allow: /$\n"
+            "Allow: /rooms$\n"
+            "Disallow: /play\n"
+            "Disallow: /review/\n"
+            "Disallow: /room/\n"
+            "\n"
+            "Sitemap: https://crosskings.net/sitemap.xml\n"
+        )
+        return Response(body, mimetype="text/plain")
+
+    @app.get("/sitemap.xml")
+    def sitemap_xml():
+        # Only the indexable landing pages (see robots.txt).
+        urls = [url_for("index", _external=True), url_for("rooms_view", _external=True)]
+        entries = "".join(f"  <url><loc>{u}</loc></url>\n" for u in urls)
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+            f"{entries}"
+            "</urlset>\n"
+        )
+        return Response(body, mimetype="application/xml")
+
     @app.get("/rooms")
     def rooms_view():
         return render_template(
@@ -217,6 +253,16 @@ def create_app():
             abort(404, description="Room codes must be 4 letters, e.g. /room/ABCD")
         _get_or_create_room(normalized)
         return render_template("room.html.jinja2", code=normalized)
+
+    @app.errorhandler(404)
+    def not_found(error):
+        message = getattr(error, "description", None) or "That page doesn't exist."
+        return render_template("error.html.jinja2", code=404, message=message), 404
+
+    @app.errorhandler(500)
+    def server_error(error):
+        message = "Something went wrong on our end. Please try again."
+        return render_template("error.html.jinja2", code=500, message=message), 500
 
     return app
 
