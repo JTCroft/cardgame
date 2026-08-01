@@ -71,8 +71,10 @@ from flask_socketio import join_room as sio_join_room
 from flask_socketio import leave_room as sio_leave_room
 from jinja2 import ChoiceLoader, PackageLoader
 
+from ..analysis_native import NATIVE_AVAILABLE as _ANALYSIS_NATIVE
 from ..cards import Card
 from ..game import Game
+from ..solver_native import NATIVE_AVAILABLE as _SOLVER_NATIVE
 from .extensions import app_holder, socketio
 from .identity import _MAX_NAME_LENGTH, _normalize_player_id
 from .rooms import (
@@ -98,6 +100,7 @@ from .rooms import (
     _sid_index,
     _sid_index_lock,
     start_ondemand_analysis,
+    status_counts,
 )
 
 # Socket.IO broadcast group used for the /rooms lobby listing. This is a
@@ -188,6 +191,22 @@ def create_app():
         # Browsers/crawlers request /favicon.ico at the root; serve the
         # static file rather than falling through to the 404 page.
         return redirect(url_for("static", filename="favicon.ico"))
+
+    @app.get("/status")
+    def status():
+        # Lightweight health/diagnostics as JSON. `native` reports whether
+        # the Rust core backs each hot path: `solver` the computer opponent
+        # (cardgame.choose_move) and `analysis` the post-game move analysis.
+        # Both false means the pure-Python fallbacks are in use.
+        return {
+            "status": "ok",
+            "version": importlib.metadata.version("cardgame"),
+            "native": {
+                "solver": _SOLVER_NATIVE,
+                "analysis": _ANALYSIS_NATIVE,
+            },
+            **status_counts(),
+        }
 
     @app.get("/robots.txt")
     def robots_txt():

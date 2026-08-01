@@ -342,6 +342,22 @@ _finished_rooms: list[dict] = []
 _finished_rooms_lock = threading.Lock()
 
 
+def status_counts():
+    """Lightweight, lock-safe health counts for the /status endpoint:
+    live rooms, recorded finished games, and connected sockets."""
+    with _rooms_lock:
+        active_rooms = len(_rooms)
+    with _finished_rooms_lock:
+        finished_rooms = len(_finished_rooms)
+    with _sid_index_lock:
+        connected_clients = len(_sid_index)
+    return {
+        "active_rooms": active_rooms,
+        "finished_rooms": finished_rooms,
+        "connected_clients": connected_clients,
+    }
+
+
 # Total background time spent analysing any one finished game.
 _ANALYSIS_TIME_CAP = 120.0
 
