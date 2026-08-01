@@ -156,6 +156,9 @@
     function sendMove(row, col) {
         socket.emit("move", withIdentity({ code: ROOM_KEY, row: row, col: col }));
     }
+    function placeMarker(row, col) {
+        socket.emit("place_marker", withIdentity({ code: ROOM_KEY, row: row, col: col }));
+    }
     function requestRematch() {
         socket.emit("request_rematch", withIdentity({ code: ROOM_KEY }));
     }

@@ -32,10 +32,24 @@
    game, or stepping through one that just ended). Using game.legal_moves
    directly means the trophy only shows at the actual final position, and
    the turn indicator is restored at every earlier one. #}
-{% set position_over = not game.legal_moves %}
+{% set position_over = game.marker is not none and not game.legal_moves %}
+
+{% if needs_marker %}
+    {% if your_placement %}
+    <div class="placement-banner">Place the marker: choose one of the highlighted central cards.</div>
+    {% else %}
+    <div class="placement-banner">Waiting for {{ placer_name or "Player 2" }} to place the marker&hellip;</div>
+    {% endif %}
+{% endif %}
 
 <div class="game-container">
-    {{ macros.draw_board(game.board, game.moves, marker_pos=game.marker, legal_moves=legal_moves if your_turn else None) }}
+    {% if needs_marker and your_placement %}
+        {{ macros.draw_board(game.board, game.moves, marker_pos=None, legal_moves=starting_positions, move_handler="placeMarker", placement=True) }}
+    {% elif needs_marker %}
+        {{ macros.draw_board(game.board, game.moves, marker_pos=None) }}
+    {% else %}
+        {{ macros.draw_board(game.board, game.moves, marker_pos=game.marker, legal_moves=legal_moves if your_turn else None) }}
+    {% endif %}
     <div class="hands">
         <div class="hand-slot" id="hand-slot-1">
             <div class="seat-header">
@@ -49,7 +63,7 @@
                 {% elif p1_seated and p1_disconnected and not vs_computer %}
                     <button type="button" class="small" onclick="kickSeat(1)">Kick</button>
                 {% elif p1_seated and my_seat == 2 and not game_started %}
-                    <button type="button" class="small" onclick="swapSeats()">Swap seats</button>
+                    <button type="button" class="small" onclick="swapSeats()">Swap</button>
                 {% elif is_spectator and not p1_seated %}
                     <button type="button" class="small" onclick="claimSeat(1)">Join as Player 1</button>
                 {% endif %}
@@ -68,7 +82,7 @@
                 {% elif p2_seated and p2_disconnected and not vs_computer %}
                     <button type="button" class="small" onclick="kickSeat(2)">Kick</button>
                 {% elif p2_seated and my_seat == 1 and not game_started %}
-                    <button type="button" class="small" onclick="swapSeats()">Swap seats</button>
+                    <button type="button" class="small" onclick="swapSeats()">Swap</button>
                 {% elif is_spectator and not p2_seated %}
                     <button type="button" class="small" onclick="claimSeat(2)">Join as Player 2</button>
                 {% endif %}

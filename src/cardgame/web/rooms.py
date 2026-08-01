@@ -174,7 +174,9 @@ class RoomState:
 
     @property
     def game_over(self):
-        return not self.game.legal_moves
+        # An unplaced game also has no legal moves, but it's pre-game rather
+        # than finished - guard on the marker having been placed.
+        return not self.game.needs_marker and not self.game.legal_moves
 
     @property
     def current_turn_seat(self):
@@ -191,6 +193,23 @@ class RoomState:
         if occupant is None:
             return None
         return self.player_names.get(occupant, f"Player {seat}")
+
+    def _seat2_occupant(self):
+        # Identity of whoever currently holds seat 2 (the marker placer):
+        # a player id, "computer", or None if vacant.
+        if self.computer_seat == 2:
+            return "computer"
+        return self.seats.get(2)
+
+    def _reset_marker_if_orphaned(self, previous_seat2):
+        """Clear a marker placement if seat 2's occupant has changed since it
+        was placed, so the new occupant chooses. A no-op once play has begun
+        (seats are locked then) or if the marker isn't placed. Callers hold
+        the lock and pass the seat-2 occupant captured before their change."""
+        if self.game.needs_marker or self.game.moves:
+            return
+        if self._seat2_occupant() != previous_seat2:
+            self.game = self.game.clear_marker()
 
     def claim_seat(self, seat, player_id):
         """Try to claim a vacant seat. Returns (success, error_message).
@@ -214,7 +233,9 @@ class RoomState:
                 return False, "You already have a seat."
             if seat in self.seats:
                 return False, "That seat is already taken."
+            previous_seat2 = self._seat2_occupant()
             self.seats[seat] = player_id
+            self._reset_marker_if_orphaned(previous_seat2)
             return True, None
 
     def vacate_seat(self, player_id):
@@ -224,9 +245,11 @@ class RoomState:
                 return False, "You can't leave a solo game against the computer."
             if self.game_started and not self.game_over:
                 return False, "You can't leave while a game is in progress."
+            previous_seat2 = self._seat2_occupant()
             for seat, occupant in list(self.seats.items()):
                 if occupant == player_id:
                     del self.seats[seat]
+                    self._reset_marker_if_orphaned(previous_seat2)
                     return True, None
             return False, "You don't have a seat."
 
@@ -243,9 +266,11 @@ class RoomState:
                 return False, "You can't swap seats after the game has started."
             if player_id not in self.seats.values():
                 return False, "You don't have a seat."
+            previous_seat2 = self._seat2_occupant()
             self.seats = {3 - seat: occupant for seat, occupant in self.seats.items()}
             if self.computer_seat is not None:
                 self.computer_seat = 3 - self.computer_seat
+            self._reset_marker_if_orphaned(previous_seat2)
             return True, None
 
     def seat_disconnected(self, seat):
@@ -273,7 +298,9 @@ class RoomState:
                 return False, "You can't kick a seat in a solo game."
             if not self.seat_disconnected(seat):
                 return False, "That seat isn't a disconnected player's."
+            previous_seat2 = self._seat2_occupant()
             del self.seats[seat]
+            self._reset_marker_if_orphaned(previous_seat2)
             return True, None
 
     def displayed_game(self, player_id):
@@ -713,7 +740,11 @@ def _analysis_worker_loop(code, room):
             with room.lock:
                 game = room.game
                 game_id = room.game_id
-                ended = not game.legal_moves
+                # An unplaced game (dealt with no marker yet, e.g. just after
+                # a rematch) also has no legal moves, but it's pre-game, not
+                # ended - treating it as ended drives the backward slot to a
+                # negative index (undo past the start). Mirror game_over.
+                ended = not game.needs_marker and not game.legal_moves
                 if ended:
                     deadline = room.analysis_deadline
                     if deadline is None or time.monotonic() >= deadline:
@@ -938,7 +969,10 @@ def _get_or_create_room(code, solo=False):
     with _rooms_lock:
         room = _rooms.get(code)
         if room is None:
-            room = RoomState(game=Game.deal())
+            # Dealt unplaced: seat 2 places the marker before play begins
+            # (a solo computer in seat 2 auto-places, see
+            # _maybe_play_computer_move).
+            room = RoomState(game=Game.deal(marker=None))
             if solo:
                 room.computer_seat = 2
             _rooms[code] = room
@@ -1246,6 +1280,12 @@ def _room_context(code, room, player_id):
 
     turn_seat = None if game_over else room.current_turn_seat
 
+    # Placement phase: the marker is dealt but not yet placed, and both seats
+    # are filled so seat 2 can choose its starting cell. your_placement marks
+    # the viewer who gets the clickable central cells.
+    needs_marker = display_game.needs_marker and room.both_seated
+    your_placement = needs_marker and my_seat == 2
+
     winner = None
     if game_over:
         p1_score, p2_score = final_game.p1.score(), final_game.p2.score()
@@ -1302,6 +1342,10 @@ def _room_context(code, room, player_id):
         "both_seated": room.both_seated,
         "your_turn": my_seat is not None and my_seat == turn_seat and room.both_seated,
         "legal_moves": set() if (game_over or viewing_history) else display_game.legal_moves,
+        "needs_marker": needs_marker,
+        "your_placement": your_placement,
+        "placer_name": room.name_for_seat(2),
+        "starting_positions": Game._valid_starting_positions,
         "game_over": game_over,
         "game_started": game_started,
         "seats_locked": seats_locked,
@@ -1364,6 +1408,10 @@ def _room_review_context(entry, viewer_id):
         "both_seated": True,
         "your_turn": False,
         "legal_moves": set(),
+        "needs_marker": False,
+        "your_placement": False,
+        "placer_name": entry["p2_name"],
+        "starting_positions": (),
         "game_over": True,
         "game_started": True,
         "seats_locked": True,
@@ -1441,9 +1489,23 @@ def _maybe_play_computer_move(code, room):
         with room.lock:
             if room.computer_seat is None or room.game_over:
                 return
-            if room.current_turn_seat != room.computer_seat:
+            if room.game.needs_marker:
+                # Computer placer (seat 2 only): auto-place the default
+                # central start once both seats are filled. Placing from
+                # seat 1 is never the computer's call - that's the human's.
+                if not room.both_seated or room.computer_seat != 2:
+                    return
+                room.game = room.game.place_marker(*Game.starting_position)
+                placed = True
+            elif room.current_turn_seat != room.computer_seat:
                 return
+            else:
+                placed = False
             game, game_id = room.game, room.game_id
+        if placed:
+            # Broadcast the placement and loop; the move turn is now P1's.
+            _broadcast_state(code, room)
+            continue
         # Think (and enforce the minimum move time) outside the lock, so a
         # slow think no longer holds the room's lock and the padding sleep
         # never blocks broadcasts or the analysis worker.
@@ -1477,7 +1539,10 @@ def _room_summary_locked(code, room):
     move that just finished it - see _record_room_finished_locked).
     """
     game = room.game
-    game_over = not game.legal_moves
+    # An unplaced game (fresh room awaiting a marker) has no legal moves but
+    # isn't finished - otherwise a room with a vacant seat would be filtered
+    # out of the lobby as "finished" (see _lobby_active_summaries).
+    game_over = not game.needs_marker and not game.legal_moves
     game_started = room.game_started
     seated_ids = set(room.seats.values())
     spectators = sum(1 for pid in room.sid_players.values() if pid not in seated_ids)

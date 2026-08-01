@@ -406,6 +406,10 @@ def handle_join(data):
         socketio.emit("need_name", {}, to=sid)
     else:
         _broadcast_state(code, room)
+    # A solo room's computer opponent in seat 2 places the marker as soon as
+    # the human is seated (nothing else would trigger it before the human's
+    # first move).
+    _maybe_play_computer_move(code, room)
     _ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
@@ -474,6 +478,9 @@ def handle_claim_seat(data):
         return
 
     _broadcast_state(code, room)
+    # Claiming may have completed the seating of a solo room whose computer
+    # is the marker placer.
+    _maybe_play_computer_move(code, room)
     _broadcast_lobby()
 
 
@@ -605,6 +612,57 @@ def handle_move(data):
     _maybe_play_computer_move(code, room)
     _ensure_analysis_worker(code, room)
     _broadcast_lobby()
+
+
+@socketio.on("place_marker")
+def handle_place_marker(data):
+    data = data or {}
+    player_id = _normalize_player_id(data.get("player_id"))
+    if player_id is None:
+        socketio.emit("error_message", {"message": "Missing player id."}, to=request.sid)
+        return
+    code = _resolve_room_key(data.get("code", ""), player_id)
+    room = _rooms.get(code)
+    if room is None:
+        socketio.emit("error_message", {"message": "That room doesn't exist."}, to=request.sid)
+        return
+    my_seat = room.seat_of(player_id)
+
+    with room.lock:
+        game = room.game
+        if not room.both_seated:
+            socketio.emit(
+                "error_message",
+                {"message": "Waiting for both players to join before the game can start."},
+                to=request.sid,
+            )
+            return
+        if not game.needs_marker:
+            socketio.emit("error_message", {"message": "The marker is already placed."}, to=request.sid)
+            return
+        # The marker is placed by the player not moving first - seat 2.
+        if my_seat != 2:
+            socketio.emit("error_message", {"message": "It isn't yours to place."}, to=request.sid)
+            return
+        try:
+            row = int(data["row"])
+            col = int(data["col"])
+        except (KeyError, TypeError, ValueError):
+            socketio.emit("error_message", {"message": "Invalid placement."}, to=request.sid)
+            return
+        if (row, col) not in game._valid_starting_positions:
+            socketio.emit(
+                "error_message",
+                {"message": "The marker must start on a central card."},
+                to=request.sid,
+            )
+            return
+        room.game = game.place_marker(row, col)
+
+    _broadcast_state(code, room)
+    _broadcast_lobby()
+    # If the computer is Player 1, it now makes the first move.
+    _maybe_play_computer_move(code, room)
 
 
 @socketio.on("history_step")
@@ -784,7 +842,7 @@ def handle_request_rematch(data):
         if room.computer_seat is not None:
             # The computer always accepts immediately - there's no one to
             # ask, and no point waiting.
-            room.game = Game.deal()
+            room.game = Game.deal(marker=None)
             room.game_id = secrets.token_hex(8)
             room.rematch_requested_by = None
             room.history_index.clear()
@@ -794,7 +852,7 @@ def handle_request_rematch(data):
             room.analysis_calc_started = {}
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
-            room.game = Game.deal()
+            room.game = Game.deal(marker=None)
             room.game_id = secrets.token_hex(8)
             room.rematch_requested_by = None
             room.history_index.clear()
@@ -834,7 +892,7 @@ def handle_respond_rematch(data):
         if room.rematch_requested_by is None or room.rematch_requested_by == player_id:
             return  # nothing to respond to, or you're the one who asked
         if accept:
-            room.game = Game.deal()
+            room.game = Game.deal(marker=None)
             room.game_id = secrets.token_hex(8)
             room.history_index.clear()
             room.game_over_seen.clear()

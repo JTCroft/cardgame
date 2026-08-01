@@ -1,5 +1,5 @@
-{% macro draw_card(card, marker=False, highlight=False) %}
-<div class="card{% if marker %} marker{% endif %}{% if highlight %} just-taken{% endif %}{% if card is none %} taken{% elif card.facedown %} facedown{% else %} {{ card.suit_name }}{% endif %}">
+{% macro draw_card(card, marker=False, highlight=False, dimmed=False) %}
+<div class="card{% if marker %} marker{% endif %}{% if highlight %} just-taken{% endif %}{% if dimmed %} dimmed{% endif %}{% if card is none %} taken{% elif card.facedown %} facedown{% else %} {{ card.suit_name }}{% endif %}">
     {% if card and not card.facedown %}
     <div class="corner top-left"><span>{{ card.rank }}</span><br><span>{{ card.suit }}</span></div>
     <div class="suit">{{ card.suit }}</div>
@@ -9,8 +9,8 @@
 </div>
 {% endmacro %}
 
-{% macro draw_board(board, move_sequence=None, marker_pos=False, legal_moves=None, move_handler="sendMove") %}
-<div class="board">
+{% macro draw_board(board, move_sequence=None, marker_pos=False, legal_moves=None, move_handler="sendMove", placement=False) %}
+<div class="board{% if placement %} placement{% endif %}">
     {% for row in board %}
         {% set row_index = loop.index0 %}
         {% for card in row %}
@@ -18,11 +18,11 @@
             {% set marker = (row_index, col_index) == marker_pos %}
             {% set display_card = card if not move_sequence else (None if ((row_index, col_index) in move_sequence) else card) %}
             {% if legal_moves and ((row_index, col_index) in legal_moves) %}
-            <button type="button" class="cell-button" onclick="{{ move_handler }}({{ row_index }}, {{ col_index }})" aria-label="Move to row {{ row_index }}, column {{ col_index }}">
+            <button type="button" class="cell-button{% if placement %} place-target{% endif %}" onclick="{{ move_handler }}({{ row_index }}, {{ col_index }})" aria-label="{% if placement %}Place marker on{% else %}Move to{% endif %} row {{ row_index }}, column {{ col_index }}">
                 {{ draw_card(display_card, marker=marker) }}
             </button>
             {% else %}
-                {{ draw_card(display_card, marker=marker) }}
+                {{ draw_card(display_card, marker=marker, dimmed=placement) }}
             {% endif %}
         {% endfor %}
     {% endfor %}

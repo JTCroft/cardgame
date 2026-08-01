@@ -409,6 +409,10 @@ class ProbEval(Counter):
 
 class Game:
     starting_position = (2, 2)
+    # The marker may be placed on any of the four central face-down cards
+    # (the non-first player chooses). Sorted, so each cell's index is a
+    # stable token in the save string.
+    _valid_starting_positions = ((2, 2), (2, 3), (3, 2), (3, 3))
     possible_moves = {
         (i, j): (
             ({(i, j2) for j2 in range(6)} | {(i2, j) for i2 in range(6)}) - {(i, j)}
@@ -418,17 +422,48 @@ class Game:
     }
     template = env.get_template("game.html.jinja2")
 
-    def __init__(self, board, moves):
+    def __init__(self, board, moves, start=starting_position):
         self.board = board
         self.moves = moves
+        # The cell the marker was placed on, or None if it hasn't been
+        # placed yet. Constant across a game's lineage; _child carries it to
+        # every descendant so move/undo never have to mention it.
+        self.start = start
 
     @classmethod
-    def deal(cls):
-        return cls(Board.deal(), tuple())
+    def deal(cls, marker=starting_position):
+        # marker=None deals the board with no marker placed yet; call
+        # place_marker to choose a starting cell before play begins.
+        if marker is not None and marker not in cls._valid_starting_positions:
+            raise ValueError("Invalid starting position")
+        return cls(Board.deal(), tuple(), start=marker)
+
+    def place_marker(self, row, col):
+        """Place the marker on one of the central face-down cards to start
+        the game. Only valid before it has been placed; the card is not
+        collected (it's revealed only if a move lands on it later)."""
+        if self.start is not None or self.moves:
+            raise ValueError("The marker has already been placed")
+        if (row, col) not in self._valid_starting_positions:
+            raise ValueError("The marker must start on a central face-down card")
+        return self.__class__(self.board, self.moves, start=(row, col))
+
+    def clear_marker(self):
+        """Undo a marker placement, returning to the unplaced board. Only
+        valid before any move (placement changes nothing but `start`, so
+        this is lossless); used when the seat that placed it changes hands."""
+        if self.moves:
+            raise ValueError("Cannot clear the marker once play has begun")
+        return self.__class__(self.board, self.moves, start=None)
+
+    def _child(self, board, moves):
+        # Every descendant of a game inherits its marker start; this is the
+        # single place that carries it forward, so move/undo never mention it.
+        return self.__class__(board, moves, start=self.start)
 
     @property
     def marker(self):
-        return self.moves[-1] if self.moves else self.starting_position
+        return self.moves[-1] if self.moves else self.start
 
     @property
     def _taken_masks(self):
@@ -455,7 +490,12 @@ class Game:
             return self._legal_moves_cache
         except AttributeError:
             pass
-        row, col = self.moves[-1] if self.moves else self.starting_position
+        marker = self.moves[-1] if self.moves else self.start
+        if marker is None:
+            # No marker placed yet - place_marker must be called first.
+            self._legal_moves_cache = frozenset()
+            return self._legal_moves_cache
+        row, col = marker
         rows, cols = self._taken_masks
         # The marker's own bits are forced on so the root marker (whose
         # starting cell was never taken) excludes itself like any other.
@@ -484,11 +524,11 @@ class Game:
         masks = (rows | 1 << (row * 6 + col), cols | 1 << (col * 6 + row))
         if self.board[row][col].facedown:
             children = tuple(
-                self.__class__(new_board, new_moves)
+                self._child(new_board, new_moves)
                 for new_board in self.board.resolve(row, col)
             )
         else:
-            children = (self.__class__(self.board, new_moves),)
+            children = (self._child(self.board, new_moves),)
         for child in children:
             child._taken_masks_cache = masks
         return children
@@ -524,12 +564,19 @@ class Game:
         return self.get_hand(slice(1, None, 2))
 
     @property
+    def needs_marker(self):
+        # Dealt but not yet placed: place_marker must be called before play.
+        return self.marker is None
+
+    @property
     def is_p1_turn(self):
         return bool(self.legal_moves and (len(self.moves) % 2 == 0))
 
     @property
     def is_p2_turn(self):
-        return bool(self.legal_moves and (len(self.moves) % 2))
+        # Player 2 also acts during the placement phase - they choose the
+        # marker's starting cell before Player 1 makes the first move.
+        return self.needs_marker or bool(self.legal_moves and (len(self.moves) % 2))
 
     def _repr_html_(self):
         return self.template.render(game=self)
@@ -556,7 +603,7 @@ class Game:
             )
         else:
             board = self.board
-        return self.__class__(board, tuple(self.moves[:-number_of_moves]))
+        return self._child(board, tuple(self.moves[:-number_of_moves]))
 
     @property
     def taken_card(self):
@@ -786,30 +833,37 @@ class Game:
         }
 
     def save(self, alnum=False):
+        # Format: "<board>//<start><moves>". <start> is one digit, the index
+        # of the marker's starting cell in _valid_starting_positions, and
+        # each <moves> digit indexes the taken cell in the sorted possible
+        # moves from the previous marker. An unplaced game has no marker, so
+        # the trailing section is empty.
         board_str = self.board.save(alnum=alnum)
+        if self.start is None:
+            return f"{board_str}//"
         ordered_poss_moves = {
             marker: sorted(moves) for marker, moves in self.possible_moves.items()
         }
         move_ind = [
             str(ordered_poss_moves[marker].index(move))
-            for marker, move in zip(
-                (self.starting_position,) + self.moves[:-1], self.moves
-            )
+            for marker, move in zip((self.start,) + self.moves[:-1], self.moves)
         ]
-        moves_str = "".join(move_ind)
-        return f"{board_str}//{moves_str}"
+        start_ind = str(self._valid_starting_positions.index(self.start))
+        return f"{board_str}//{start_ind}{''.join(move_ind)}"
 
     @classmethod
     def load(cls, save):
-        board, moves = save.rsplit("//", maxsplit=1)
+        board, section = save.rsplit("//", maxsplit=1)
         board = Board.load(board)
+        if not section:
+            return cls(board, tuple(), start=None)
         ordered_poss_moves = {
             marker: sorted(moves) for marker, moves in cls.possible_moves.items()
         }
-        move_indexes = [int(move) for move in moves]
-        position = cls.starting_position
+        start = cls._valid_starting_positions[int(section[0])]
+        position = start
         moves_list = []
-        for move_index in move_indexes:
-            position = ordered_poss_moves[position][move_index]
+        for char in section[1:]:
+            position = ordered_poss_moves[position][int(char)]
             moves_list.append(position)
-        return cls(board, tuple(moves_list))
+        return cls(board, tuple(moves_list), start=start)
