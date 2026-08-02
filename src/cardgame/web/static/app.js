@@ -291,7 +291,23 @@
         applyActiveHand();
         applyAnalysisTimer();
         suppressBoardHover();
+        applySpectatorBadge();
     });
+
+    // Surface the spectating indicator in the sticky nav (its label is carried
+    // by a hidden element in the state fragment), so it never takes vertical
+    // space above the board and disturb the fit-to-height scaling.
+    function applySpectatorBadge() {
+        const badge = document.getElementById("spectator-badge");
+        if (!badge) return;
+        const src = document.getElementById("spectator-status");
+        if (src) {
+            badge.textContent = src.dataset.label;
+            badge.hidden = false;
+        } else {
+            badge.hidden = true;
+        }
+    }
     socket.on("disconnect", () => {
         const el = document.getElementById("flash-container");
         if (el) el.innerHTML = "<div class=\"flash\">Connection lost, trying to reconnect...</div>";

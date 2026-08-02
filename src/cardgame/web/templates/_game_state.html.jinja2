@@ -22,8 +22,11 @@
     {% endif %}
 {% endmacro %}
 
+{# The spectating indicator is surfaced in the sticky nav (see
+   applySpectatorBadge in app.js) rather than above the board, so it never eats
+   into the board's fit-to-height budget. This just carries the label. #}
 {% if is_spectator and not review %}
-<div class="role-badge">Spectating ({{ seats_taken }}/2 seated)</div>
+<span id="spectator-status" data-label="Spectating ({{ seats_taken }}/2 seated)" hidden></span>
 {% endif %}
 
 {# Whether the *currently displayed* position is terminal - not the same as
@@ -50,14 +53,14 @@
                 </span>
                 {% if my_seat == 1 %}
                     {% if not seats_locked and not vs_computer %}
-                        <button type="button" class="small" onclick="leaveSeat()">Leave seat</button>
+                        <button type="button" class="small" onclick="leaveSeat()">Leave</button>
                     {% endif %}
                 {% elif p1_seated and p1_disconnected and not vs_computer %}
                     <button type="button" class="small" onclick="kickSeat(1)">Kick</button>
                 {% elif p1_seated and my_seat == 2 and not game_started %}
                     <button type="button" class="small" onclick="swapSeats()">Swap</button>
                 {% elif is_spectator and not p1_seated %}
-                    <button type="button" class="small" onclick="claimSeat(1)">Join as Player 1</button>
+                    <button type="button" class="small" onclick="claimSeat(1)">Join</button>
                 {% endif %}
             </div>
             {{ macros.draw_hand(game.p1, highlight_card=taken_card) }}
@@ -76,7 +79,7 @@
                 {% elif p2_seated and my_seat == 1 and not game_started %}
                     <button type="button" class="small" onclick="swapSeats()">Swap</button>
                 {% elif is_spectator and not p2_seated %}
-                    <button type="button" class="small" onclick="claimSeat(2)">Join as Player 2</button>
+                    <button type="button" class="small" onclick="claimSeat(2)">Join</button>
                 {% endif %}
             </div>
             {{ macros.draw_hand(game.p2, highlight_card=taken_card) }}

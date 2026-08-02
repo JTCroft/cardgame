@@ -20,6 +20,27 @@
     .page:has(.game-container) {
         max-width: none;
     }
+    /* Centre the whole game as one shrink-wrapped block (board + hands, plus
+       the history/analysis controls below the board). Because it's a single
+       centred column, the board's left edge and those controls' left edge
+       stay aligned - the controls sit directly under the board rather than
+       drifting to the page edge. */
+    #game-state {
+        /* Single scale for the whole desktop game: cell width in px, capped at
+           100 (max size) and otherwise shrunk so the ~9.5-cell-tall board fits
+           the viewport height, or the ~9.58-cell-wide board+max-hand fits the
+           width. Defined here (not on .game-container) so the below-board
+           history/analysis controls, which are siblings of .game-container,
+           inherit it too. Vertical budget = viewport - sticky nav (--nav-h)
+           - 70px: the top gap above the board is 35px (20px page padding +
+           15px .game-container margin), and 70 reserves the same 35px again
+           below so the board isn't flush to the viewport bottom. Horizontal
+           budget subtracts 40px. See the mobile @media thresholds - these same
+           numbers at the 65px minimum. */
+        --cell: min(100px, (100dvh - var(--nav-h) - 70px) / 9.5, (100vw - 40px) / 9.58);
+        width: fit-content;
+        margin-inline: auto;
+    }
     .site-nav {
         /* Sticky so it stays put while the page scrolls; its height (--nav-h)
            is reserved in the board's --cell height budget. Still a positioning
@@ -124,6 +145,8 @@
         border-radius: 6px;
         margin-bottom: 15px;
     }
+    /* Spectating indicator - lives inline in the sticky nav (see
+       #spectator-badge in base.html), toggled via the hidden attribute. */
     .role-badge {
         display: inline-block;
         background: #262626;
@@ -131,8 +154,9 @@
         font-size: 0.85em;
         padding: 4px 12px;
         border-radius: 999px;
-        margin-bottom: 12px;
     }
+    /* Guard the hidden attribute against the display:inline-block above. */
+    .role-badge[hidden] { display: none; }
     button, .button {
         font-size: 1em;
         padding: 8px 16px;
@@ -224,7 +248,8 @@
         align-items: center;
         gap: 10px;
         margin: 10px 0;
-        width: 650px;
+        /* Match the (scaled) board width so it sits under the board. */
+        width: calc(var(--cell) * 6.5);
         max-width: 100%;
     }
     .history-count {
@@ -234,7 +259,8 @@
         white-space: nowrap;
     }
     .move-analysis {
-        width: 650px;
+        /* Match the (scaled) board width so it sits under the board. */
+        width: calc(var(--cell) * 6.5);
         max-width: 100%;
         margin: 10px 0;
         background: #2b2b2b;
@@ -359,19 +385,11 @@
     .rematch-controls-mobile { display: none; }
 
     .game-container {
-        /* Single scale for the whole desktop game: cell width in px, capped at
-           100 (max size) and otherwise shrunk so the ~9.5-cell-tall board fits
-           the viewport height, or the ~9.58-cell-wide board+max-hand fits the
-           width. Everything below (board grid, cards, hand fan) derives from
-           it, so the board scales to fit rather than forcing vertical scroll.
-           Vertical budget = viewport - sticky nav (--nav-h) - 36px (page
-           padding + breathing); horizontal budget subtracts 40px of padding.
-           See the mobile @media thresholds, which are these same numbers at
-           the 65px minimum. */
-        --cell: min(100px, (100dvh - var(--nav-h) - 36px) / 9.5, (100vw - 40px) / 9.58);
+        /* --cell (the board/card/hand scale) is defined on #game-state so the
+           below-board controls inherit it too; everything here derives from
+           it. */
         display: flex;
         align-items: flex-start;
-        justify-content: center;
         gap: calc(var(--cell) * 0.4);
         margin: 15px 0;
         /* No wrapping in desktop mode - the board + hands are sized to fit
@@ -683,9 +701,9 @@
        desktop board scales down to fit the height (see --cell on
        .game-container), so the mobile view is only needed once a card would
        shrink below ~65px on either axis. The thresholds derive from that
-       minimum: width 663 = 9.58*65 + 40, height 710 = 9.5*65 + 92 (nav 56 +
-       36), matching the coefficients and chrome budget used by --cell. */
-    @media (max-width: 663px), (max-height: 710px) {
+       minimum: width 663 = 9.58*65 + 40, height 744 = 9.5*65 + 126 (nav 56 +
+       70), matching the coefficients and chrome budget used by --cell. */
+    @media (max-width: 663px), (max-height: 744px) {
         /* The hand panel is now permanently shown (see applyActiveHand()),
            not a drawer you tap open, so it costs board space the whole
            time you're playing - claw some of that back from the page's
