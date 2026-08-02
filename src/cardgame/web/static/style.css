@@ -718,6 +718,10 @@
            top padding rather than shrinking the board itself, and reserve
            room at the bottom so it doesn't sit on top of the board. */
         .page { padding-top: 8px; padding-bottom: 246px; }
+        /* Not shrink-wrapped on mobile (the desktop centring trick): a definite
+           full width means wide content - the move-comparison table - scrolls
+           inside its own overflow-x container instead of stretching the page. */
+        #game-state { width: auto; }
         /* .hands collapses (display:contents), so the history stepper it holds
            becomes a game-container child - let it wrap onto its own line below
            the board rather than sitting beside it. */
@@ -836,11 +840,31 @@
             z-index: 500;
         }
         .mobile-hand-tabs button {
-            flex: 1;
+            flex: 1 1 0;
+            min-width: 0;    /* shrink below content so the name can ellipsis */
+            max-width: 50%;  /* never wider than half the screen, long name or not */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
             border-radius: 0;
             border: none;
             border-top: 1px solid #666;
             padding: 12px 6px;
+        }
+        /* Only the name truncates; the turn dot, score and Winner badge always
+           stay visible (the badge is the priority). */
+        .mobile-hand-tabs .tab-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+            flex: 0 1 auto;
+        }
+        .mobile-hand-tabs .turn-slot,
+        .mobile-hand-tabs .tab-score,
+        .mobile-hand-tabs .winner-tag {
+            flex: none;
         }
         .mobile-hand-tabs button.active {
             background: #5a5a5a;

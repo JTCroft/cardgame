@@ -216,10 +216,10 @@
 
 <div class="mobile-hand-tabs">
     <button type="button" id="hand-tab-1" onclick="selectHand(1)">
-        <span class="turn-slot">{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% endif %}</span>{{ p1_name or "Player 1" }} ({{ game.p1.score() }}){% if position_over and winner == 1 %} <span class="winner-tag">Winner</span>{% endif %}
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% endif %}</span><span class="tab-name">{{ p1_name or "Player 1" }}</span><span class="tab-score">({{ game.p1.score() }})</span>{% if position_over and winner == 1 %}<span class="winner-tag">Winner</span>{% endif %}
     </button>
     <button type="button" id="hand-tab-2" onclick="selectHand(2)">
-        <span class="turn-slot">{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% endif %}</span>{{ p2_name or "Player 2" }} ({{ game.p2.score() }}){% if position_over and winner == 2 %} <span class="winner-tag">Winner</span>{% endif %}
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% endif %}</span><span class="tab-name">{{ p2_name or "Player 2" }}</span><span class="tab-score">({{ game.p2.score() }})</span>{% if position_over and winner == 2 %}<span class="winner-tag">Winner</span>{% endif %}
     </button>
 </div>
 
