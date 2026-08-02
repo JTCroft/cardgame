@@ -49,7 +49,7 @@
         <div class="hand-slot" id="hand-slot-1">
             <div class="seat-header">
                 <span class="hand-label">
-                    {{ p1_name or "Player 1" }}{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="trophy">&#127942;</span>{% endif %}
+                    {{ p1_name or "Player 1" }}{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="winner-tag">Winner</span>{% endif %}
                 </span>
                 {% if my_seat == 1 %}
                     {% if not seats_locked and not vs_computer %}
@@ -68,7 +68,7 @@
         <div class="hand-slot" id="hand-slot-2">
             <div class="seat-header">
                 <span class="hand-label">
-                    {{ p2_name or "Player 2" }}{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="trophy">&#127942;</span>{% endif %}
+                    {{ p2_name or "Player 2" }}{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="winner-tag">Winner</span>{% endif %}
                 </span>
                 {% if my_seat == 2 %}
                     {% if not seats_locked and not vs_computer %}
@@ -85,26 +85,21 @@
             {{ macros.draw_hand(game.p2, highlight_card=taken_card) }}
         </div>
         {% if game_over %}
-        {# Desktop only - underneath player 2's hand, where it sits in the
-           .hands column. Mobile gets its own copy below the history
-           stepper instead, since .hands collapses to a fixed drawer there
-           and this position wouldn't make sense. #}
-        <div class="rematch-controls rematch-controls-desktop">
-            {{ rematch_controls() }}
+        {# The history stepper lives below the hands here (right column) on
+           desktop; on mobile .hands collapses and it wraps to its own line
+           below the board (see the @media rules). #}
+        <div class="history-stepper">
+            <button type="button" onclick="historyGoto(0)" {% if history_index == 0 %}disabled{% endif %} aria-label="Go to start">|&lt;</button>
+            <button type="button" onclick="historyStep(-1)" {% if history_index == 0 %}disabled{% endif %} aria-label="Previous move">&lt;</button>
+            <span class="history-count">{{ history_index }} / {{ history_total }}</span>
+            <button type="button" onclick="historyStep(1)" {% if history_index == history_total %}disabled{% endif %} aria-label="Next move">&gt;</button>
+            <button type="button" onclick="historyGoto({{ history_total }})" {% if history_index == history_total %}disabled{% endif %} aria-label="Go to end">&gt;|</button>
         </div>
         {% endif %}
     </div>
 </div>
 
 {% if game_over %}
-<div class="history-stepper">
-    <button type="button" onclick="historyGoto(0)" {% if history_index == 0 %}disabled{% endif %} aria-label="Go to start">|&lt;</button>
-    <button type="button" onclick="historyStep(-1)" {% if history_index == 0 %}disabled{% endif %} aria-label="Previous move">&lt;</button>
-    <span class="history-count">{{ history_index }} / {{ history_total }}</span>
-    <button type="button" onclick="historyStep(1)" {% if history_index == history_total %}disabled{% endif %} aria-label="Next move">&gt;</button>
-    <button type="button" onclick="historyGoto({{ history_total }})" {% if history_index == history_total %}disabled{% endif %} aria-label="Go to end">&gt;|</button>
-</div>
-
 {% if move_analysis %}
 <div class="move-analysis">
     {% if move_analysis.calculable %}
@@ -212,23 +207,19 @@
 </div>
 {% endif %}
 
-{% if play_from_state %}
-<div class="play-from">
-    <a class="button" href="/play-from/{{ play_from_state }}">Play from here</a>
-</div>
-{% endif %}
-
-<div class="rematch-controls rematch-controls-mobile">
+{# New game + Play from here, centred below the move-comparison box. #}
+<div class="game-over-actions">
     {{ rematch_controls() }}
+    {% if play_from_state %}<a class="button" href="/play-from/{{ play_from_state }}">Play from here</a>{% endif %}
 </div>
 {% endif %}
 
 <div class="mobile-hand-tabs">
     <button type="button" id="hand-tab-1" onclick="selectHand(1)">
-        <span class="turn-slot">{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 1 %}<span class="trophy">&#127942;</span>{% endif %}</span>{{ p1_name or "Player 1" }} ({{ game.p1.score() }})
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p1_turn %}<span class="turnmarker"></span>{% endif %}</span>{{ p1_name or "Player 1" }} ({{ game.p1.score() }}){% if position_over and winner == 1 %} <span class="winner-tag">Winner</span>{% endif %}
     </button>
     <button type="button" id="hand-tab-2" onclick="selectHand(2)">
-        <span class="turn-slot">{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% elif position_over and winner == 2 %}<span class="trophy">&#127942;</span>{% endif %}</span>{{ p2_name or "Player 2" }} ({{ game.p2.score() }})
+        <span class="turn-slot">{% if both_seated and not position_over and game.is_p2_turn %}<span class="turnmarker"></span>{% endif %}</span>{{ p2_name or "Player 2" }} ({{ game.p2.score() }}){% if position_over and winner == 2 %} <span class="winner-tag">Winner</span>{% endif %}
     </button>
 </div>
 

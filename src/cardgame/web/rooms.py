@@ -995,6 +995,20 @@ def _get_or_create_room(code, solo=False):
         return room
 
 
+def _deal_fresh_locked(room):
+    """Reset a room to a brand-new dealt game (marker unplaced). Caller holds
+    room.lock. Clears the per-game rematch / history / analysis state that must
+    not carry over. Shared by the rematch handlers and the solo new-game path."""
+    room.game = Game.deal(marker=None)
+    room.game_id = secrets.token_hex(8)
+    room.rematch_requested_by = None
+    room.history_index.clear()
+    room.game_over_seen.clear()
+    room.analysis = None
+    room.analysis_inflight = set()
+    room.analysis_calc_started = {}
+
+
 def _random_unused_code():
     while True:
         code = "".join(random.choices(string.ascii_uppercase, k=4))
@@ -1584,6 +1598,11 @@ def _room_summary_locked(code, room):
     return {
         "code": code,
         "is_solo": room.computer_seat is not None,
+        # A multiplayer room with a free seat is joinable; once both are taken
+        # (even before the first move, while placing the marker) it's spectate
+        # only. Drives the lobby's Join vs Spectate label - "waiting for
+        # players" (no moves yet) is NOT the same as "has a free seat".
+        "has_open_seat": room.computer_seat is None and len(room.seats) < 2,
         "has_moves": game_started,
         "p1_name": room.name_for_seat(1),
         "p2_name": room.name_for_seat(2),

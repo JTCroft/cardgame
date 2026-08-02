@@ -186,6 +186,10 @@
         return withIdentity(Object.assign(targetFields(), data));
     }
 
+    // Only the first join of this page load is a genuine "I came here to play"
+    // intent (the `start` flag driving the solo resume/new-game flow); later
+    // joins are socket reconnects, which must just resume the game in progress.
+    let firstJoin = true;
     socket.on("connect", () => {
         // Clear any "Connection lost" flash left over from a prior drop.
         const flash = document.getElementById("flash-container");
@@ -195,7 +199,11 @@
         // actually a vacant seat to claim - so it's fine to always route
         // through requireNameThen() here: the server simply won't ask for
         // one in the cases that don't need it.
-        if (ROOM_KEY || REVIEW_ENTRY_ID) requireNameThen("join", targetFields());
+        if (ROOM_KEY || REVIEW_ENTRY_ID) {
+            const extra = firstJoin ? { start: true } : {};
+            firstJoin = false;
+            requireNameThen("join", Object.assign(targetFields(), extra));
+        }
         // The seed only applies to the first join; drop it (and scrub it from
         // the address bar) so a reconnect - or a refresh - resumes the game
         // in progress instead of resetting it back to the loaded position.
@@ -320,6 +328,37 @@
         const el = document.getElementById("game-over-modal");
         if (el) el.classList.remove("open");
     }
+
+    // Solo resume/new-game prompt. The server sends "solo_prompt" when a "start"
+    // intent landed on a game in progress (see handle_join): show the current
+    // game with a choice to Resume or start the new action. A bare payload means
+    // Play (New game); one carrying a load_state means Play-from-here (Start from
+    // this position). Both confirm by re-joining with force so the server starts
+    // fresh; Resume just dismisses.
+    function closeResumeModal() {
+        document.getElementById("resume-modal").classList.remove("open");
+    }
+    function openResumeModal(newLabel, onNew) {
+        const btn = document.getElementById("resume-modal-new");
+        btn.textContent = newLabel;
+        btn.onclick = () => {
+            closeResumeModal();
+            onNew();
+        };
+        document.getElementById("resume-modal").classList.add("open");
+    }
+    socket.on("solo_prompt", (payload) => {
+        const loadState = payload && payload.load_state;
+        if (loadState) {
+            openResumeModal("Start from this position", () => {
+                socket.emit("join", withIdentity({ code: ROOM_KEY, start: true, force: true, load_state: loadState }));
+            });
+        } else {
+            openResumeModal("New game", () => {
+                socket.emit("join", withIdentity({ code: ROOM_KEY, start: true, force: true }));
+            });
+        }
+    });
     // Mobile hand panel: exactly one player's hand is shown at a time, as a
     // persistent toggle rather than a drawer that auto-closes - selection
     // lives only here in JS, so it has to be re-applied every time a

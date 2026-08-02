@@ -171,9 +171,6 @@
         display: inline-block;
         text-decoration: none;
     }
-    .play-from {
-        margin: 12px 0;
-    }
     button:hover, .button:hover {
         background: #5a5a5a;
     }
@@ -242,16 +239,18 @@
         flex-wrap: wrap;
     }
 
+    /* Sits below the hands (right column) at game over. Scales off --cell
+       (font + em-based padding/gap) so it stays on a single row and fits the
+       hands' width at every desktop size, rather than wrapping or overflowing. */
     .history-stepper {
         display: flex;
         justify-content: center;
         align-items: center;
-        gap: 10px;
+        gap: 0.4em;
         margin: 10px 0;
-        /* Match the (scaled) board width so it sits under the board. */
-        width: calc(var(--cell) * 6.5);
-        max-width: 100%;
+        font-size: calc(var(--cell) * 0.16);
     }
+    .history-stepper button { padding: 0.35em 0.6em; }
     .history-count {
         display: inline-block;
         min-width: 4.5em;
@@ -372,17 +371,18 @@
         font-size: 0.8em;
         color: #bbb;
     }
-    .rematch-controls {
+    /* New game + Play from here, centred (relative to the move-comparison box
+       above it, so it shares the board's width). */
+    .game-over-actions {
         display: flex;
+        justify-content: center;
         align-items: center;
-        gap: 8px;
+        gap: 12px;
         flex-wrap: wrap;
-        margin: 10px 0;
+        margin: 12px 0;
+        width: calc(var(--cell) * 6.5);
+        max-width: 100%;
     }
-    /* Two copies of the same controls (see _game_state.html.jinja2) so they
-       can sit in different spots on desktop vs. mobile without JS - only
-       one is ever visible at a time. */
-    .rematch-controls-mobile { display: none; }
 
     .game-container {
         /* --cell (the board/card/hand scale) is defined on #game-state so the
@@ -403,16 +403,10 @@
     .hands {
         display: flex;
         flex-direction: column;
+        align-items: center;
         gap: 30px;
-        /* The fanned cards inside are absolutely positioned, so they don't
-           contribute to this column's own width - but normal-flow content
-           like .rematch-controls-desktop's rematch-request text does, and
-           without a cap that text can grow the column wide enough to push
-           .game-container's flex-wrap into dropping the hands below the
-           board (see history around the 700px->900px breakpoint fix). Cap
-           it to the fan's own rough footprint so long text wraps in place
-           instead of stretching the layout. */
-        max-width: calc(var(--cell) * 2.7);
+        /* Sized by its widest child - the hand fan (a fixed-width .handarray)
+           during play, or the history stepper below it at game over. */
     }
     .seat-header {
         display: flex;
@@ -510,8 +504,22 @@
         margin-left: 0.2em;
         vertical-align: middle;
     }
-    .trophy {
-        margin-left: 0.3em;
+    /* Winner indicator: a compact gold pill next to the winning player's name.
+       Kept small (0.62em, tight line-height) so it stays within the name's
+       line box and never grows the header / shifts the hand below it. */
+    .winner-tag {
+        display: inline-block;
+        vertical-align: middle;
+        margin-left: 0.4em;
+        padding: 1px 7px;
+        background: #d4a017;
+        color: #241a00;
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        line-height: 1.4;
+        text-transform: uppercase;
+        border-radius: 999px;
     }
     .card.taken {
         border-color: transparent;
@@ -710,7 +718,10 @@
            top padding rather than shrinking the board itself, and reserve
            room at the bottom so it doesn't sit on top of the board. */
         .page { padding-top: 8px; padding-bottom: 246px; }
-        .game-container { justify-content: center; margin-top: 4px; }
+        /* .hands collapses (display:contents), so the history stepper it holds
+           becomes a game-container child - let it wrap onto its own line below
+           the board rather than sitting beside it. */
+        .game-container { justify-content: center; margin-top: 4px; flex-wrap: wrap; }
         .hands { display: contents; }
         .board {
             grid-template-columns: repeat(6, 40px);
@@ -731,9 +742,10 @@
             background-size: 44px 60px;
         }
         .history-stepper {
-            width: 260px;
-            margin: 10px auto;
+            flex-basis: 100%; /* full line below the board */
+            margin: 10px 0;
             gap: 4px;
+            font-size: 1rem; /* fixed here, not the desktop --cell scaling */
         }
         .history-stepper button {
             padding: 6px 8px;
@@ -754,12 +766,8 @@
         .outcome-heatmap-ticks {
             font-size: 0.6em;
         }
-        .rematch-controls-desktop { display: none; }
-        .rematch-controls-mobile {
-            display: flex;
-            justify-content: center;
-            width: 260px;
-            margin: 10px auto;
+        .game-over-actions {
+            width: auto;
         }
         .card {
             --w: 40px;
@@ -839,17 +847,15 @@
             border-top: 2px solid #7cb8ff;
         }
         /* Fixed-width slot, always rendered whether or not this player
-           currently has a turn/trophy indicator - keeps the name from
-           shifting sideways in the tab as the turn changes hands. */
+           currently has a turn indicator - keeps the name from shifting
+           sideways in the tab as the turn changes hands. (The Winner pill sits
+           after the name instead.) */
         .mobile-hand-tabs .turn-slot {
             display: inline-block;
             width: 1.1em;
             text-align: center;
         }
         .mobile-hand-tabs .turnmarker::after {
-            margin: 0;
-        }
-        .mobile-hand-tabs .trophy {
             margin: 0;
         }
         /* The tabs already carry the name, score and turn/trophy indicator

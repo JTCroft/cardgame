@@ -80,6 +80,7 @@ from .identity import _MAX_NAME_LENGTH, _normalize_player_id
 from .rooms import (
     _broadcast_state,
     create_solo_room_from_state,
+    _deal_fresh_locked,
     decode_game_state,
     _ensure_analysis_worker,
     _finished_rooms_lock,
@@ -360,31 +361,72 @@ def handle_join(data):
         return
 
     name = (data.get("name") or "").strip()[:_MAX_NAME_LENGTH]
-    # load_state names a "Play from here" position (see the play_from route
-    # and rooms.encode_game_state): seed the player's own solo room at it,
-    # replacing any game in progress, rather than resolving an existing room.
-    # The seat on the move is assigned to this player below, so the auto-seat
-    # step is a no-op and it's their turn from the off (see
-    # create_solo_room_from_state).
+    # Solo "start a new game" flow. Two one-shot flags from the client:
+    #   start - set only on the first join of a fresh page load (not on socket
+    #           reconnects), i.e. a genuine "I came here to play" intent.
+    #   force - set when the player confirmed the new action from the resume
+    #           prompt.
+    # load_state names a "Play from here" position (see the play_from route and
+    # rooms.encode_game_state) to seed a solo game from - an optional parameter
+    # to the same flow. Rather than silently replacing a game in progress, the
+    # server renders it and offers a Resume/new-game choice (solo_prompt),
+    # starting fresh only once confirmed. None of this touches
+    # multiplayer/spectate/review joins (is_own_solo is false for them).
+    start = bool(data.get("start"))
+    force = bool(data.get("force"))
     load_state = (data.get("load_state") or "").strip()
+    seed_game = None
     if load_state:
-        game = decode_game_state(load_state)
-        if game is None or not game.legal_moves:
+        seed_game = decode_game_state(load_state)
+        if seed_game is None or not seed_game.legal_moves:
             socketio.emit(
                 "error_message",
                 {"message": "That saved position could not be loaded."},
                 to=request.sid,
             )
             return
-        code, room = create_solo_room_from_state(player_id, game)
+
+    raw_code = data.get("code", "")
+    is_own_solo = _normalize_code(raw_code) is None and (
+        _normalize_player_id(raw_code) or player_id
+    ) == player_id
+
+    pending_prompt = None  # {load_state} -> emit solo_prompt after broadcasting
+    deal_fresh = False
+    if is_own_solo:
+        existing = _rooms.get(player_id)
+        in_progress = finished = False
+        if existing is not None and existing.computer_seat is not None:
+            with existing.lock:
+                finished = existing.game_over
+                in_progress = existing.game_started and not existing.game_over
+        if force and seed_game is not None:
+            code, room = create_solo_room_from_state(player_id, seed_game)
+        elif force:
+            code, room = player_id, _get_or_create_room(player_id, solo=True)
+            deal_fresh = True
+        elif start and in_progress:
+            # Don't clobber a game in progress - resume it and ask (below).
+            code, room = player_id, existing
+            pending_prompt = {"load_state": load_state or None}
+        elif start and finished and seed_game is None:
+            # Landing on a finished game via Play -> straight to a new one.
+            code, room = player_id, _get_or_create_room(player_id, solo=True)
+            deal_fresh = True
+        elif seed_game is not None:
+            code, room = create_solo_room_from_state(player_id, seed_game)
+        else:
+            code, room = player_id, _get_or_create_room(player_id, solo=True)
     else:
-        code, room, error = _resolve_or_create_room_for_join(data.get("code", ""), player_id)
+        code, room, error = _resolve_or_create_room_for_join(raw_code, player_id)
         if room is None:
             socketio.emit("error_message", {"message": error}, to=request.sid)
             return
 
     sid = request.sid
     with room.lock:
+        if deal_fresh:
+            _deal_fresh_locked(room)
         room.sid_players[sid] = player_id
         # Pick up this player's client-stored name (if any), in case they
         # set it while visiting a different room.
@@ -425,9 +467,14 @@ def handle_join(data):
         socketio.emit("need_name", {}, to=sid)
     else:
         _broadcast_state(code, room)
+        # A game was in progress and this was a "start" intent - render it, then
+        # let the player choose Resume vs the new action (see solo_prompt in
+        # app.js). Only ever sent to this joiner, never other viewers.
+        if pending_prompt is not None:
+            socketio.emit("solo_prompt", pending_prompt, to=sid)
     # A solo room's computer opponent in seat 2 places the marker as soon as
     # the human is seated (nothing else would trigger it before the human's
-    # first move).
+    # first move), and after a fresh deal above.
     _maybe_play_computer_move(code, room)
     _ensure_analysis_worker(code, room)
     _broadcast_lobby()
@@ -861,24 +908,10 @@ def handle_request_rematch(data):
         if room.computer_seat is not None:
             # The computer always accepts immediately - there's no one to
             # ask, and no point waiting.
-            room.game = Game.deal(marker=None)
-            room.game_id = secrets.token_hex(8)
-            room.rematch_requested_by = None
-            room.history_index.clear()
-            room.game_over_seen.clear()
-            room.analysis = None
-            room.analysis_inflight = set()
-            room.analysis_calc_started = {}
+            _deal_fresh_locked(room)
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
-            room.game = Game.deal(marker=None)
-            room.game_id = secrets.token_hex(8)
-            room.rematch_requested_by = None
-            room.history_index.clear()
-            room.game_over_seen.clear()
-            room.analysis = None
-            room.analysis_inflight = set()
-            room.analysis_calc_started = {}
+            _deal_fresh_locked(room)
         else:
             room.rematch_requested_by = player_id
 
@@ -911,13 +944,7 @@ def handle_respond_rematch(data):
         if room.rematch_requested_by is None or room.rematch_requested_by == player_id:
             return  # nothing to respond to, or you're the one who asked
         if accept:
-            room.game = Game.deal(marker=None)
-            room.game_id = secrets.token_hex(8)
-            room.history_index.clear()
-            room.game_over_seen.clear()
-            room.analysis = None
-            room.analysis_inflight = set()
-            room.analysis_calc_started = {}
+            _deal_fresh_locked(room)
         room.rematch_requested_by = None
 
     _broadcast_state(code, room)

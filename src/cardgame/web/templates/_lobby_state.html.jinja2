@@ -23,7 +23,7 @@
             <td>{{ game.status }}</td>
             <td>{{ game.spectators }}</td>
             <td>
-                <a class="button" href="{{ url_for('spectate_solo', player_id=game.code) if game.is_solo else url_for('room_view', code=game.code) }}">{{ "Join" if (not game.is_solo and game.status == "waiting for players") else "Spectate" }}</a>
+                <a class="button" href="{{ url_for('spectate_solo', player_id=game.code) if game.is_solo else url_for('room_view', code=game.code) }}">{{ "Join" if game.has_open_seat else "Spectate" }}</a>
             </td>
         </tr>
         {% endfor %}

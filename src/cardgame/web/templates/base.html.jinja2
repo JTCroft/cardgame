@@ -87,6 +87,19 @@
     </div>
 </div>
 
+<!-- Solo "start a new game while one's in progress" prompt. The second button's
+     label + action are set by app.js (New game, or Start from this position). -->
+<div id="resume-modal" class="modal-backdrop">
+    <div class="modal">
+        <h3>Game in progress</h3>
+        <p id="resume-modal-text">You have a game in progress.</p>
+        <div class="modal-actions">
+            <button type="button" onclick="closeResumeModal()">Resume</button>
+            <button type="button" id="resume-modal-new">New game</button>
+        </div>
+    </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 {% block scripts %}{% endblock %}
