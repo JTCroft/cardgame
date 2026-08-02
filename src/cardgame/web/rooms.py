@@ -1541,6 +1541,12 @@ def _maybe_play_computer_move(code, room):
             ):
                 return
             if placing:
+                # Re-check the placement preconditions under the lock: a seat
+                # swap during the think can hand seat 2 (the placer) to the
+                # human, in which case the computer must not place after all.
+                # (The turn re-check below is the move-branch equivalent.)
+                if not room.both_seated or room.computer_seat != 2:
+                    return
                 room.game = room.game.place_marker(*placement)
             else:
                 if room.current_turn_seat != room.computer_seat:

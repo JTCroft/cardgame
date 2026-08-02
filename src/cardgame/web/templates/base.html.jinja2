@@ -25,9 +25,7 @@
         <a href="{{ url_for('index') }}">Home</a>
         <a href="{{ url_for('rooms_view') }}">Room List</a>
         <a href="{{ url_for('how_to_play') }}">How to Play</a>
-        <button type="button" onclick="closeNavMenu(); openNameModal();">
-            <span id="current-name-label">Set name</span>
-        </button>
+        <button type="button" onclick="closeNavMenu(); openSettingsModal();">Settings</button>
         <span class="nav-version">v{{ app_version }}</span>
     </div>
 </nav>
@@ -36,6 +34,8 @@
     {% block content %}{% endblock %}
 </div>
 
+<!-- Standalone name prompt: shown when the server needs a name (e.g. joining
+     a room), separate from the Settings modal below. -->
 <div id="name-modal" class="modal-backdrop">
     <div class="modal">
         <h3>Choose a display name</h3>
@@ -44,6 +44,44 @@
         <div class="modal-actions">
             <button type="button" onclick="submitName()">Save</button>
             <button type="button" onclick="closeNameModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Settings: display name + card-back appearance, opened from the nav menu. -->
+<div id="settings-modal" class="modal-backdrop">
+    <div class="modal settings-modal">
+        <button type="button" class="modal-close" onclick="closeSettingsModal()" aria-label="Close">&times;</button>
+        <h3>Settings</h3>
+
+        <div class="settings-section">
+            <label class="settings-legend" for="settings-name-input">Display name</label>
+            <div class="settings-name-row">
+                <input type="text" id="settings-name-input" maxlength="24" placeholder="Your name">
+            </div>
+        </div>
+
+        <div class="settings-section">
+            <span class="settings-legend">Card back</span>
+            <p class="settings-hint">How face-down cards look to you.</p>
+            <div class="back-grid" id="back-grid">
+                <button type="button" class="back-cell card facedown bk-red pat-stripes" data-color="red" data-pattern="stripes" aria-label="Red, stripes"></button>
+                <button type="button" class="back-cell card facedown bk-red pat-crosshatch" data-color="red" data-pattern="crosshatch" aria-label="Red, crosshatch"></button>
+                <button type="button" class="back-cell card facedown bk-red pat-gradient" data-color="red" data-pattern="gradient" aria-label="Red, gradient"></button>
+                <button type="button" class="back-cell card facedown bk-red pat-plain" data-color="red" data-pattern="plain" aria-label="Red, plain"></button>
+                <button type="button" class="back-cell card facedown bk-green pat-stripes" data-color="green" data-pattern="stripes" aria-label="Green, stripes"></button>
+                <button type="button" class="back-cell card facedown bk-green pat-crosshatch" data-color="green" data-pattern="crosshatch" aria-label="Green, crosshatch"></button>
+                <button type="button" class="back-cell card facedown bk-green pat-gradient" data-color="green" data-pattern="gradient" aria-label="Green, gradient"></button>
+                <button type="button" class="back-cell card facedown bk-green pat-plain" data-color="green" data-pattern="plain" aria-label="Green, plain"></button>
+                <button type="button" class="back-cell card facedown bk-blue pat-stripes" data-color="blue" data-pattern="stripes" aria-label="Blue, stripes"></button>
+                <button type="button" class="back-cell card facedown bk-blue pat-crosshatch" data-color="blue" data-pattern="crosshatch" aria-label="Blue, crosshatch"></button>
+                <button type="button" class="back-cell card facedown bk-blue pat-gradient" data-color="blue" data-pattern="gradient" aria-label="Blue, gradient"></button>
+                <button type="button" class="back-cell card facedown bk-blue pat-plain" data-color="blue" data-pattern="plain" aria-label="Blue, plain"></button>
+            </div>
+        </div>
+
+        <div class="modal-actions">
+            <button type="button" onclick="saveSettings()">Done</button>
         </div>
     </div>
 </div>

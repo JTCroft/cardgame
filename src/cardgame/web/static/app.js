@@ -42,8 +42,6 @@
     let lastAction = null;
     let pendingAction = null;
 
-    document.getElementById("current-name-label").textContent = getPlayerName() || "Set name";
-
     function toggleNavMenu() {
         document.getElementById("nav-menu").classList.toggle("open");
     }
@@ -57,6 +55,7 @@
         closeNavMenu();
     });
 
+    // Standalone name prompt (used for the server's "need_name" flow).
     function openNameModal() {
         document.getElementById("name-modal-input").value = getPlayerName();
         document.getElementById("name-modal").classList.add("open");
@@ -66,12 +65,63 @@
         document.getElementById("name-modal").classList.remove("open");
     }
     function submitName() {
-        const input = document.getElementById("name-modal-input");
-        const name = input.value.trim();
+        saveName(document.getElementById("name-modal-input").value);
+    }
+
+    // Settings modal (name + card back), opened from the nav menu.
+    function openSettingsModal() {
+        document.getElementById("settings-name-input").value = getPlayerName();
+        applyCardBack();
+        document.getElementById("settings-modal").classList.add("open");
+    }
+    function closeSettingsModal() {
+        document.getElementById("settings-modal").classList.remove("open");
+    }
+    // The Settings modal's single "Done" button: save the name (if any) and
+    // close. Card back is applied live on each pick, so it needs no saving.
+    function saveSettings() {
+        saveName(document.getElementById("settings-name-input").value);
+        closeSettingsModal();
+    }
+    function saveName(raw) {
+        const name = (raw || "").trim();
         if (!name) return;
         localStorage.setItem("player_name", name);
         socket.emit("set_name", withIdentity({ name: name }));
     }
+
+    // Card-back appearance: a per-viewer cosmetic preference kept in
+    // localStorage and applied as body data-attributes that style.css keys the
+    // face-down patterns off. Nothing here touches game state.
+    const CARD_BACK_COLORS = ["red", "green", "blue"];
+    const CARD_BACK_PATTERNS = ["stripes", "crosshatch", "gradient", "plain"];
+    function getCardBack() {
+        const color = localStorage.getItem("card_back_color");
+        const pattern = localStorage.getItem("card_back_pattern");
+        return {
+            color: CARD_BACK_COLORS.includes(color) ? color : "red",
+            pattern: CARD_BACK_PATTERNS.includes(pattern) ? pattern : "stripes",
+        };
+    }
+    function applyCardBack() {
+        const back = getCardBack();
+        document.body.dataset.backColor = back.color;
+        document.body.dataset.backPattern = back.pattern;
+        document.querySelectorAll("#back-grid .back-cell").forEach((b) =>
+            b.classList.toggle("selected",
+                b.dataset.color === back.color && b.dataset.pattern === back.pattern));
+    }
+    const backGridEl = document.getElementById("back-grid");
+    if (backGridEl) {
+        backGridEl.addEventListener("click", (event) => {
+            const btn = event.target.closest(".back-cell");
+            if (!btn) return;
+            localStorage.setItem("card_back_color", btn.dataset.color);
+            localStorage.setItem("card_back_pattern", btn.dataset.pattern);
+            applyCardBack();
+        });
+    }
+    applyCardBack();
     // Fires an event that might need a display name first - if the server
     // responds with "need_name", this attempt (event + its *original*,
     // identity-free data) is what gets retried once one's set. `data`
@@ -88,10 +138,9 @@
         pendingAction = lastAction;
         openNameModal();
     });
-    socket.on("name_set", (payload) => {
+    socket.on("name_set", () => {
         document.getElementById("name-modal").classList.remove("open");
-        const label = document.getElementById("current-name-label");
-        if (label) label.textContent = payload.name;
+        document.getElementById("settings-modal").classList.remove("open");
         if (pendingAction) {
             const action = pendingAction;
             pendingAction = null;

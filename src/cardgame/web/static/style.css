@@ -1,3 +1,6 @@
+    /* Height of the sticky top nav, reserved above the board in the --cell
+       height budget so the board still fits the viewport under it. */
+    :root { --nav-h: 56px; }
     body {
         font-family: 'Arial', sans-serif;
         background-color: #333;
@@ -12,8 +15,18 @@
         padding: 20px;
         padding-bottom: 70px; /* room for the mobile hand tabs, harmless on desktop */
     }
+    /* The game (board + hands) is wider than 900px at full --cell scale and
+       centres itself, so let its page use the full viewport width. */
+    .page:has(.game-container) {
+        max-width: none;
+    }
     .site-nav {
-        position: relative;
+        /* Sticky so it stays put while the page scrolls; its height (--nav-h)
+           is reserved in the board's --cell height budget. Still a positioning
+           context for the dropdown menu, as position:relative was. */
+        position: sticky;
+        top: 0;
+        z-index: 500;
         display: flex;
         align-items: center;
         gap: 10px;
@@ -346,17 +359,27 @@
     .rematch-controls-mobile { display: none; }
 
     .game-container {
+        /* Single scale for the whole desktop game: cell width in px, capped at
+           100 (max size) and otherwise shrunk so the ~9.5-cell-tall board fits
+           the viewport height, or the ~9.58-cell-wide board+max-hand fits the
+           width. Everything below (board grid, cards, hand fan) derives from
+           it, so the board scales to fit rather than forcing vertical scroll.
+           Vertical budget = viewport - sticky nav (--nav-h) - 36px (page
+           padding + breathing); horizontal budget subtracts 40px of padding.
+           See the mobile @media thresholds, which are these same numbers at
+           the 65px minimum. */
+        --cell: min(100px, (100dvh - var(--nav-h) - 36px) / 9.5, (100vw - 40px) / 9.58);
         display: flex;
         align-items: flex-start;
-        gap: 40px;
+        justify-content: center;
+        gap: calc(var(--cell) * 0.4);
         margin: 15px 0;
-        /* No wrapping in desktop mode - the mobile breakpoint (900px) is
-           already the intentional cutoff for "not enough room for board +
-           hands side by side", so anything at or above it should reliably
-           stay side by side. Wrapping here was what let long rematch-status
-           text (e.g. "Waiting for X to respond...") drop the hands below
-           the board even on a full desktop width, since flex-wrap decides
-           per-line fit before shrinking is applied. */
+        /* No wrapping in desktop mode - the board + hands are sized to fit
+           side by side at the current --cell scale, and the mobile @media
+           takes over before they can't. Wrapping here was what let long
+           rematch-status text (e.g. "Waiting for X to respond...") drop the
+           hands below the board, since flex-wrap decides per-line fit before
+           shrinking is applied. */
         flex-wrap: nowrap;
     }
     .hands {
@@ -371,7 +394,7 @@
            board (see history around the 700px->900px breakpoint fix). Cap
            it to the fan's own rough footprint so long text wraps in place
            instead of stretching the layout. */
-        max-width: 260px;
+        max-width: calc(var(--cell) * 2.7);
     }
     .seat-header {
         display: flex;
@@ -382,21 +405,26 @@
     }
     .board {
         display: grid;
-        grid-template-columns: repeat(6, 100px);
-        grid-template-rows: repeat(6, 150px);
-        gap: 10px;
+        grid-template-columns: repeat(6, var(--cell));
+        grid-template-rows: repeat(6, calc(var(--cell) * 1.5));
+        gap: calc(var(--cell) * 0.1);
         position: relative;
     }
+    /* Grid-line overlay ("rook move" guides): a 2px line centred on each
+       cell, tiled at the cell pitch (cell + gap = 1.1 x 1.6 cell) and inset so
+       the lines land on the row/column centres. All derived from --cell so it
+       tracks the scaled board (values match the old fixed 74/49/552/802 at
+       --cell: 100px). */
     .board::before {
         content: "";
         position: absolute;
-        top: 74px;
-        left: 49px;
-        width: 552px;
-        height: 802px;
+        top: calc(var(--cell) * 0.75 - 1px);
+        left: calc(var(--cell) * 0.5 - 1px);
+        width: calc(var(--cell) * 5.5 + 2px);
+        height: calc(var(--cell) * 8 + 2px);
         background-image: linear-gradient(to right, #777 2px, transparent 2px),
                           linear-gradient(to bottom, #777 2px, transparent 2px);
-        background-size: 110px 160px;
+        background-size: calc(var(--cell) * 1.1) calc(var(--cell) * 1.6);
     }
     .cell-button {
         all: unset;
@@ -415,15 +443,28 @@
     .board.no-hover .cell-button:hover .card {
         outline-color: transparent;
     }
+    /* Logo-styled card: thick charcoal outline, warm face, rounded corners.
+       All size-derived values scale off --w so the single definition works
+       at every card size (board, hands, mobile, how-to-play diagrams). */
     .card {
-        width: 100px;
-        height: 150px;
-        border: 1px solid #000;
-        border-radius: 10px;
-        background-color: white;
+        /* On the game page cards inherit --cell from .game-container so they
+           scale with the board; elsewhere (and as a fallback) they stay 100px.
+           Height follows the 3:2 card ratio. The mobile and how-to-play blocks
+           override --w/--h to their own fixed sizes. */
+        --w: var(--cell, 100px);
+        --h: calc(var(--w) * 1.5);
+        width: var(--w);
+        height: var(--h);
+        border: max(2px, calc(var(--w) * 0.028)) solid #2b2b2b;
+        border-radius: calc(var(--w) * 0.14);
+        background-color: #fbf8f2;
         position: relative;
+        /* Not the body's Arial: the suit glyphs and ranks are drawn in the
+           system UI face, which gives the rounder, heavier shapes the logo
+           style calls for. */
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
         font-size: 1.5em;
-        box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.3);
+        box-shadow: 0 calc(var(--w) * 0.02) calc(var(--w) * 0.05) rgba(43, 43, 43, 0.28);
         box-sizing: border-box;
     }
     .marker::after {
@@ -471,35 +512,122 @@
     /* Keep the resting-pointer brighten off place-targets too, but leave the
        base blue outline (unlike normal cells, which have no base outline). */
     .board.no-hover .cell-button.place-target:hover .card { outline-color: #4aa3df; }
-    .card.hearts, .card.diamonds { color: red; }
-    .card.clubs, .card.spades { color: black; }
+    .card.hearts, .card.diamonds { color: #d13b3b; }
+    .card.clubs, .card.spades { color: #2b2b2b; }
     .card .corner {
         position: absolute;
-        line-height: 0.8;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        line-height: 1;
+        font-weight: 800;
     }
-    .card .top-left { top: 5px; left: 5px; }
-    .card .bottom-right { bottom: 5px; right: 5px; transform: rotate(180deg); }
+    .card .corner br { display: none; }
+    .card .corner span:first-child { font-size: calc(var(--w) * 0.19); }
+    .card .corner span:last-child { font-size: calc(var(--w) * 0.17); margin-top: calc(var(--w) * 0.02); }
+    .card .top-left { top: calc(var(--w) * 0.05); left: calc(var(--w) * 0.05); }
+    .card .bottom-right { bottom: calc(var(--w) * 0.05); right: calc(var(--w) * 0.05); transform: rotate(180deg); }
     .card .suit {
         position: absolute;
         top: 50%;
         left: 50%;
         transform: translate(-50%, -50%);
-        font-size: 50px;
+        font-size: calc(var(--w) * 0.66);
+        line-height: 1;
     }
+    /* Card back: charcoal outline (from .card), a warm inset ring, then the
+       logo's red diagonal stripes. */
+    /* Card back = a viewer-chosen colour + pattern (Settings modal). The
+       colour supplies --back-a / --back-b; the pattern rules below paint the
+       background. The charcoal outline (.card border), warm inset ring and
+       drop shadow are shared by every back. Purely cosmetic and per-device -
+       face-down cards are hidden from everyone, so this never affects play.
+       Defaults to red diagonal stripes. */
+    /* Each colour supplies a light (--back-a) and dark (--back-b) shade. Set on
+       the body from the viewer's pick, and on each picker cell so a cell always
+       shows its own colour. */
+    :root { --back-a: #d13b3b; --back-b: #b02f2f; }
+    body[data-back-color="red"], .bk-red { --back-a: #d13b3b; --back-b: #b02f2f; }
+    body[data-back-color="green"], .bk-green { --back-a: #2f9e5f; --back-b: #237a48; }
+    body[data-back-color="blue"], .bk-blue { --back-a: #3f7fd1; --back-b: #2f5fa6; }
+
     .card.facedown {
-        background: radial-gradient(circle, #3c3, #363);
+        /* default (and the "stripes" pattern) */
+        background: repeating-linear-gradient(45deg,
+            var(--back-a) 0 calc(var(--w) * 0.08),
+            var(--back-b) calc(var(--w) * 0.08) calc(var(--w) * 0.16));
+        box-shadow: inset 0 0 0 calc(var(--w) * 0.05) #fbf8f2,
+                    0 calc(var(--w) * 0.02) calc(var(--w) * 0.05) rgba(43, 43, 43, 0.28);
         color: transparent;
+    }
+
+    /* Live face-down cards on the board/hands, driven by the viewer's pick.
+       Stripes is the base rule above; the picker cells are styled separately
+       (id-scoped) below, so the current pick never leaks onto the swatches. */
+    body[data-back-pattern="crosshatch"] .card.facedown {
+        background:
+            repeating-linear-gradient(45deg, transparent 0 calc(var(--w) * 0.10), var(--back-b) calc(var(--w) * 0.10) calc(var(--w) * 0.13)),
+            repeating-linear-gradient(-45deg, transparent 0 calc(var(--w) * 0.10), var(--back-b) calc(var(--w) * 0.10) calc(var(--w) * 0.13)),
+            var(--back-a);
+    }
+    body[data-back-pattern="gradient"] .card.facedown {
+        background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--back-a) 72%, white), var(--back-b));
+    }
+    body[data-back-pattern="plain"] .card.facedown {
+        background: var(--back-a);
+    }
+
+    /* ---- Card-back picker: a grid of every colour + pattern (Settings). Cells
+       are id-scoped so each renders its own colour+pattern regardless of the
+       viewer's current pick. ---- */
+    .settings-modal { min-width: 300px; text-align: left; }
+    .settings-section { margin-top: 18px; }
+    .settings-legend { display: block; font-weight: bold; margin-bottom: 2px; }
+    .settings-hint { margin: 0 0 8px; font-size: 0.85em; color: #bbb; }
+    .settings-name-row { display: flex; gap: 8px; }
+    .settings-name-row input { flex: 1; min-width: 0; }
+    .back-grid { display: grid; grid-template-columns: repeat(4, auto); gap: 8px; justify-content: center; }
+    .modal .back-cell { --w: 54px; --h: 76px; padding: 0; cursor: pointer; }
+    #back-grid .back-cell.pat-stripes {
+        background: repeating-linear-gradient(45deg,
+            var(--back-a) 0 calc(var(--w) * 0.08),
+            var(--back-b) calc(var(--w) * 0.08) calc(var(--w) * 0.16));
+    }
+    #back-grid .back-cell.pat-crosshatch {
+        background:
+            repeating-linear-gradient(45deg, transparent 0 calc(var(--w) * 0.10), var(--back-b) calc(var(--w) * 0.10) calc(var(--w) * 0.13)),
+            repeating-linear-gradient(-45deg, transparent 0 calc(var(--w) * 0.10), var(--back-b) calc(var(--w) * 0.10) calc(var(--w) * 0.13)),
+            var(--back-a);
+    }
+    #back-grid .back-cell.pat-gradient {
+        background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--back-a) 72%, white), var(--back-b));
+    }
+    #back-grid .back-cell.pat-plain {
+        background: var(--back-a);
+    }
+    .back-cell.selected, .back-cell:focus-visible {
+        outline: 3px solid #7cb8ff; outline-offset: 2px;
     }
     .hand-label { font-size: 1em; color: #bbb; }
     .score {
         font-size: 2.2em;
         font-weight: 500;
     }
+    /* Hand geometry also scales off --cell: four suit rows fan out with a
+       0.45-cell vertical step, and cards within a row overlap leaving a
+       0.24-cell reveal (matches the old 45px / 24px at --cell: 100px). */
     .handarray {
         display: flex;
         position: relative;
         flex-direction: column;
-        height: 285px;
+        height: calc(var(--cell) * 2.85);
+        /* The fanned cards inside are absolutely positioned and so contribute
+           no width of their own - reserve the widest a fan can ever be (an
+           8-card row: 7 * 0.24-cell reveal + 1 cell = 2.68 cell) so the hands
+           column takes its true footprint. Without this the game-container is
+           too narrow, mis-centres, and lets the rightmost cards spill off
+           screen before the mobile @media trips. */
+        width: calc(var(--cell) * 2.68);
     }
     .hand {
         display: flex;
@@ -508,25 +636,27 @@
     }
     .handarray > .hand {
         position: absolute;
-        height: 150px;
+        height: calc(var(--cell) * 1.5);
     }
     .hand > .card {
         position: absolute;
-        height: 150px;
+        height: calc(var(--cell) * 1.5);
     }
     .hand:nth-child(1) { top: 0; }
-    .hand:nth-child(2) { top: 45px; }
-    .hand:nth-child(3) { top: 90px; }
-    .hand:nth-child(4) { top: 135px; }
+    .hand:nth-child(2) { top: calc(var(--cell) * 0.45); }
+    .hand:nth-child(3) { top: calc(var(--cell) * 0.9); }
+    .hand:nth-child(4) { top: calc(var(--cell) * 1.35); }
+    /* 0.24-cell reveal per overlapped card - wide enough that the shared
+       corner (see .card .corner) sits fully within the exposed sliver. */
     .hand > .card:nth-child(1) { left: 0; }
-    .hand > .card:nth-child(2) { left: 20px; }
-    .hand > .card:nth-child(3) { left: 40px; }
-    .hand > .card:nth-child(4) { left: 60px; }
-    .hand > .card:nth-child(5) { left: 80px; }
-    .hand > .card:nth-child(6) { left: 100px; }
-    .hand > .card:nth-child(7) { left: 120px; }
-    .hand > .card:nth-child(8) { left: 140px; }
-    .hand > .card:nth-child(9) { left: 160px; }
+    .hand > .card:nth-child(2) { left: calc(var(--cell) * 0.24); }
+    .hand > .card:nth-child(3) { left: calc(var(--cell) * 0.48); }
+    .hand > .card:nth-child(4) { left: calc(var(--cell) * 0.72); }
+    .hand > .card:nth-child(5) { left: calc(var(--cell) * 0.96); }
+    .hand > .card:nth-child(6) { left: calc(var(--cell) * 1.2); }
+    .hand > .card:nth-child(7) { left: calc(var(--cell) * 1.44); }
+    .hand > .card:nth-child(8) { left: calc(var(--cell) * 1.68); }
+    .hand > .card:nth-child(9) { left: calc(var(--cell) * 1.92); }
 
     /* Room list */
     table.room-list {
@@ -549,14 +679,13 @@
        rank+suit label (rank stacked above the suit icon, as in the
        original) - the full card face is too small to read legibly at
        this size. */
-    /* Matches .page's own max-width: the desktop layout needs a fixed
-       ~650px board plus room for the hand fans beside it, which stops
-       fitting well before a narrower viewport would visually justify
-       staying in "desktop" mode - so switch to the compact mobile layout
-       at the same point the page itself starts shrinking, rather than
-       leaving a gap where flex-wrap silently drops the (still full-size)
-       hands below the board. */
-    @media (max-width: 900px) {
+    /* Switch to the compact (mobile) layout on viewport size alone: the
+       desktop board scales down to fit the height (see --cell on
+       .game-container), so the mobile view is only needed once a card would
+       shrink below ~65px on either axis. The thresholds derive from that
+       minimum: width 663 = 9.58*65 + 40, height 710 = 9.5*65 + 92 (nav 56 +
+       36), matching the coefficients and chrome budget used by --cell. */
+    @media (max-width: 663px), (max-height: 710px) {
         /* The hand panel is now permanently shown (see applyActiveHand()),
            not a drawer you tap open, so it costs board space the whole
            time you're playing - claw some of that back from the page's
@@ -615,11 +744,8 @@
             margin: 10px auto;
         }
         .card {
-            width: 40px;
-            height: 56px;
-            border-radius: 4px;
-            font-size: 0.6em;
-            box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.4);
+            --w: 40px;
+            --h: 56px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -629,10 +755,10 @@
             display: flex !important;
             flex-direction: column;
             align-items: center;
-            line-height: 1.1;
+            line-height: 1.05;
         }
-        .card .simple-label span:first-child { font-size: 19px; font-weight: bold; }
-        .card .simple-label span:last-child { font-size: 18px; }
+        .card .simple-label span:first-child { font-size: 20px; font-weight: 800; }
+        .card .simple-label span:last-child { font-size: 23px; }
 
         /* The desktop hand uses absolute positioning to fan cards out with
            an overlap, relying on the corner rank+suit still being readable
@@ -641,6 +767,7 @@
            cards out as a plain wrapping grid instead. */
         .handarray {
             height: auto;
+            width: auto; /* reset the desktop fan-footprint reservation */
             gap: 4px;
             align-items: center;
         }
@@ -661,12 +788,18 @@
            order - it doesn't need to be nearly as large to read, so
            shrink it further to reclaim vertical space in the
            permanently-visible mobile hand panel. */
-        .hand-slot .card, .hand-slot .card-slot {
+        .hand-slot .card {
+            --w: 26px;
+            --h: 36px;
+            width: var(--w);
+            height: var(--h);
+        }
+        .hand-slot .card-slot {
             width: 26px;
             height: 36px;
         }
-        .hand-slot .simple-label span:first-child { font-size: 12px; }
-        .hand-slot .simple-label span:last-child { font-size: 11px; }
+        .hand-slot .simple-label span:first-child { font-size: 13px; }
+        .hand-slot .simple-label span:last-child { font-size: 15px; }
 
         .mobile-hand-tabs {
             display: flex;
@@ -811,10 +944,8 @@
     .how-to-play .htp-columns > div { flex: 1 1 240px; }
     .how-to-play .htp-cta { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-top: 16px; }
     .htp-diagram .card {
-        width: 40px;
-        height: 56px;
-        border-radius: 4px;
-        box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.4);
+        --w: 40px;
+        --h: 56px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -829,8 +960,8 @@
         align-items: center;
         line-height: 1.1;
     }
-    .htp-diagram .card .simple-label span:first-child { font-size: 19px; font-weight: bold; }
-    .htp-diagram .card .simple-label span:last-child { font-size: 18px; }
+    .htp-diagram .card .simple-label span:first-child { font-size: 20px; font-weight: 800; }
+    .htp-diagram .card .simple-label span:last-child { font-size: 23px; }
     .htp-legend {
         display: flex;
         gap: 20px;
