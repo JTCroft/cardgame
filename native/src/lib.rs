@@ -1270,6 +1270,88 @@ fn heuristic_root(
 /// Validation probe: every root move's exact full-window value at a fixed
 /// depth (no deepening, no time limit). Used to check the port against the
 /// Python search. Returns (marker, value) per legal move.
+/// Choose the marker's starting cell for the placer (the player NOT moving
+/// first). `starts` are the candidate cell indices; the placer wants the one
+/// MINIMISING the value of the mover's best reply. Mirrors `heuristic_root`'s
+/// budgeted iterative deepening, but over all placements jointly: the position
+/// after the mover's first move is independent of which cell the marker began
+/// on, so the shared transposition table caches every subtree common to two
+/// placements, searched once. All placements advance at equal depth; children
+/// use the full window so their values are exact and cross-comparable.
+/// Returns (best cell (row, col), completed depth, elapsed secs, per-start
+/// values in `starts` order).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn heuristic_placement(
+    py: Python<'_>, cells: Vec<i64>, starts: Vec<usize>, rows: u64, cols: u64, mi: u32, mk: u8,
+    oi: u32, ok: u8, unknowns: Vec<i64>, params: Vec<f64>, resolution_cap: usize,
+    deepen_fraction: f64, time_budget: f64,
+) -> PyResult<((usize, usize), i64, f64, Vec<f64>)> {
+    let (mut ctx, nu) = new_hctx(cells, unknowns, &params, Some(time_budget))?;
+    ctx.p.resolution_cap = resolution_cap;
+    ctx.p.deepen_fraction = deepen_fraction;
+    py.detach(move || {
+        let start = Instant::now();
+        let bound = ctx.p.value_bound;
+        // Each placement's first-move children, ordered once.
+        let child_lists: Vec<Vec<(usize, bool)>> = starts
+            .iter()
+            .map(|&cell| ctx.ordered(cell, rows, cols, mi, mk, oi, ok, nu))
+            .collect();
+        let mut best_values = vec![-bound; starts.len()];
+        let max_depth = 36 - rows.count_ones() as i64;
+        let mut completed = 0i64;
+        let mut depth = 1i64;
+        while depth <= max_depth {
+            let mut values = vec![-bound; starts.len()];
+            let mut aborted = false;
+            for (pi, children) in child_lists.iter().enumerate() {
+                let mut v = -bound;
+                for &(target, fd) in children {
+                    let cv = ctx.child_value(
+                        target, fd, rows, cols, mi, mk, oi, ok, nu, depth, -bound, bound,
+                    );
+                    if ctx.aborted {
+                        aborted = true;
+                        break;
+                    }
+                    if cv > v {
+                        v = cv;
+                    }
+                }
+                if aborted {
+                    break;
+                }
+                values[pi] = v;
+            }
+            if aborted {
+                break;
+            }
+            best_values = values;
+            completed = depth;
+            depth += 1;
+            if start.elapsed().as_secs_f64() > ctx.p.deepen_fraction * time_budget {
+                break;
+            }
+        }
+        // Placer minimises the mover's value; strict `<` keeps the lowest start
+        // index on exact ties, matching Python's min over (value, cell).
+        let mut best_i = 0usize;
+        for i in 1..starts.len() {
+            if best_values[i] < best_values[best_i] {
+                best_i = i;
+            }
+        }
+        let cell = starts[best_i];
+        Ok((
+            (cell / 6, cell % 6),
+            completed,
+            start.elapsed().as_secs_f64(),
+            best_values,
+        ))
+    })
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn heuristic_probe(
@@ -1296,6 +1378,7 @@ fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
     m.add_function(wrap_pyfunction!(distribution, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_root, m)?)?;
+    m.add_function(wrap_pyfunction!(heuristic_placement, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_probe, m)?)?;
     Ok(())
 }

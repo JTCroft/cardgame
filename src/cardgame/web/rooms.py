@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 
 from flask import render_template
 
-from ..ai import choose_move
+from ..ai import choose_move, choose_placement
 from ..analysis import AnalysisAborted, analyse_moves_by_deadline
 from ..analysis_native import FINAL, NATIVE_AVAILABLE, iter_move_analyses
 from ..game import Game
@@ -1504,47 +1504,55 @@ def _maybe_play_computer_move(code, room):
             if room.computer_seat is None or room.game_over:
                 return
             if room.game.needs_marker:
-                # Computer placer (seat 2 only): auto-place the default
-                # central start once both seats are filled. Placing from
-                # seat 1 is never the computer's call - that's the human's.
+                # Computer placer (seat 2 only): choose a starting cell once
+                # both seats are filled. Placing from seat 1 is never the
+                # computer's call - that's the human's.
                 if not room.both_seated or room.computer_seat != 2:
                     return
-                room.game = room.game.place_marker(*Game.starting_position)
-                placed = True
+                placing = True
             elif room.current_turn_seat != room.computer_seat:
                 return
             else:
-                placed = False
+                placing = False
             game, game_id = room.game, room.game_id
-        if placed:
-            # Broadcast the placement and loop; the move turn is now P1's.
-            _broadcast_state(code, room)
-            continue
         # Think (and enforce the minimum move time) outside the lock, so a
         # slow think no longer holds the room's lock and the padding sleep
-        # never blocks broadcasts or the analysis worker.
+        # never blocks broadcasts or the analysis worker. Placement runs the
+        # same budgeted search over the four starting cells.
         start = time.monotonic()
-        row, col = choose_move(game)
+        if placing:
+            placement = choose_placement(game)
+        else:
+            row, col = choose_move(game)
         remaining = _COMPUTER_MIN_MOVE_SECONDS - (time.monotonic() - start)
         if remaining > 0:
             time.sleep(remaining)
         with room.lock:
             # The game may have moved on while we were thinking (a rematch
-            # dealt a fresh game, a seat was swapped, the move was played by
-            # another caller): only apply if it's still exactly the position
-            # we solved and still the computer's turn.
+            # dealt a fresh game, a seat was swapped, the move/placement was
+            # applied by another caller): only apply if it is still exactly
+            # the position we solved. `room.game is not game` already covers a
+            # marker placed meanwhile (the game object would have changed).
             if (
                 room.game is not game
                 or room.game_id != game_id
                 or room.computer_seat is None
                 or room.game_over
-                or room.current_turn_seat != room.computer_seat
             ):
                 return
-            room.game = random.choice(room.game.move(row, col))
-            if room.game_over:
-                _record_room_finished_locked(code, room)
+            if placing:
+                room.game = room.game.place_marker(*placement)
+            else:
+                if room.current_turn_seat != room.computer_seat:
+                    return
+                room.game = random.choice(room.game.move(row, col))
+                if room.game_over:
+                    _record_room_finished_locked(code, room)
         _broadcast_state(code, room)
+        if placing:
+            # The move turn is now P1's; loop in case it becomes the
+            # computer's turn again (it never is in practice).
+            continue
 
 
 def _room_summary_locked(code, room):

@@ -53,9 +53,14 @@ try:
 except ImportError:
     _heuristic_root = None
 
+try:
+    from cardgame_native import heuristic_placement as _heuristic_placement
+except ImportError:
+    _heuristic_placement = None
+
 HEURISTIC_NATIVE = _heuristic_root is not None
 
-__all__ = ("choose_move", "AlphaBetaBot", "SearchParams")
+__all__ = ("choose_move", "choose_placement", "AlphaBetaBot", "SearchParams")
 
 _score = lru_cache(maxsize=1 << 18)(score_dp)
 
@@ -695,6 +700,9 @@ class AlphaBetaBot:
     def _search_root(self, game):
         if self._use_native():
             return self._search_root_native(game)
+        return self._search_root_python(game)
+
+    def _search_root_python(self, game):
         params = self.params
         bound = params.value_bound
         self._exact_cache = {}
@@ -727,6 +735,10 @@ class AlphaBetaBot:
             for marker, facedown in self._ordered_markers(game, me, opp, mask)
         ]
         best_marker = moves[0][0]
+        # Value of best_marker to the player to move (higher = better for the
+        # mover). Tracked so evaluate_position/choose_placement can compare
+        # positions, not just pick a move. Set once depth 1 completes.
+        best_value = -bound
         max_depth = 36 - len(game.moves)
         depth = 1
         completed_depth = 0
@@ -765,9 +777,11 @@ class AlphaBetaBot:
                 interrupted = True
                 if iteration_best is not None:
                     best_marker = iteration_best
+                    best_value = scores[iteration_best]
                 break
             if iteration_best is not None:
                 best_marker = iteration_best
+                best_value = scores[iteration_best]
             completed_depth = depth
             # Search the previous iteration's best moves first next time round.
             moves.sort(key=lambda entry: (-scores[entry[0]], entry[0]))
@@ -780,11 +794,138 @@ class AlphaBetaBot:
             "elapsed": time.perf_counter() - start,
             "tt_entries": len(self._tt),
             "tt_cuts": self._tt_cuts,
+            "value": best_value,
         }
         return best_marker
+
+    def evaluate_position(self, game):
+        """Searched value of `game` to the player to move (higher = better for
+        the mover), from the same iterative-deepening search as choose_move.
+        Runs the pure-Python root (the native root returns only a move, no
+        scalar value), so it is slower than choose_move but yields a number
+        comparable across positions - used by choose_placement."""
+        if not game.legal_moves:
+            if len(game.moves) % 2 == 0:
+                me, opp = game.p1.as_int, game.p2.as_int
+            else:
+                me, opp = game.p2.as_int, game.p1.as_int
+            return self._terminal_value(me, opp)
+        self._search_root_python(game)
+        return self.last_search["value"]
+
+    def choose_placement(self, game):
+        """Best starting cell for the placer (the player NOT moving first),
+        i.e. the one MINIMISING the value of the mover's best reply.
+
+        Shares one search across the four placements. The starting cell is
+        never collected, so the position *after* the mover's first move depends
+        only on the target cell, not which cell the marker began on - and the
+        transposition table keys exactly on that (taken-mask + marker + hands),
+        so every subtree shared between placements is searched once and reused.
+        A joint iterative deepening evaluates all four placement roots at each
+        depth (warm table), keeping their values at equal, comparable depth."""
+        if self._use_native() and _heuristic_placement is not None:
+            return self._choose_placement_native(game)
+        return self._choose_placement_python(game)
+
+    def _choose_placement_native(self, game):
+        starts = game._valid_starting_positions
+        placed0 = game.place_marker(*starts[0])
+        cells, _cell, rows, cols, mi, mk, oi, ok, _ = _root_state(placed0)
+        codes = [int(c[0]) * 4 + int(c[1]) for c in placed0.board.facedown_cards]
+        (r, c), completed, elapsed, values = _heuristic_placement(
+            [-1 if x is None else x for x in cells],
+            [row * 6 + col for row, col in starts],
+            rows, cols, mi, mk, oi, ok, codes, self._native_params(),
+            self.params.resolution_cap, self.params.deepen_fraction,
+            self.time_budget,
+        )
+        self.last_search = {
+            "completed_depth": completed, "elapsed": elapsed, "native": True,
+            "values": {pos: v for pos, v in zip(starts, values)},
+        }
+        return (r, c)
+
+    def _choose_placement_python(self, game):
+        params = self.params
+        bound = params.value_bound
+        self._exact_cache = {}
+        self._fullpot = {}
+        self._tt = {}
+        self._tt_cuts = 0
+        start = time.perf_counter()
+        deadline = start + self.time_budget
+        starts = game._valid_starting_positions
+        # All placements share one board and one remaining multiset (no moves
+        # yet); the mover is always P1 after a placement.
+        placed0 = game.place_marker(*starts[0])
+        me, opp = placed0.p1.as_int, placed0.p2.as_int
+        remaining = self._root_tokens = tuple(
+            _TOKEN[card] for card in _remaining_cards(placed0)
+        )
+        # Each placement's first-move children (marker + facedown resolutions).
+        placements = []
+        for pos in starts:
+            placed = game.place_marker(*pos)
+            children = [
+                (marker, self._resolutions(placed, marker, facedown))
+                for marker, facedown in self._ordered_markers(placed, me, opp, 0)
+            ]
+            placements.append((pos, children))
+        best = {pos: -bound for pos, _ in placements}
+        max_depth = 36 - len(placed0.moves)
+        depth = 1
+        completed_depth = 0
+        while depth <= max_depth:
+            values = {}
+            try:
+                for pos, children in placements:
+                    value = -bound
+                    for marker, resolutions in children:
+                        child_mask = 1 << (marker[0] * 6 + marker[1])
+                        # Full window: exact child values (comparable across
+                        # placements) and exact table entries (maximal reuse).
+                        if len(resolutions) == 1:
+                            child = resolutions[0]
+                            token = _TOKEN[child.taken_card]
+                            child_value = -self._search(
+                                child, depth - 1, -bound, bound, opp,
+                                _add_card(me, child.taken_card), (token,),
+                                _without(remaining, token), child_mask, deadline,
+                            )
+                        else:
+                            child_value = self._chance_value(
+                                resolutions, depth, -bound, bound, me, opp,
+                                (), remaining, child_mask, deadline,
+                            )
+                        if child_value > value:
+                            value = child_value
+                    values[pos] = value
+            except _Timeout:
+                break
+            best = values
+            completed_depth = depth
+            depth += 1
+            if time.perf_counter() - start > params.deepen_fraction * self.time_budget:
+                break
+        self.last_search = {
+            "completed_depth": completed_depth,
+            "elapsed": time.perf_counter() - start,
+            "values": best,
+        }
+        # Placer minimises the mover's value; ties break to the lower/righter
+        # cell via the natural order of _valid_starting_positions.
+        return min(best, key=lambda pos: (best[pos], pos))
 
 
 def choose_move(game, time_budget=6.0):
     """Pick a legal (row, col) move for `game`'s current player, using a
     default-parameter `AlphaBetaBot`; construct one directly to customise."""
     return AlphaBetaBot(time_budget=time_budget).choose_move(game)
+
+
+def choose_placement(game, time_budget=6.0):
+    """Choose the marker's starting cell for the placer (the player NOT taking
+    the first move), using a default `AlphaBetaBot`; construct one directly to
+    customise. Returns a (row, col)."""
+    return AlphaBetaBot(time_budget=time_budget).choose_placement(game)
