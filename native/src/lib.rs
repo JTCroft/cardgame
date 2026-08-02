@@ -186,6 +186,9 @@ fn score(hand: u32, kings: u8) -> i64 {
 struct Ctx {
     cells: [i64; 36], // -1 facedown, 0 king, else the card's hand bit
     unknowns: [i64; 12],
+    deadline: Option<Instant>, // None => never aborts (exhaustive solve)
+    nodes: u64,
+    aborted: bool,
 }
 
 #[inline]
@@ -217,6 +220,18 @@ fn col_bit(cell: usize) -> u64 {
 
 impl Ctx {
     #[inline]
+    fn tick(&mut self) {
+        self.nodes += 1;
+        if self.nodes & 0x3ff == 0 {
+            if let Some(dl) = self.deadline {
+                if Instant::now() >= dl {
+                    self.aborted = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
     fn leaf(&self, mi: u32, mk: u8, oi: u32, ok: u8, nu: usize) -> V {
         let diff = score(mi, mk) - score(oi, ok);
         let m = FACT[nu];
@@ -228,6 +243,10 @@ impl Ctx {
         &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
         ok: u8, nu: usize, mut alpha: V, beta: V,
     ) -> V {
+        self.tick();
+        if self.aborted {
+            return alpha; // discarded: solve_root returns None once aborted
+        }
         let mut cells_buf = [0usize; 10];
         let n = legal(cell, rows, cols, &mut cells_buf);
         if n == 0 {
@@ -651,17 +670,21 @@ fn distribution(
 type MoveRow = ((usize, usize), (i64, i64), bool);
 
 #[pyfunction]
+#[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
 #[allow(clippy::too_many_arguments)]
 fn solve_root(
     py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
-    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>,
-) -> PyResult<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)> {
+    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
+) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)>> {
     if cells.len() != 36 || unknowns.len() > 12 {
         return Err(pyo3::exceptions::PyValueError::new_err("bad state shape"));
     }
     let mut ctx = Ctx {
         cells: cells.try_into().unwrap(),
         unknowns: [0; 12],
+        deadline: deadline_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
+        nodes: 0,
+        aborted: false,
     };
     let nu = unknowns.len();
     ctx.unknowns[..nu].copy_from_slice(&unknowns);
@@ -671,7 +694,7 @@ fn solve_root(
         let n = legal(cell, rows, cols, &mut buf);
         if n == 0 {
             let v = ctx.leaf(mi, mk, oi, ok, nu);
-            return Ok((None, (v.0, v.1), Vec::new()));
+            return Ok(Some((None, (v.0, v.1), Vec::new())));
         }
         // face-up moves first, stable within each group - same order as
         // Python's sorted(legal, key=lambda t: cells[t] is None)
@@ -704,6 +727,9 @@ fn solve_root(
                 )
                 .neg()
             };
+            if ctx.aborted {
+                return Ok(None); // deadline tripped mid-solve; no exact result
+            }
             let marker = (target / 6, target % 6);
             moves.push((marker, (v.0, v.1), best.is_none() || v > alpha));
             if best.is_none() || (v, marker) > best.unwrap() {
@@ -711,7 +737,7 @@ fn solve_root(
             }
         }
         let (bv, bm) = best.unwrap();
-        Ok((Some(bm), (bv.0, bv.1), moves))
+        Ok(Some((Some(bm), (bv.0, bv.1), moves)))
     })
 }
 

@@ -176,42 +176,32 @@ class _Timeout(Exception):
     pass
 
 
-# Worst observed solve_native seconds per (cards_left, facedown), 8
-# samples per cell over oracle positions (experiments/
-# calibrate_exact_gate.py, 2026-07-21). Missing low-facedown cells are
-# filled from the nearest measured higher-facedown cell in the same row
-# (cost only falls as facedown falls); unmeasured cells are infeasible.
-# The chance-node branching from face-down cards is the main cost driver.
-_EXACT_COST = {
-    13: {0: 0.01, 1: 0.01, 2: 0.01, 3: 0.04, 4: 0.06},
-    14: {0: 0.05, 1: 0.05, 2: 0.04, 3: 0.05, 4: 0.13},
-    15: {0: 0.03, 1: 0.03, 2: 0.04, 3: 0.06, 4: 0.44, 5: 0.38},
-    16: {0: 0.04, 1: 0.04, 2: 0.23, 3: 0.49, 4: 0.31, 5: 0.65},
-    17: {0: 0.19, 1: 0.19, 2: 0.19, 3: 0.48, 4: 0.70},
-    18: {0: 0.18, 1: 0.18, 2: 0.38, 3: 1.08},
-    19: {0: 0.76, 1: 0.76, 2: 0.76, 3: 2.81, 4: 5.46},
-    20: {0: 0.60, 1: 0.60, 2: 0.60, 3: 3.73, 4: 18.63},
-    21: {0: 1.96, 1: 1.96, 2: 1.96, 3: 9.75, 4: 128.07},
-}
-# Pure-Python solve fallback runs ~11x slower (measured median).
-_EXACT_COST_SCALE = 1.0 if NATIVE_AVAILABLE else 11.0
+# The exact solver, native-backed when available. `_exact_move` uses it to
+# upgrade a heuristic move once the midgame search converges with budget to
+# spare (see AlphaBetaBot.choose_move): the solve runs under a deadline and
+# returns None if it cannot finish, so a hard endgame keeps the heuristic move
+# instead of blowing the budget. This replaces a fitted feasibility gate that
+# mispredicted both ways - skipping cheap solves and committing to unbounded
+# ones.
 _EXACT_SOLVE = solve_native if NATIVE_AVAILABLE else solve
 
-
-def _exact_feasible(game, budget):
-    """True when the exact solver's observed worst case for this
-    (cards_left, facedown) cell fits inside the per-move budget - the
-    ~1.7x move ceiling (see choose_move callers) is left as headroom
-    for unsampled tails."""
-    cards_left = 36 - len(game.moves)
-    if cards_left <= 12:
-        return True
-    cost = _EXACT_COST.get(cards_left, {}).get(len(game.board.facedown_cards))
-    return cost is not None and cost * _EXACT_COST_SCALE <= budget
+# Skip the exact-upgrade attempt with less budget than this left - too little
+# to finish anything, just wasted setup.
+_EXACT_UPGRADE_MIN_SECONDS = 0.05
 
 
-def _exact_move(game):
-    result = _EXACT_SOLVE(game)
+def _exact_move(game, deadline=None):
+    """Exact best move, or None if there is no move or the solve was abandoned
+    (deadline tripped). With a deadline the native solver is required - the
+    pure-Python fallback cannot be interrupted."""
+    if deadline is not None:
+        if not NATIVE_AVAILABLE:
+            return None
+        result = solve_native(game, deadline=deadline)
+    else:
+        result = _EXACT_SOLVE(game)
+    if result is None:
+        return None
     marker = result["marker"]
     if marker is None:
         return None
@@ -365,17 +355,32 @@ class AlphaBetaBot:
         self.name = name
 
     def choose_move(self, game):
-        """Pick a legal (row, col) move for `game`'s current player."""
+        """Pick a legal (row, col) move for `game`'s current player.
+
+        Runs the iterative-deepening heuristic search first (always yields a
+        move). If it converged with budget to spare - which only happens once
+        the remaining tree is small enough to search to the end, i.e. the
+        endgame - the leftover time is spent attempting an exact solve under a
+        hard deadline. The exact solve enumerates every face-down resolution
+        (the heuristic only samples up to resolution_cap, so it can misvalue
+        face-down-heavy endgames even at full depth); if it finishes, its move
+        supersedes the heuristic's, otherwise the deadline trips and the
+        heuristic move stands."""
         legal_moves = game.legal_moves
         if not legal_moves:
             raise ValueError("Game is over - no legal moves to choose from")
         if len(legal_moves) == 1:
             return next(iter(legal_moves))
-        if self.params.exact_endgame and _exact_feasible(game, self.time_budget):
-            move = _exact_move(game)
-            if move is not None:
-                return move
-        return self._search_root(game)
+        move = self._search_root(game)
+        if self.params.exact_endgame and NATIVE_AVAILABLE:
+            leftover = self.time_budget - self.last_search.get(
+                "elapsed", self.time_budget
+            )
+            if leftover > _EXACT_UPGRADE_MIN_SECONDS:
+                exact = _exact_move(game, deadline=leftover)
+                if exact is not None:
+                    return exact
+        return move
 
     def _terminal_value(self, me, opp):
         params = self.params
