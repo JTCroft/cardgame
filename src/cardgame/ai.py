@@ -4,7 +4,7 @@
 
 * **Endgame** — once the exact solver's measured worst case for the
   position's (cards left, face-down) cell fits the per-move budget, it
-  defers to `cardgame.solve_native` (Python `solve` fallback), which
+  defers to `cardgame.best_move` (native, pure-Python fallback), which
   optimises win/draw/loss expectation directly - reaching exact play
   from ~16-19 cards at normal budgets.
 * **Opening/midgame** — iterative-deepening expectiminimax under a time
@@ -14,39 +14,34 @@
   expectation into the parent's (alpha, beta) — and a heuristic leaf
   evaluation built from:
 
-  - the actual score difference between the two hands (via the scoring DP),
+  - the score difference between the two hands (via the scoring DP),
   - "potential": the discounted marginal score of every card still on the
-    board against each hand — taking a card the opponent needs removes it
-    from *their* potential, so denial is valued automatically,
-  - rank centrality, decaying as the game progresses: middle ranks (4, 5)
-    fit into more possible runs, so they are worth more early on both to
-    build with and to deny,
+    board against each hand — taking a card the opponent needs denies it, so
+    denial is valued automatically,
+  - rank centrality, decaying as the game progresses (middle ranks fit into
+    more runs, worth more early),
   - a small mobility term, and a terminal win/loss bonus so the bot steers
-    towards ending the game while it is ahead rather than maximising a
-    speculative score.
+    towards ending the game while ahead.
 
-Every tunable lives in `SearchParams`, and a bot is an `AlphaBetaBot`
-instance (params + a time budget), so differently-configured bots can be
-built side by side and matched against each other — `cardgame.validation.arena`
-plays duplicate-deal matches between two bot versions to validate that a
-change actually gains strength. The module-level `choose_move` keeps the
-original convenience API with default parameters.
+Every behavioral tunable lives in `SearchParams`; a bot is an `AlphaBetaBot`
+(params + time budget), so variants can be matched against each other via
+`cardgame.validation.arena`. Module-level `choose_move` is the default-param
+convenience API.
 
-Averaging over the remaining face-down cards is legitimate card counting,
-not cheating: the deck composition and every face-up card are public, so
-both players can deduce the face-down *multiset* — no knowledge of which
-position hides which card is used.
+Averaging over the remaining face-down cards is legitimate card counting:
+the deck and every face-up card are public, so both players can deduce the
+face-down multiset — no knowledge of which cell hides which card is used.
 """
 
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .analysis import move_eval
+from .analysis import move_value
 from .cards import Card, Rank
 from .scoring import score_dp
-from .solver import solve, _root_state, decode
-from .solver_native import solve_native, solve_id_native, NATIVE_AVAILABLE
+from .solver import _root_state, decode
+from .solver_native import best_move, NATIVE_AVAILABLE
 
 try:
     from cardgame_native import heuristic_root as _heuristic_root
@@ -90,12 +85,9 @@ _CENTRALITY = _centrality_table()
 _KING_CENTRALITY = 1.0
 
 # Move-ordering score weights, fitted by within-position least squares on
-# 6200 oracle-labeled positions (8-16 cards left, cardgame.validation.oracle): an
-# oracle-optimal move is ordered first 58.5% of the time vs 48.3% for the
-# previous mover-marginal + denial key, uniformly across card bands
-# (held out). Ordering never changes what a search returns, only how
-# early it cuts. `replies` is the number of moves the opponent is left
-# with - restricting opponent mobility orders well (negative weight).
+# oracle-labeled positions (cardgame.validation.oracle). Ordering never
+# changes what a search returns, only how early it cuts. `replies` is how
+# many moves the opponent is left with (restricting mobility orders well).
 _ORDER_ME = 0.5883
 _ORDER_OPP = 0.1114
 _ORDER_CENT = 2.8549
@@ -176,52 +168,32 @@ class _Timeout(Exception):
     pass
 
 
-# The exact solver, native-backed when available. `_exact_move` uses it to
-# upgrade a heuristic move once the midgame search converges with budget to
-# spare (see AlphaBetaBot.choose_move): the solve runs under a deadline and
-# returns None if it cannot finish, so a hard endgame keeps the heuristic move
-# instead of blowing the budget. This replaces a fitted feasibility gate that
-# mispredicted both ways - skipping cheap solves and committing to unbounded
-# ones. solve_id_native (iterative-deepening + gate) is the default engine:
-# 2.2-2.8x faster than solve_native with identical best move+value, so within
-# the deadline it solves a wider endgame band (arena-neutral, see exact_id).
-_EXACT_SOLVE = solve_id_native if NATIVE_AVAILABLE else solve
-
 # Skip the exact-upgrade attempt with less budget than this left - too little
 # to finish anything, just wasted setup.
 _EXACT_UPGRADE_MIN_SECONDS = 0.05
 
 
-def _exact_move(game, deadline=None, solver=solve_id_native):
+def _exact_move(game, deadline=None):
     """Exact best move, or None if there is no move or the solve was abandoned
-    (deadline tripped). With a deadline the native solver is required - the
-    pure-Python fallback cannot be interrupted. `solver` selects the native
-    exact engine (solve_id_native by default, or solve_native)."""
-    if deadline is not None:
-        if not NATIVE_AVAILABLE:
-            return None
-        result = solver(game, deadline=deadline)
-    else:
-        result = _EXACT_SOLVE(game)
+    (deadline tripped). A deadline requires the native solver - the pure-Python
+    fallback cannot be interrupted (best_move returns None then)."""
+    result = best_move(game, deadline=deadline)
     if result is None:
         return None
     marker = result["marker"]
     if marker is None:
         return None
-    # The solver ranks by (2w+d, s) - it drops Game.evaluate's middle "prefer
-    # decisive" term (w) for sound pruning (see solver.py). Restore it only
-    # where it can matter: among the moves tying the winner on the first term
-    # (2w+d, i.e. sign_sum), re-rank by evaluate's full (2w+d, w, s) so a
-    # guaranteed draw never beats an equal-expectation move that can still win.
-    # An untied winner (the common case) skips this - so the solve itself is
-    # unchanged and only a genuine top-tie pays for the exact per-move re-eval.
+    # The solver ranks by (2w+d, s), dropping evaluate's middle "prefer
+    # decisive" term (w) for sound pruning (see solver.py). Among moves tied on
+    # 2w+d, re-rank by the full (2w+d, w, s) so a guaranteed draw never beats an
+    # equal-expectation move that can still win. Untied winners skip this.
     moves = result["moves"]
     best_sign = max(decode(value)[0] for value, _exact in moves.values())
     tied = [mk for mk, (value, _exact) in moves.items() if decode(value)[0] == best_sign]
     if len(tied) > 1:
         best_key = None
         for mk in tied:
-            candidate = (move_eval(game, mk), mk)
+            candidate = (move_value(game, mk), mk)
             if best_key is None or candidate > best_key:
                 best_key, marker = candidate, mk
     return marker if marker in game.legal_moves else None
@@ -230,125 +202,65 @@ def _exact_move(game, deadline=None, solver=solve_id_native):
 @dataclass(frozen=True)
 class SearchParams:
     """Every *behavioral* tunable of the midgame search - anything that can
-    change what the search returns - in one immutable object so bot
-    variants can be constructed side by side and A/B tested (see
-    `cardgame.validation.arena`). Fitted machinery constants that only
-    affect search speed (the `_ORDER_*` move-ordering weights) or that are
-    a feature's internal shape (the `_CENTRALITY` table) live at module
-    level: they are outputs of offline fits, only coherent to change by
-    refitting, and arena-invisible individually."""
+    change what it returns - in one immutable object, so bot variants can be
+    built side by side and A/B tested (see `cardgame.validation.arena`).
+    Speed-only or feature-shape constants (the `_ORDER_*` weights, the
+    `_CENTRALITY` table) live at module level: they are offline-fit outputs,
+    only coherent to change by refitting, and arena-invisible individually."""
 
     # Upper bound on any value the search can return, used for Star1 cutoffs
-    # at chance nodes - their strength scales directly with how tight this
-    # is. Sound by construction: terminal and leaf values are clamped to
-    # this range on return. Terminals reach at most ~32 (score difference +
-    # win bonus) and heuristic leaves stay within ~±13 in practice, so
-    # clamping essentially never fires outside overwhelmingly decided
-    # positions.
+    # at chance nodes (tighter = stronger). Sound by construction: terminal
+    # and leaf values are clamped to this range on return.
     value_bound: float = 36.0
     win_bonus: float = 6.0
-    # The leaf weights below were fitted by least squares against exact
-    # oracle values (cardgame.validation.oracle: 2500 labeled 8-12 card positions,
-    # ~16k child-position rows; held-out rmse 6.26 -> 4.38 vs the original
-    # hand-guessed 0.35/0.6/0.05/0) and validated in the arena at +6.36
-    # points/pair over 200 duplicate deals (82% game score). Note the
-    # centrality weight is fitted *under the linear decay*, whose shape is
-    # itself unvalidated outside the fitting band.
-    # (2026-07-17: a leaf-feature round - min-replies-left, take-everything
-    # ceiling, clipped win-likelihood, best accessible marginal - improved
-    # held-out oracle RMSE 4.07 -> 3.72 in-band but was arena-refuted as a
-    # joint refit (-1.11 pts/pair; the corpus band, 8-18 cards left, does
-    # not constrain the opening eval) and arena-neutral as a residual fit
-    # over 300 pairs, so it was removed per the arena-proven-only policy.
-    # Candidates, measurements and the offline harness live in
-    # examples/leaf_eval_features.md and validation/fit_weights.py.)
+    # Heuristic leaf weights, fitted by least squares against exact oracle
+    # values (cardgame.validation.oracle) and arena-validated. The centrality
+    # weight is fitted under the linear decay below.
     potential_weight: float = 0.238
     centrality_weight: float = 7.562
     mobility_weight: float = 0.378
-    # King centrality relative to the 0..1 rank table (4/5 = 1.0) inside
-    # the evaluation's centrality sum. Pinned at 1.0; a free fit prices
-    # kings at ~1.13x a 4/5 (2026-07-16), close enough that the pin
-    # survived. Fittable via fit_weights' king-centrality column.
+    # King centrality relative to the 0..1 rank table (4/5 = 1.0) in the
+    # evaluation's centrality sum. Pinned at 1.0; fittable via fit_weights.
     king_centrality: float = 1.0
-    # Phase slopes (2026-07-17, fitted on the exact corpus + the 19-30-card
-    # bootstrap corpus, data/bootstrap_labels.jsonl): each base weight may
-    # vary linearly in cards left ABOVE the in-band anchor,
-    # w_eff = weight + slope * max(cards_left - 12, 0), so play at <= 12
-    # cards is exactly the arena-validated champion and the correction
-    # ramps in toward the opening, where per-band fits show potential
-    # (0.24 -> ~0.07 by 27 cards) and the tempo constant genuinely decay.
-    # The centrality linear-decay shape needs no correction - the
-    # bootstrap fit reproduces it (0.178*cl vs the implied 0.210*cl);
-    # `centrality_base` adds a flat floor to that decayed term,
-    # (centrality_base + centrality_weight * cl / 36) * raw_centrality.
-    # Setting the slopes to 0 recovers the phase-flat champion exactly.
-    # Arena status (2026-07-18): +0.24 +/- 0.21 pts/pair pooled over 400
-    # pairs across two seeds (p~0.26) - consistently positive, below the
-    # proof threshold (~1,200 pairs for this effect size). Kept as
-    # defaults by decision: the change is bit-identical at <= 12 cards
-    # and in-band agreement-neutral, so it can only affect opening play,
-    # where the offline evidence (held-out RMSE 2.5-2.9 -> 1.5-2.3 above
-    # 16 cards vs the bootstrap labels) is strong.
+    # Phase slopes: each base weight varies linearly in cards left above the
+    # pivot, w_eff = weight + slope * max(cards_left - pivot, 0), so play at
+    # <= pivot cards is exactly the arena-validated champion and the
+    # correction only ramps in toward the opening. `centrality_base` adds a
+    # flat floor to the decayed centrality term. Slopes = 0 recovers the
+    # phase-flat champion. Fitted on the exact + bootstrap corpora.
     potential_slope: float = -0.01199
     centrality_base: float = 0.0
     mobility_slope: float = 0.00037
     tempo_slope: float = -0.1182
-    # Where the phase ramp starts, in cards left. The slopes above are
-    # only valid at the pivot they were fitted against - changing this
-    # requires refitting them (fit_weights' phase-fit section grids over
-    # pivots); it is a parameter for that refit loop, not a free knob.
+    # Where the phase ramp starts, in cards left. The slopes are only valid
+    # at the pivot they were fitted against; refitting them (fit_weights'
+    # phase-fit section) is what changes it, not a free knob.
     phase_pivot: float = 12.0
-    # (Empirical per-rank-class material and same-suit proximity features
-    # were tried here and removed: arena-refuted / no fit gain - the DP
-    # potential and centrality terms already carry that information from
-    # better sources. Measured tables live in the 2026-07 analysis notes
-    # and git history.)
-    # Constant added to every heuristic leaf: the value of being on move
-    # (the mover takes the best remaining card first). Affects only
-    # comparisons against terminal values, where it correctly encodes
-    # that a live position is worth more than its bare score.
+    # Constant added to every heuristic leaf: the value of being on move.
+    # Affects only comparisons against terminal values, encoding that a live
+    # position is worth more than its bare score.
     tempo_bonus: float = 2.367
     # Face-down moves branch into one child per possible hidden card; deeper
-    # in the tree the expectation is approximated with this many
-    # evenly-spaced samples of the rank-ordered possibilities.
+    # in the tree the expectation is approximated with this many evenly-spaced
+    # samples of the rank-ordered possibilities.
     resolution_cap: int = 5
     # Positions with at most this many cards left are solved exactly by
-    # Game.evaluate wherever the midgame search meets them, instead of
-    # being searched heuristically or leaf-evaluated: the expectation of
-    # the terminal scoring over the exact outcome distribution replaces
-    # the horizon-truncated guess. Cost-wise 6 is affordable (~0.6ms median
-    # solves, cached across deepening iterations, and measurably *deeper*
-    # searches in the 9-14 card facedown-heavy band) but arena-tested
-    # strength-neutral at 6 (100 pairs, 50.0%), so it stays off by default;
-    # a suspected cause is the value-scale mismatch against heuristic
-    # leaves (exact leaves carry the win-bonus expectation, heuristic
-    # leaves carry none). 0 disables.
+    # Game.evaluate instead of leaf-evaluated. Affordable but arena-neutral,
+    # so off by default (suspected value-scale mismatch vs heuristic leaves).
+    # 0 disables.
     exact_leaf_cards: int = 0
-    # Don't start another deepening iteration once this fraction of the
-    # time budget has been spent. 1.0 means keep deepening until the
-    # deadline aborts mid-iteration: with the previous best searched first
-    # and sound mid-iteration improvements kept, an interrupted iteration
-    # is never worse than idling, so there is no opportunity cost.
+    # Don't start another deepening iteration past this fraction of the
+    # budget. 1.0 keeps deepening until the deadline aborts mid-iteration:
+    # the previous best is searched first and improvements kept, so an
+    # interrupted iteration is never worse than idling.
     deepen_fraction: float = 1.0
     # Defer to the exact solver inside the calibrated endgame region.
     exact_endgame: bool = True
-    # Endgame exact engine: the ID solver (solve_id_native) by default - 2.2-
-    # 2.8x faster than solve_native with identical best move+value, so within
-    # the leftover deadline it reaches exact play a ply earlier and solves a
-    # wider endgame band. Arena-neutral on strength (all-faceup 300 pairs @0.3s:
-    # +0.01 pts/pair, p=0.88) but strictly the faster/deeper solve; kept as an
-    # A/B knob - set False to force solve_native.
-    exact_id: bool = True
-    # Run the opening/midgame iterative-deepening search in the Rust core
-    # (cardgame_native.heuristic_root) instead of pure Python. Same search
-    # and evaluation, bit-identical at equal depth (per-move values verified
-    # to ~1e-15); the win is speed - the native search reaches the same play
-    # far faster (often finishing well inside the budget) and is
-    # arena-neutral vs the Python path (+0.40 ± 0.50 pts/pair, p=0.43, 60
-    # pairs @6s), so it is the default. Falls back to Python automatically
-    # when the native core is unavailable (HEURISTIC_NATIVE) or when
-    # exact_leaf_cards is set (the native port implements exact_leaf_cards=0
-    # only). Set native=False to force the pure-Python reference search.
+    # Run the midgame search in the Rust core (heuristic_root) instead of
+    # Python. Same search, bit-identical at equal depth; the win is speed and
+    # it is arena-neutral, so it is the default. Falls back to Python when the
+    # native core is unavailable or exact_leaf_cards is set (native port is
+    # exact_leaf_cards=0 only). native=False forces the Python reference.
     native: bool = True
 
 
@@ -368,14 +280,10 @@ class AlphaBetaBot:
         """Pick a legal (row, col) move for `game`'s current player.
 
         Runs the iterative-deepening heuristic search first (always yields a
-        move). If it converged with budget to spare - which only happens once
-        the remaining tree is small enough to search to the end, i.e. the
-        endgame - the leftover time is spent attempting an exact solve under a
-        hard deadline. The exact solve enumerates every face-down resolution
-        (the heuristic only samples up to resolution_cap, so it can misvalue
-        face-down-heavy endgames even at full depth); if it finishes, its move
-        supersedes the heuristic's, otherwise the deadline trips and the
-        heuristic move stands."""
+        move). If it converged with budget to spare (the endgame), the leftover
+        time attempts an exact solve under a hard deadline - it enumerates every
+        face-down resolution the heuristic only samples. If it finishes its move
+        wins, otherwise the deadline trips and the heuristic move stands."""
         legal_moves = game.legal_moves
         if not legal_moves:
             raise ValueError("Game is over - no legal moves to choose from")
@@ -387,8 +295,7 @@ class AlphaBetaBot:
                 "elapsed", self.time_budget
             )
             if leftover > _EXACT_UPGRADE_MIN_SECONDS:
-                solver = solve_id_native if self.params.exact_id else solve_native
-                exact = _exact_move(game, deadline=leftover, solver=solver)
+                exact = _exact_move(game, deadline=leftover)
                 if exact is not None:
                     return exact
         return move
@@ -430,18 +337,11 @@ class AlphaBetaBot:
 
     def _evaluate_leaf(self, game, me, opp, taken, remaining):
         # The search's hot spot. The potential term (each hand's summed
-        # marginals over the cards still on the board) is a per-card sum,
-        # so it can be computed two equivalent ways, and each leaf picks
-        # the shorter one:
-        # * direct - one probe per hand per remaining card, or
-        # * incremental - potential(hand, root remaining), cached per hand
-        #   in _fullpot, minus the marginals of the cards taken on the
-        #   path from the root: O(path length) probes.
-        # Shallow horizons (long remaining, short path) go incremental;
-        # deep endgame horizons (the reverse) go direct, which also keeps
-        # the full-board sweep from probing expensive many-king hands the
-        # direct sum never needs. All sums are integers, so values are
-        # bit-for-bit identical either way.
+        # marginals over cards still on the board) is computed the shorter of
+        # two equivalent ways per leaf: direct (one probe per hand per
+        # remaining card) or incremental (the _fullpot-cached root potential
+        # minus the path's taken marginals). Shallow horizons go incremental,
+        # deep endgame horizons direct; integer sums, so identical either way.
         params = self.params
         score = _score
         me_int, me_kings = me
@@ -608,7 +508,7 @@ class AlphaBetaBot:
         every deepening iteration are solved once."""
         value = self._exact_cache.get(game.moves)
         if value is None:
-            prob = game.evaluate()["Evaluation"]
+            prob, _best = game.evaluate()
             m = prob.multiplicity
             w, d, s = prob.wds
             value = (s + self.params.win_bonus * (2 * w + d - m)) / m
@@ -624,14 +524,11 @@ class AlphaBetaBot:
             return self._terminal_value(me, opp)
         if 36 - len(game.moves) <= self.params.exact_leaf_cards:
             return self._exact_leaf(game)
-        # Transposition probe. `mask` is the taken-cell bitmask; with the
-        # marker and both hands it fully determines the subgame (hands alone
-        # don't - the same revealed card can have come from different
-        # face-down cells). Entries are (depth, flag, value, best_marker)
-        # with flag 0 exact / 1 lower bound / -1 upper bound (fail-soft);
-        # a shallower entry can't answer for a deeper request but its best
-        # move still improves ordering, which is where an iterative
-        # deepener earns most of its table hits.
+        # Transposition probe. The taken-cell mask, marker and both hands
+        # fully determine the subgame (hands alone don't). Entries are
+        # (depth, flag, value, best_marker), flag 0 exact / 1 lower / -1 upper
+        # (fail-soft); a shallower entry can't answer a deeper request but its
+        # best move still improves ordering.
         key = (mask, game.moves[-1], me, opp)
         entry = self._tt.get(key)
         tt_move = None
@@ -752,8 +649,8 @@ class AlphaBetaBot:
         ]
         best_marker = moves[0][0]
         # Value of best_marker to the player to move (higher = better for the
-        # mover). Tracked so evaluate_position/choose_placement can compare
-        # positions, not just pick a move. Set once depth 1 completes.
+        # mover). Tracked so choose_placement can compare positions, not just
+        # pick a move. Set once depth 1 completes.
         best_value = -bound
         max_depth = 36 - len(game.moves)
         depth = 1
@@ -814,32 +711,15 @@ class AlphaBetaBot:
         }
         return best_marker
 
-    def evaluate_position(self, game):
-        """Searched value of `game` to the player to move (higher = better for
-        the mover), from the same iterative-deepening search as choose_move.
-        Runs the pure-Python root (the native root returns only a move, no
-        scalar value), so it is slower than choose_move but yields a number
-        comparable across positions - used by choose_placement."""
-        if not game.legal_moves:
-            if len(game.moves) % 2 == 0:
-                me, opp = game.p1.as_int, game.p2.as_int
-            else:
-                me, opp = game.p2.as_int, game.p1.as_int
-            return self._terminal_value(me, opp)
-        self._search_root_python(game)
-        return self.last_search["value"]
-
     def choose_placement(self, game):
-        """Best starting cell for the placer (the player NOT moving first),
-        i.e. the one MINIMISING the value of the mover's best reply.
+        """Best starting cell for the placer (the player NOT moving first):
+        the one MINIMISING the mover's best reply.
 
         Shares one search across the four placements. The starting cell is
-        never collected, so the position *after* the mover's first move depends
-        only on the target cell, not which cell the marker began on - and the
-        transposition table keys exactly on that (taken-mask + marker + hands),
-        so every subtree shared between placements is searched once and reused.
-        A joint iterative deepening evaluates all four placement roots at each
-        depth (warm table), keeping their values at equal, comparable depth."""
+        never collected, so the position after the mover's first move depends
+        only on the target cell, and the transposition table keys exactly on
+        that - every shared subtree is searched once. Joint iterative deepening
+        keeps all four values at equal, comparable depth."""
         if self._use_native() and _heuristic_placement is not None:
             return self._choose_placement_native(game)
         return self._choose_placement_python(game)

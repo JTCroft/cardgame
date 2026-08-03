@@ -906,6 +906,66 @@ fn distribution(
     })
 }
 
+/// Root exact evaluation in one walk: the position's value distribution AND
+/// the best move. Runs dist_search's root loop directly (the same
+/// (2w+d, w, s)-then-marker selection Game.evaluate / analyse_moves use) but
+/// also returns which marker won. Returns (best_marker, (m, w, d, s),
+/// (score_diff, weight) pairs) in the root mover's own perspective, or None
+/// if the deadline tripped. best_marker is None for a terminal position.
+#[pyfunction]
+#[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_root(
+    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
+    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
+) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64, i64, i64), Vec<(i64, i64)>)>> {
+    let mut ctx = new_actx(cells, &unknowns, deadline_secs)?;
+    let nu = unknowns.len();
+    py.detach(move || {
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            // Terminal: a single-bin histogram at the final score difference,
+            // in the root mover's perspective - mirrors Game.evaluate's
+            // ProbEval(mult, {diff: mult}) leaf.
+            let agg = ctx.leaf(mi, mk, oi, ok, nu);
+            let diff = score(mi, mk) - score(oi, ok);
+            return Ok(Some((None, (agg.m, agg.w, agg.d, agg.s), vec![(diff, agg.m)])));
+        }
+        let mut best: Option<(Agg, Hist, (usize, usize))> = None;
+        for &target in &buf[..n] {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = ctx.cells[target];
+            let (cagg, chist) = if payload < 0 {
+                ctx.dist_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+            } else if payload > 0 {
+                ctx.dist_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+            } else {
+                ctx.dist_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+            };
+            let candidate = cagg.neg();
+            let marker = (target / 6, target % 6);
+            let better = match best {
+                None => true,
+                Some((ba, _, bm)) => (candidate.key(), marker) > (ba.key(), bm),
+            };
+            if better {
+                best = Some((candidate, hist_rev(&chist), marker));
+            }
+        }
+        if ctx.aborted {
+            return Ok(None);
+        }
+        let (bagg, bhist, bmarker) = best.unwrap();
+        let out: Vec<(i64, i64)> = (0..HIST_SIZE)
+            .filter(|&i| bhist[i] != 0)
+            .map(|i| (i as i64 - HIST_OFFSET, bhist[i]))
+            .collect();
+        Ok(Some((Some(bmarker), (bagg.m, bagg.w, bagg.d, bagg.s), out)))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Root (port of solver.solve, ordered=False path)
 // ---------------------------------------------------------------------------
@@ -930,76 +990,15 @@ fn new_ctx(cells: Vec<i64>, unknowns: &[i64], deadline_secs: Option<f64>) -> PyR
     })
 }
 
+/// Exact root solve by iterative deepening + gate/bound cache (port of
+/// experiments/id_best.py). Returns (best_marker, (sign_sum, score_sum),
+/// per-move rows). The best marker and its value are exact; rival-move values
+/// are valid upper bounds but, being order- and deepening-dependent, may
+/// differ from an exhaustive solve numerically. None on deadline.
 #[pyfunction]
 #[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
 #[allow(clippy::too_many_arguments)]
 fn solve_root(
-    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
-    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
-) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)>> {
-    let mut ctx = new_ctx(cells, &unknowns, deadline_secs)?;
-    let nu = unknowns.len();
-
-    py.detach(move || {
-        let mut buf = [0usize; 10];
-        let n = legal(cell, rows, cols, &mut buf);
-        if n == 0 {
-            let v = ctx.leaf(mi, mk, oi, ok, nu);
-            return Ok(Some((None, (v.0, v.1), Vec::new())));
-        }
-        // face-up moves first, stable within each group - same order as
-        // Python's sorted(legal, key=lambda t: cells[t] is None)
-        let mut ordered: Vec<usize> = Vec::with_capacity(n);
-        ordered.extend(buf[..n].iter().filter(|&&t| ctx.cells[t] >= 0));
-        ordered.extend(buf[..n].iter().filter(|&&t| ctx.cells[t] < 0));
-
-        let mut best: Option<(V, (usize, usize))> = None;
-        let mut moves: Vec<MoveRow> = Vec::with_capacity(n);
-        for target in ordered {
-            let alpha = match best {
-                None => INF.neg(),
-                Some((bv, _)) => bv.sub(V(0, 1)),
-            };
-            let nrows = rows | 1 << target;
-            let ncols = cols | col_bit(target);
-            let payload = ctx.cells[target];
-            let v = if payload < 0 {
-                ctx.chance(target, nrows, ncols, mi, mk, oi, ok, nu, alpha, INF)
-            } else if payload > 0 {
-                ctx.search(
-                    target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu,
-                    INF.neg(), alpha.neg(),
-                )
-                .neg()
-            } else {
-                ctx.search(
-                    target, nrows, ncols, oi, ok, mi, mk + 1, nu,
-                    INF.neg(), alpha.neg(),
-                )
-                .neg()
-            };
-            if ctx.aborted {
-                return Ok(None); // deadline tripped mid-solve; no exact result
-            }
-            let marker = (target / 6, target % 6);
-            moves.push((marker, (v.0, v.1), best.is_none() || v > alpha));
-            if best.is_none() || (v, marker) > best.unwrap() {
-                best = Some((v, marker));
-            }
-        }
-        let (bv, bm) = best.unwrap();
-        Ok(Some((Some(bm), (bv.0, bv.1), moves)))
-    })
-}
-
-/// Iterative-deepening exact root solve (port of id_best.solve_id). Returns
-/// the same shape as solve_root - the best marker and its value are exact and
-/// identical to solve_root; rival-move values are valid upper bounds but, being
-/// order- and deepening-dependent, may differ numerically. None on deadline.
-#[pyfunction]
-#[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
-#[allow(clippy::too_many_arguments)]
-fn solve_id_root(
     py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
     mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
 ) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)>> {
@@ -1672,34 +1671,13 @@ fn heuristic_placement(
     })
 }
 
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn heuristic_probe(
-    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
-    ok: u8, unknowns: Vec<i64>, params: Vec<f64>, resolution_cap: usize, depth: i64,
-) -> PyResult<Vec<((usize, usize), f64)>> {
-    let (mut ctx, nu) = new_hctx(cells, unknowns, &params, None)?;
-    ctx.p.resolution_cap = resolution_cap;
-    py.detach(move || {
-        let bound = ctx.p.value_bound;
-        let mut out = Vec::new();
-        for (target, fd) in ctx.ordered(cell, rows, cols, mi, mk, oi, ok, nu) {
-            let value =
-                ctx.child_value(target, fd, rows, cols, mi, mk, oi, ok, nu, depth, -bound, bound);
-            out.push(((target / 6, target % 6), value));
-        }
-        Ok(out)
-    })
-}
-
 #[pymodule]
 fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_root, m)?)?;
-    m.add_function(wrap_pyfunction!(solve_id_root, m)?)?;
     m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
     m.add_function(wrap_pyfunction!(distribution, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_root, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_root, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_placement, m)?)?;
-    m.add_function(wrap_pyfunction!(heuristic_probe, m)?)?;
     Ok(())
 }

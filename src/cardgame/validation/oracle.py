@@ -98,7 +98,7 @@ def label_position(game):
     for resolutions in game.all_moves():
         entries = []
         for child in resolutions:
-            ev = child.evaluate()["Evaluation"]
+            ev, _best = child.evaluate()
             w, d, s = ev.wds
             entries.append(
                 {"card": repr(child.taken_card), "w": w, "d": d, "s": s,

@@ -30,13 +30,13 @@ FINAL = object()
 __all__ = (
     "analyse_moves_native",
     "iter_move_analyses",
-    "move_eval_native",
+    "move_value_native",
     "NATIVE_AVAILABLE",
     "FINAL",
 )
 
 
-def move_eval_native(game, marker, deadline=None):
+def move_value_native(game, marker, deadline=None):
     """Exact Eval(m, w, d, s) for a single legal move, current player's
     perspective - the native per-move aggregate without the full-slate walk
     iter_move_analyses does. Used to break the exact solver's (2w+d, s) ties

@@ -234,13 +234,13 @@ class Eval(tuple):
     def __lt__(self, other):
         return self.__apply_op(lt, other)
 
-    def __lte__(self, other):
+    def __le__(self, other):
         return self.__apply_op(le, other)
 
     def __gt__(self, other):
         return self.__apply_op(gt, other)
 
-    def __gte__(self, other):
+    def __ge__(self, other):
         return self.__apply_op(ge, other)
 
     def __eq__(self, other):
@@ -252,26 +252,11 @@ class Eval(tuple):
         )
 
     def decisively_exceeds(self, other):
-        # (2w + d, w, s) is a valid total order, but it is NOT reliably
-        # reversed by negation: __neg__ maps (w, d, s) -> (m-w-d, d, -s),
-        # so the first component maps 2w+d -> 2m - (2w+d), a strictly
-        # decreasing bijection - safe on its own - but the second (w) is
-        # UNCHANGED whenever 2w+d ties between two values (algebra: if
-        # 2w1+d1 = 2w2+d2 = x, then the negated w's are m+w1-x and
-        # m+w2-x, so their difference is (w1-w2) unchanged). That means
-        # a comparison DECIDED by the w tiebreak (2w+d ties, w differs)
-        # can come out "greater than" on BOTH sides of a negation at
-        # once - the exact scenario the codebase's docstrings warn is
-        # "not strictly well ordered". `alpha > beta and not -alpha >
-        # -beta` only catches this when alpha/beta THEMSELVES exhibit
-        # it; it can't see that continuing the search might later find
-        # an even-better value that would (see
-        # evaluate-alpha-beta-ordering-bug in project memory for the
-        # concrete counterexample this was fixed from). The one
-        # comparator outcome immune to this regardless of what a deeper
-        # search might still find is a STRICT difference in 2w+d alone
-        # (cross-multiplied to a common multiplicity, like every other
-        # comparison here) - only that is safe to prune on.
+        # Prune-safe strict comparison on 2w+d alone. Full (2w+d, w, s)
+        # ordering is not reversed by negation - the w tiebreak survives
+        # negating both sides - so pruning on it is unsound, but a strict
+        # 2w+d difference is immune (see evaluate-alpha-beta-ordering-bug
+        # in project memory for the counterexample).
         self_multip = self.multiplicity
         other_multip = other.multiplicity
         if self_multip == other_multip:
@@ -364,34 +349,21 @@ class ProbEval(Counter):
     def __lt__(self, other):
         return self._bound_evals()[1] < other._bound_evals()[0]
 
-    def __lte__(self, other):
+    def __le__(self, other):
         return self._bound_evals()[1] <= other._bound_evals()[0]
 
     def __gt__(self, other):
         return self._bound_evals()[0] > other._bound_evals()[1]
 
-    def __gte__(self, other):
+    def __ge__(self, other):
         return self._bound_evals()[0] >= other._bound_evals()[1]
 
     def __eq__(self, other):
-        # Ordering (and therefore equality) on a ProbEval is only ever
-        # meaningful through Eval: ProbEval's job is to record the exact
-        # frequency map, Eval's is to reduce that to a well-ordered (w, d,
-        # s) bound for comparison/tie-breaking - see _bound_evals and
-        # __lt__/__gt__ below. A dict-based __eq__ bypassed that and
-        # compared raw Counter contents instead, so two distributions with
-        # identical (w, d, s) - and therefore identical bounds - but
-        # different underlying frequency maps (e.g. {-4: 2, -2: 4} and
-        # {-3: 4, -2: 2}, both w=0, d=0, s=-16) came out simultaneously
-        # not-equal, not-less, and not-greater. That silently broke the
-        # (eval, marker) tie-break used throughout (score_walk, evaluate,
-        # _collect_terminals all compare (value, marker) tuples and rely on
-        # tied values falling through to the marker) - ties resolved by
-        # iteration order instead of the intended deterministic marker
-        # tie-break. Comparing bounds here instead keeps __eq__ consistent
-        # with __lt__/__gt__ for both fully- and partially-observed
-        # ProbEvals, and (via Eval.__eq__) handles differing multiplicities
-        # the same way they do.
+        # Compare on (w, d, s) bounds, consistent with __lt__/__gt__. The
+        # inherited dict __eq__ compared raw Counter contents, so two
+        # distributions with equal bounds but different frequency maps came
+        # out simultaneously not-equal/not-less/not-greater, breaking the
+        # (value, marker) tie-break used throughout the search.
         self_bounds = self._bound_evals()
         other_bounds = other._bound_evals()
         return self_bounds[0] == other_bounds[0] and self_bounds[1] == other_bounds[1]
@@ -642,58 +614,6 @@ class Game:
             mover_kings,
         )
 
-    @property
-    def move_evals(self):
-        move_evals = {}
-        for move in self.all_moves():
-            move_evals[move[0].marker] = {
-                "resolved_evals": {
-                    move_possibility.taken_card: -(move_possibility.score_walk()[0])
-                    for move_possibility in move
-                }
-            }
-            if move[0].marker in self.board.facedown_positions:
-                move_evals[move[0].marker]["combined_eval"] = ProbEval.combine(
-                    list(move_evals[move[0].marker]["resolved_evals"].values())
-                )
-            else:
-                move_evals[move[0].marker]["combined_eval"] = move_evals[
-                    move[0].marker
-                ]["resolved_evals"][move[0].taken_card]
-        return move_evals
-
-    def score_walk(self, _state=None):
-        # _state is the same threaded (mover_int, mover_kings, other_int,
-        # other_kings) evaluate uses, so terminals score from the cache
-        # with no Hand construction.
-        if _state is None:
-            _state = self._hand_state()
-        if not self.legal_moves:
-            multiplicity = self.multiplicity
-            diff = _cached_score(_state[0], _state[1]) - _cached_score(
-                _state[2], _state[3]
-            )
-            return ProbEval(
-                multiplicity=multiplicity,
-                initial_counts={diff: multiplicity},
-            ), (-1, -1)
-        child_state = self._child_hand_state
-        best_score = max(
-            (
-                -ProbEval.combine(
-                    [
-                        move_possibility.score_walk(
-                            child_state(_state, move_possibility.taken_card)
-                        )[0]
-                        for move_possibility in move
-                    ]
-                ),
-                move[0].marker,
-            )
-            for move in self.all_moves()
-        )
-        return best_score
-
     @staticmethod
     def _get_bounds(branch_multiplicity, move_score, alpha, beta):
         # Same arithmetic as the original Counter-copy formulation, one
@@ -730,18 +650,37 @@ class Game:
             subbeta = ub
         return subalpha, subbeta
 
-    def evaluate(self, alpha=None, beta=None, _state=None):
-        # Note: unexplored-branch placeholders here deliberately use the
-        # loose global ±26. Tighter per-position bounds (from scoring's
-        # monotonicity: a hand vs the hand plus everything left on the
-        # board) were tried and are provably sound, but this engine's
-        # fail-soft bookkeeping folds the observed mass of partially
-        # evaluated moves into complete results, which is only safe when a
-        # chance move is abandoned under the most optimistic completion
-        # possible anywhere - tightening the abandonment check corrupts
-        # evaluations (found by counterexample), and tightening the other
-        # fill sites measurably prunes nothing. Such bounds suit search
-        # schemes with explicit per-node intervals instead.
+    def evaluate(self):
+        """Exact value of this position as a single ProbEval (the score-
+        difference distribution under optimal play, in the mover's own
+        perspective) together with the best move's marker (None at a
+        terminal). Native-backed when the Rust core is available (one
+        `evaluate_root` walk), falling back to the pure-Python
+        `_evaluate_python` engine otherwise.
+
+        Returns (ProbEval, best_marker). The native and pure-Python engines
+        agree exactly on the value's (w, d, s) and on the best move; they may
+        differ in how the histogram distributes weight among tied-optimal
+        lines, which is invisible to every consumer (ProbEval orders on its
+        (w, d, s) bounds, not raw counts)."""
+        from .solver_native import NATIVE_AVAILABLE, evaluate_native
+
+        if NATIVE_AVAILABLE:
+            return evaluate_native(self)
+        result = self._evaluate_python()
+        return result["Evaluation"], result["best_marker"]
+
+    def _evaluate_python(self, alpha=None, beta=None, _state=None):
+        # Pure-Python reference engine behind Game.evaluate (the no-native
+        # fallback), and the recursive workhorse: it calls itself under
+        # negated windows. Returns the full internal dict (Evaluation, the
+        # deterministic optimal PV, per-branch scores, and the best marker);
+        # the public `evaluate` reduces that to (ProbEval, best_marker).
+        #
+        # Unexplored-branch placeholders use the loose global ±26. Tighter
+        # per-position bounds are sound in principle but corrupt this
+        # engine's fail-soft bookkeeping (found by counterexample) and prune
+        # nothing at the other fill sites (see position-bounds-finding).
         multiplicity = self.multiplicity
         if not self.legal_moves:
             # _state is the incrementally threaded (mover_int, mover_kings,
@@ -755,6 +694,7 @@ class Game:
             return {
                 "Evaluation": ProbEval(multiplicity, {diff: multiplicity}),
                 "Deterministic optimal moves": tuple(),
+                "best_marker": None,
             }
         if _state is None:
             _state = self._hand_state()
@@ -764,6 +704,7 @@ class Game:
             beta = Eval(multiplicity, multiplicity, 0, bound_sum)
         best_score = ProbEval(multiplicity).lower_bound
         best_move_seq = ((-1, -1),)
+        best_marker = None
         ordered_moves = sorted(self.all_moves(), key=len)
         detailed_move_scores = {}
         child_state = self._child_hand_state
@@ -771,13 +712,14 @@ class Game:
         for move in ordered_moves:
             move_marker = move[0].marker
             if len(move) == 1:
-                move_eval = move[0].evaluate(
+                move_eval = move[0]._evaluate_python(
                     -beta, -alpha, _state=child_state(_state, move[0].taken_card)
                 )
                 move_score = -(move_eval["Evaluation"])
                 detailed_move_scores[move_marker] = move_score
                 if (move_score, move_marker) > (best_score, best_move_seq[0]):
                     best_score = move_score
+                    best_marker = move_marker
                     best_move_seq = (move[0].taken_card,) + move_eval[
                         "Deterministic optimal moves"
                     ]
@@ -795,7 +737,7 @@ class Game:
                     subalpha, subbeta = self._get_bounds(
                         branch_multiplicity, move_score, alpha, beta
                     )
-                    possibility_eval = possibility.evaluate(
+                    possibility_eval = possibility._evaluate_python(
                         -subbeta,
                         -subalpha,
                         _state=child_state(_state, possibility.taken_card),
@@ -810,6 +752,7 @@ class Game:
                     move_score.update(possibility_score)
                     if (move_score, move_marker) > (best_score, best_move_seq[0]):
                         best_score = move_score
+                        best_marker = move_marker
                         curr_move_best_move = True
                     move_lower, move_upper = move_score._bound_evals()
                     if move_upper < alpha:
@@ -830,6 +773,7 @@ class Game:
             "Evaluation": best_score,
             "Deterministic optimal moves": best_move_seq,
             "Known info for other branches": detailed_move_scores,
+            "best_marker": best_marker,
         }
 
     def save(self, alnum=False):

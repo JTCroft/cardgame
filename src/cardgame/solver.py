@@ -20,7 +20,7 @@ from math import factorial
 from .cards import Rank
 from .game import _cached_score
 
-__all__ = ("solve", "solve_plain", "decode", "SIGN_SCALE")
+__all__ = ("decode", "SIGN_SCALE")
 
 # Must exceed 2 * 26 * 12! so any sign-count difference outweighs any
 # possible score-sum difference at the maximum root multiplicity.
@@ -273,8 +273,10 @@ def _finish(best_v, best_marker, moves, multiplicity):
     }
 
 
-def solve_plain(game):
-    """Exhaustive root solve - every move's exact value, no pruning."""
+def _solve_plain(game):
+    """Exhaustive root solve - every move's exact value, no pruning. The
+    unpruned pure-Python ground-truth reference (used to differential-test the
+    pruned/native solvers); not a normal route - call `best_move` instead."""
     cells, cell, rows, cols, mi, mk, oi, ok, unknowns = _root_state(game)
     legal = _legal_cells(cell, rows, cols)
     m = _FACT[len(unknowns)]
@@ -306,14 +308,14 @@ def solve_plain(game):
     return _finish(best_v, best_marker, moves, m)
 
 
-def solve(game, ordered=False):
-    """Pruned root solve. The best move's value is exact; rival moves
-    carry (value, exact_flag) - a non-exact value is an upper bound.
-    Root alpha sits one below the incumbent so equal-valued rivals stay
-    exact and the (value, marker) tie-break matches solve_plain.
-    ordered=True uses heuristic move ordering - measured neutral overall
-    (wins ~15-25% on most positions, loses similar on some), kept for
-    experimentation."""
+def _solve_python(game, ordered=False):
+    """Pruned pure-Python root solve - the fallback `best_move` dispatches to
+    when the native core is unavailable. The best move's value is exact; rival
+    moves carry (value, exact_flag) - a non-exact value is an upper bound.
+    Root alpha sits one below the incumbent so equal-valued rivals stay exact
+    and the (value, marker) tie-break matches _solve_plain. ordered=True uses
+    heuristic move ordering - measured neutral overall (wins ~15-25% on most
+    positions, loses similar on some), kept for experimentation."""
     cells, cell, rows, cols, mi, mk, oi, ok, unknowns = _root_state(game)
     legal = _legal_cells(cell, rows, cols)
     m = _FACT[len(unknowns)]

@@ -1,56 +1,22 @@
-"""A basic Flask + Flask-SocketIO front end for playing Cross Kings online
-in a 'room', with game state synced live between players over WebSockets.
+"""Flask + Flask-SocketIO front end for playing Cross Kings online.
 
-Two players can play a game together by both visiting
+Two players share a game at /room/<4 letter code>; visiting auto-claims a
+vacant seat, later visitors spectate. /play is the same room model keyed by
+the visitor's own player id, with the computer seated in the other seat. A
+solo game is just a room whose second seat is computer-played. /rooms lists
+live rooms; finished games are reviewable from a frozen snapshot.
 
-    https://<site>/room/<4 letter room code>
+There's no server-side session: each browser generates a player id (UUID)
+and display name in localStorage, sent up with every event. The initial
+render is a generic shell; the real per-viewer board is filled in over the
+socket once the page's JS supplies its identity.
 
-Visiting a room auto-claims a vacant seat for you (see the "join" handler
-below); once both seats are taken, later visitors become spectators.
-Spectators can still claim either vacant seat, up until the game starts;
-seated players can give their seat back up right up until the first move.
-Once the game is under way, seats are locked in for the rest of that game.
-
-Every visitor can pick a display name (via the settings button) at any
-point; unnamed seated players just show as "Player 1"/"Player 2".
-
-There's no server-side login or session here: each browser generates its
-own player id (a UUID) on first visit and keeps it - along with the chosen
-display name - in localStorage. Both are sent up with every relevant
-Socket.IO event (see `withIdentity()` in base.html.jinja2), which is what
-this server uses to recognise "the same visitor" across page loads and
-reconnects. This means the initial (non-JS) page render can't know who's
-asking - routes render a generic shell, and the real, personalised board
-is filled in moments later once the page's own JS reads its stored identity
-and asks for it over the socket.
-
-A `/rooms` page lists all rooms currently in memory, live-updated the same
-way, for matchmaking or spectating.
-
-`/play` is the same underlying room model, just keyed by the visiting
-player's own id instead of a shared code, with the computer opponent
-(see `cardgame.ai`) automatically seated in the other seat, and rematches
-auto-accepted on its behalf - see `rooms.RoomState.computer_seat`. There's
-deliberately no separate "solo game" concept here: a solo game against the
-computer *is* a room, just one where the second seat happens to be
-computer-played instead of human-played.
-
-Both finished rooms and finished solo games can also be reviewed after the
-fact from a frozen snapshot (see the "Recently finished" sections on
-/rooms), independent of whatever the room/player has done since.
-
-This module wires up the actual HTTP routes and Socket.IO event handlers.
-The supporting state/storage/rendering logic behind them is split out by
-concern into sibling modules, kept in memory and per-process (this is
-intentionally simple - fine for a single-process demo/dev server, but state
-is lost on restart and won't be shared across multiple worker processes;
-for production you'd want to move it into a shared store, e.g. Redis, which
-flask-socketio can also use as a "message queue" to fan out events across
-multiple workers):
-
-- `identity.py` - validating the client-supplied player id/name described above.
-- `rooms.py` - room state (`RoomState`, keyed by room code or player id).
-- `extensions.py` - the shared `socketio` instance `rooms.py` emits through.
+State is in-memory and per-process. This module owns the HTTP routes and
+Socket.IO handlers; supporting concerns are split into siblings: rooms.py
+(state + lifecycle helpers + identity validation), rendering.py (per-viewer
+render/broadcast + view models), analysis_worker.py (post-game analysis),
+analysis_policy.py (feasibility/grace-period predicates), game_flow.py
+(computer turn + freezing finished games), extensions.py (shared socketio).
 """
 
 import importlib.metadata
@@ -75,65 +41,60 @@ from ..analysis_native import NATIVE_AVAILABLE as _ANALYSIS_NATIVE
 from ..cards import Card
 from ..game import Game
 from ..solver_native import NATIVE_AVAILABLE as _SOLVER_NATIVE
+from .analysis_policy import grace_period_over
+from .analysis_worker import ensure_analysis_worker, start_ondemand_analysis
 from .extensions import app_holder, socketio
-from .identity import _MAX_NAME_LENGTH, _normalize_player_id
+from .game_flow import maybe_play_computer_move, record_room_finished_locked
+from .rendering import (
+    broadcast_state,
+    lobby_active_summaries,
+    lobby_finished_summaries,
+    render_room_review_state,
+    render_state,
+)
 from .rooms import (
-    _broadcast_state,
+    MAX_NAME_LENGTH,
     create_solo_room_from_state,
-    _deal_fresh_locked,
+    deal_fresh_locked,
     decode_game_state,
-    _ensure_analysis_worker,
-    _finished_rooms_lock,
-    _find_finished_room_entry,
-    _get_or_create_room,
-    _grace_period_over,
-    _lobby_active_summaries,
-    _lobby_finished_summaries,
-    _maybe_play_computer_move,
-    _normalize_code,
-    _random_unused_code,
-    _record_room_finished_locked,
-    _render_room_review_state,
-    _render_state,
-    _resolve_or_create_room_for_join,
-    _resolve_room_key,
-    _rooms,
-    _sid_index,
-    _sid_index_lock,
-    start_ondemand_analysis,
+    find_finished_room_entry,
+    finished_rooms_lock,
+    get_or_create_room,
+    normalize_code,
+    normalize_player_id,
+    random_unused_code,
+    resolve_or_create_room_for_join,
+    resolve_room_key,
+    rooms,
+    sid_index,
+    sid_index_lock,
     status_counts,
 )
 
-# Socket.IO broadcast group used for the /rooms lobby listing. This is a
-# genuine flask-socketio "room" (its group-of-connections concept, distinct
-# from our own 4-letter game room codes) since every viewer of the lobby
-# sees identical content, unlike a game room's live state, which is
-# personalised per player/spectator and therefore sent individually instead
-# of through a broadcast group. See rooms._broadcast_state() for that case.
+# flask-socketio broadcast group for the /rooms lobby listing (identical for
+# every viewer, unlike per-viewer game state). Distinct from our 4-letter
+# game room codes.
 _LOBBY_GROUP = "lobby"
 
 
 def _render_lobby():
     return render_template(
         "_lobby_state.html.jinja2",
-        rooms=_lobby_active_summaries(),
-        finished_games=_lobby_finished_summaries(),
+        rooms=lobby_active_summaries(),
+        finished_games=lobby_finished_summaries(),
     )
 
 
 def _how_to_play_context():
-    """Data for the illustrated rules page: a real dealt board plus, for
-    each diagram, the marker cell, the highlighted legal moves and any
-    taken cells (gaps). The scoring diagrams are hand-built card rows."""
-    game = Game.deal()  # diagonals face down, marker starts central
+    """Data for the illustrated rules page: a dealt board plus, for each
+    diagram, the marker cell, highlighted legal moves and taken cells (gaps).
+    The scoring diagrams are hand-built card rows."""
+    game = Game.deal()
     board = game.board
 
-    # A real, reachable position for the "passing over gaps" diagram: play
-    # a short legal sequence (the exact cards don't matter, only that every
-    # step is a legal rook move) so the marker ends up sitting in a gap -
-    # the card it collected - with further gaps in its row and column to
-    # reach past. Facedown destinations resolve to several children; any
-    # one will do since those cells become gaps.
+    # A reachable position for the "passing over gaps" diagram: play a short
+    # legal sequence so the marker sits in a gap with further gaps to reach
+    # past. Facedown destinations resolve to several children; any one will do.
     gap_game = game
     for move in [(2, 3), (4, 3), (4, 1), (1, 1), (1, 3)]:
         gap_game = gap_game.move(*move)[0]
@@ -163,11 +124,8 @@ def create_app():
     app = Flask(__name__)
     app.secret_key = os.environ.get("CARDGAME_SECRET_KEY", secrets.token_hex(16))
 
-    # Reuse the same card/board/hand rendering macros the package already
-    # uses for its Jupyter _repr_html_ output (templates/components.html.jinja2
-    # at the repo root), instead of maintaining a separate copy here. Flask's
-    # own template loader only looks in this package's templates/ folder by
-    # default, so we chain in the package-wide one too.
+    # Chain in the package-wide templates/ folder (the card/board macros
+    # shared with the Jupyter _repr_html_ output) alongside Flask's default.
     app.jinja_loader = ChoiceLoader(
         [
             app.jinja_loader,
@@ -189,16 +147,12 @@ def create_app():
 
     @app.get("/favicon.ico")
     def favicon():
-        # Browsers/crawlers request /favicon.ico at the root; serve the
-        # static file rather than falling through to the 404 page.
         return redirect(url_for("static", filename="favicon.ico"))
 
     @app.get("/status")
     def status():
-        # Lightweight health/diagnostics as JSON. `native` reports whether
-        # the Rust core backs each hot path: `solver` the computer opponent
-        # (cardgame.choose_move) and `analysis` the post-game move analysis.
-        # Both false means the pure-Python fallbacks are in use.
+        # Health/diagnostics JSON. `native` reports whether the Rust core
+        # backs the solver (computer opponent) and post-game analysis.
         return {
             "status": "ok",
             "version": importlib.metadata.version("cardgame"),
@@ -211,8 +165,8 @@ def create_app():
 
     @app.get("/robots.txt")
     def robots_txt():
-        # Only the two landing pages are worth indexing; live games,
-        # reviews and joinable rooms are transient/per-user.
+        # Only the two landing pages are indexable; games/reviews/rooms are
+        # transient or per-user.
         body = (
             "User-agent: *\n"
             "Allow: /$\n"
@@ -227,7 +181,6 @@ def create_app():
 
     @app.get("/sitemap.xml")
     def sitemap_xml():
-        # Only the indexable landing pages (see robots.txt).
         urls = [url_for("index", _external=True), url_for("rooms_view", _external=True)]
         entries = "".join(f"  <url><loc>{u}</loc></url>\n" for u in urls)
         body = (
@@ -242,39 +195,32 @@ def create_app():
     def rooms_view():
         return render_template(
             "rooms.html.jinja2",
-            rooms=_lobby_active_summaries(),
-            finished_games=_lobby_finished_summaries(),
+            rooms=lobby_active_summaries(),
+            finished_games=lobby_finished_summaries(),
         )
 
     @app.post("/create-room")
     def create_room():
-        code = _random_unused_code()
+        code = random_unused_code()
         return redirect(url_for("room_view", code=code))
 
     @app.post("/join-room")
     def join_room_form():
-        code = _normalize_code(request.form.get("code", ""))
+        code = normalize_code(request.form.get("code", ""))
         if code is None:
             return redirect(url_for("index"))
         return redirect(url_for("room_view", code=code))
 
     @app.get("/play")
     def play():
-        # No known player id yet at this point - see module docstring. The
-        # page's own JS reads/creates its client-side identity and asks for
-        # its actual game over the socket (see "join" below) moments after
-        # this loads.
+        # No player id server-side yet; the page's JS joins over the socket.
         return render_template("play.html.jinja2")
 
     @app.get("/play-from/<state>")
     def play_from(state):
-        # "Play from here": open a fresh solo game seeded at a position saved
-        # into the URL (see rooms.encode_game_state, and the button in
-        # _game_state.html.jinja2). Validated eagerly so a mangled link 404s
-        # here rather than silently doing nothing; the page's own JS then
-        # carries `state` up with its "join" (see the handler below), which is
-        # where the room is actually created - the same deferred-identity flow
-        # /play uses, since the player id is only known client-side.
+        # "Play from here": seed a solo game from a position encoded in the
+        # URL. Validated eagerly so a mangled link 404s here; the JS carries
+        # `state` up with its "join", where the room is actually created.
         game = decode_game_state(state)
         if game is None or not game.legal_moves:
             abort(404, description="That saved position could not be loaded.")
@@ -282,23 +228,16 @@ def create_app():
 
     @app.get("/play/<player_id>")
     def spectate_solo(player_id):
-        target_id = _normalize_player_id(player_id)
+        target_id = normalize_player_id(player_id)
         if target_id is None:
             abort(404, description="Invalid player id.")
         return render_template("play.html.jinja2", spectate_player_id=target_id)
 
     @app.get("/review/<entry_id>")
     def review(entry_id):
-        # Checked eagerly here (unlike spectate_solo, which only validates
-        # the id's *shape*) since finished entries are content-addressed
-        # and never change, so a 404 now is a reliable, permanent answer.
-        # The page's own JS still re-asks over the socket - see "join"
-        # below - using the exact same live/spectate flow, just pointed at
-        # this frozen entry instead of a live game. Solo and room games are
-        # otherwise different templates (play.html.jinja2 needs no "code";
-        # room.html.jinja2 shows one), so dispatch on the frozen entry's own
-        # "is_solo" flag rather than needing two separate routes for it.
-        entry = _find_finished_room_entry(entry_id)
+        # Finished entries never change, so 404 eagerly. Dispatch on the
+        # frozen entry's is_solo flag to pick the template (solo vs room).
+        entry = find_finished_room_entry(entry_id)
         if entry is None:
             abort(404, description="That finished game could no longer be found.")
         if entry["is_solo"]:
@@ -307,10 +246,10 @@ def create_app():
 
     @app.get("/room/<code>")
     def room_view(code):
-        normalized = _normalize_code(code)
+        normalized = normalize_code(code)
         if normalized is None:
             abort(404, description="Room codes must be 4 letters, e.g. /room/ABCD")
-        _get_or_create_room(normalized)
+        get_or_create_room(normalized)
         return render_template("room.html.jinja2", code=normalized)
 
     @app.errorhandler(404)
@@ -336,18 +275,16 @@ app_holder["app"] = app
 @socketio.on("join")
 def handle_join(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         socketio.emit("error_message", {"message": "Missing player id."}, to=request.sid)
         return
 
-    # review_entry_id names a *frozen, finished* room to read-only review -
-    # a completely separate, stateless path from live rooms below, since
-    # there's no live RoomState to join once the result's been recorded
-    # (the room itself may have long since gone into a rematch).
+    # review_entry_id names a frozen finished room for read-only review - a
+    # separate, stateless path with no live RoomState to join.
     review_entry_id = (data.get("review_entry_id") or "").strip()
     if review_entry_id:
-        entry = _find_finished_room_entry(review_entry_id)
+        entry = find_finished_room_entry(review_entry_id)
         if entry is None:
             socketio.emit(
                 "error_message",
@@ -356,22 +293,16 @@ def handle_join(data):
             )
             return
         socketio.emit(
-            "state", {"html": _render_room_review_state(entry, player_id)}, to=request.sid
+            "state", {"html": render_room_review_state(entry, player_id)}, to=request.sid
         )
         return
 
-    name = (data.get("name") or "").strip()[:_MAX_NAME_LENGTH]
-    # Solo "start a new game" flow. Two one-shot flags from the client:
-    #   start - set only on the first join of a fresh page load (not on socket
-    #           reconnects), i.e. a genuine "I came here to play" intent.
-    #   force - set when the player confirmed the new action from the resume
-    #           prompt.
-    # load_state names a "Play from here" position (see the play_from route and
-    # rooms.encode_game_state) to seed a solo game from - an optional parameter
-    # to the same flow. Rather than silently replacing a game in progress, the
-    # server renders it and offers a Resume/new-game choice (solo_prompt),
-    # starting fresh only once confirmed. None of this touches
-    # multiplayer/spectate/review joins (is_own_solo is false for them).
+    name = (data.get("name") or "").strip()[:MAX_NAME_LENGTH]
+    # Solo "start a new game" flow. Client flags: `start` (first join of a
+    # fresh page load, not a reconnect), `force` (confirmed the new-game
+    # prompt), `load_state` (a "Play from here" position to seed from). Rather
+    # than clobber a game in progress, the server offers a Resume/new choice
+    # (solo_prompt). Untouched by multiplayer/spectate/review joins.
     start = bool(data.get("start"))
     force = bool(data.get("force"))
     load_state = (data.get("load_state") or "").strip()
@@ -387,14 +318,14 @@ def handle_join(data):
             return
 
     raw_code = data.get("code", "")
-    is_own_solo = _normalize_code(raw_code) is None and (
-        _normalize_player_id(raw_code) or player_id
+    is_own_solo = normalize_code(raw_code) is None and (
+        normalize_player_id(raw_code) or player_id
     ) == player_id
 
     pending_prompt = None  # {load_state} -> emit solo_prompt after broadcasting
     deal_fresh = False
     if is_own_solo:
-        existing = _rooms.get(player_id)
+        existing = rooms.get(player_id)
         in_progress = finished = False
         if existing is not None and existing.computer_seat is not None:
             with existing.lock:
@@ -403,7 +334,7 @@ def handle_join(data):
         if force and seed_game is not None:
             code, room = create_solo_room_from_state(player_id, seed_game)
         elif force:
-            code, room = player_id, _get_or_create_room(player_id, solo=True)
+            code, room = player_id, get_or_create_room(player_id, solo=True)
             deal_fresh = True
         elif start and in_progress:
             # Don't clobber a game in progress - resume it and ask (below).
@@ -411,14 +342,14 @@ def handle_join(data):
             pending_prompt = {"load_state": load_state or None}
         elif start and finished and seed_game is None:
             # Landing on a finished game via Play -> straight to a new one.
-            code, room = player_id, _get_or_create_room(player_id, solo=True)
+            code, room = player_id, get_or_create_room(player_id, solo=True)
             deal_fresh = True
         elif seed_game is not None:
             code, room = create_solo_room_from_state(player_id, seed_game)
         else:
-            code, room = player_id, _get_or_create_room(player_id, solo=True)
+            code, room = player_id, get_or_create_room(player_id, solo=True)
     else:
-        code, room, error = _resolve_or_create_room_for_join(raw_code, player_id)
+        code, room, error = resolve_or_create_room_for_join(raw_code, player_id)
         if room is None:
             socketio.emit("error_message", {"message": error}, to=request.sid)
             return
@@ -426,21 +357,15 @@ def handle_join(data):
     sid = request.sid
     with room.lock:
         if deal_fresh:
-            _deal_fresh_locked(room)
+            deal_fresh_locked(room)
         room.sid_players[sid] = player_id
-        # Pick up this player's client-stored name (if any), in case they
-        # set it while visiting a different room.
+        # Pick up the player's client-stored name, if any.
         if name:
             room.player_names[player_id] = name
 
-        # Auto-claim a vacant seat
-        #
-        # A *multiplayer* seat needs a name first
-        # needs_name below tells the client to prompt for one and retry,
-        # same as the manual "claim seat" button already does. A *solo*
-        # room's seat is exempt - the computer opponent doesn't care who
-        # you are, so you can still play anonymously (name_for_seat already
-        # falls back to "Player 1" either way).
+        # Auto-claim a vacant seat. A multiplayer seat needs a name first
+        # (needs_name prompts and retries); a solo room's seat is exempt,
+        # since the computer opponent doesn't care who you are.
         vacant_seat = next(
             (seat for seat in (1, 2) if not room.occupied(seat)), None
         )
@@ -453,63 +378,52 @@ def handle_join(data):
         needs_name = eligible and not can_auto_seat
         if eligible and can_auto_seat:
             room.seats[vacant_seat] = player_id
-    with _sid_index_lock:
-        _sid_index[sid] = (code, player_id)
+    with sid_index_lock:
+        sid_index[sid] = (code, player_id)
 
     if needs_name:
-        # Don't show them a board at all while we're withholding their
-        # seat pending a name - the client's own "Loading..." placeholder
-        # stays put behind the name prompt. Once they provide one and the
-        # retry lands here again, can_auto_seat is true and this branch
-        # isn't hit, so the *first* board they ever see is the real,
-        # already-seated one - and everyone else already in the room (not
-        # just this sid) gets refreshed too, below.
+        # Withhold the board behind the name prompt; the retry (with a name)
+        # renders the real, already-seated board for everyone.
         socketio.emit("need_name", {}, to=sid)
     else:
-        _broadcast_state(code, room)
-        # A game was in progress and this was a "start" intent - render it, then
-        # let the player choose Resume vs the new action (see solo_prompt in
-        # app.js). Only ever sent to this joiner, never other viewers.
+        broadcast_state(code, room)
+        # Offer the joiner Resume vs new-game for a game in progress.
         if pending_prompt is not None:
             socketio.emit("solo_prompt", pending_prompt, to=sid)
-    # A solo room's computer opponent in seat 2 places the marker as soon as
-    # the human is seated (nothing else would trigger it before the human's
-    # first move), and after a fresh deal above.
-    _maybe_play_computer_move(code, room)
-    _ensure_analysis_worker(code, room)
+    # A solo computer in seat 2 places the marker once the human is seated
+    # (or after a fresh deal above).
+    maybe_play_computer_move(code, room)
+    ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
 
 @socketio.on("set_name")
 def handle_set_name(data):
     data = data or {}
-    name = (data.get("name") or "").strip()[:_MAX_NAME_LENGTH]
+    name = (data.get("name") or "").strip()[:MAX_NAME_LENGTH]
     if not name:
         socketio.emit("error_message", {"message": "Please enter a name."}, to=request.sid)
         return
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         socketio.emit("error_message", {"message": "Missing player id."}, to=request.sid)
         return
 
     sid = request.sid
-    with _sid_index_lock:
-        info = _sid_index.get(sid)
+    with sid_index_lock:
+        info = sid_index.get(sid)
     if info is not None:
         code, _player_id = info
-        room = _rooms.get(code)
+        room = rooms.get(code)
         if room is not None:
             with room.lock:
                 room.player_names[player_id] = name
                 is_seated = room.seat_of(player_id) is not None
-            # Only worth telling everyone else if this name is actually
-            # visible to them (i.e. this player is seated) - broadcasting
-            # for an unseated visitor would render them a premature
-            # spectator view of the board a moment before the pending
-            # "join" retry (see handle_join) seats them and renders it for
-            # real, defeating the point of withholding it until then.
+            # Only broadcast if the name is visible to others (player seated);
+            # broadcasting for an unseated visitor would leak a premature
+            # spectator board before the pending "join" retry seats them.
             if is_seated:
-                _broadcast_state(code, room)
+                broadcast_state(code, room)
                 _broadcast_lobby()
 
     socketio.emit("name_set", {"name": name}, to=sid)
@@ -518,10 +432,10 @@ def handle_set_name(data):
 @socketio.on("claim_seat")
 def handle_claim_seat(data):
     data = data or {}
-    code = _normalize_code(data.get("code", ""))
+    code = normalize_code(data.get("code", ""))
     if code is None:
         return
-    room = _rooms.get(code)
+    room = rooms.get(code)
     if room is None:
         return
 
@@ -530,7 +444,7 @@ def handle_claim_seat(data):
         socketio.emit("need_name", {}, to=request.sid)
         return
 
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     try:
@@ -543,24 +457,24 @@ def handle_claim_seat(data):
         socketio.emit("error_message", {"message": error}, to=request.sid)
         return
 
-    _broadcast_state(code, room)
-    # Claiming may have completed the seating of a solo room whose computer
-    # is the marker placer.
-    _maybe_play_computer_move(code, room)
+    broadcast_state(code, room)
+    # Claiming may have completed a solo room's seating, letting the computer
+    # place the marker.
+    maybe_play_computer_move(code, room)
     _broadcast_lobby()
 
 
 @socketio.on("vacate_seat")
 def handle_vacate_seat(data):
     data = data or {}
-    code = _normalize_code(data.get("code", ""))
+    code = normalize_code(data.get("code", ""))
     if code is None:
         return
-    room = _rooms.get(code)
+    room = rooms.get(code)
     if room is None:
         return
 
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     ok, error = room.vacate_seat(player_id)
@@ -568,21 +482,19 @@ def handle_vacate_seat(data):
         socketio.emit("error_message", {"message": error}, to=request.sid)
         return
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
 
 
 @socketio.on("swap_seats")
 def handle_swap_seats(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
-    # Unlike claim_seat/vacate_seat, this needs to work for a solo room too
-    # (its "code" is the owner's own player id, not a 4-letter code) - see
-    # _resolve_room_key.
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    # Works for solo rooms too (keyed by player id, not a 4-letter code).
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         return
 
@@ -591,27 +503,24 @@ def handle_swap_seats(data):
         socketio.emit("error_message", {"message": error}, to=request.sid)
         return
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
-    # A solo room's computer opponent may now be sitting in seat 1, which
-    # always moves first (see Game.is_p1_turn) - without this, swapping
-    # into seat 2 would leave the computer waiting forever for a "turn"
-    # nothing ever hands it, since no move has been played to trigger the
-    # usual post-move check (see handle_move).
-    _maybe_play_computer_move(code, room)
+    # The computer may now hold seat 1 (moves first), which no played move
+    # would otherwise trigger.
+    maybe_play_computer_move(code, room)
 
 
 @socketio.on("kick_seat")
 def handle_kick_seat(data):
     data = data or {}
-    code = _normalize_code(data.get("code", ""))
+    code = normalize_code(data.get("code", ""))
     if code is None:
         return
-    room = _rooms.get(code)
+    room = rooms.get(code)
     if room is None:
         return
 
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     try:
@@ -624,19 +533,19 @@ def handle_kick_seat(data):
         socketio.emit("error_message", {"message": error}, to=request.sid)
         return
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
 
 
 @socketio.on("move")
 def handle_move(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         socketio.emit("error_message", {"message": "Missing player id."}, to=request.sid)
         return
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         socketio.emit("error_message", {"message": "That room doesn't exist."}, to=request.sid)
         return
@@ -665,30 +574,28 @@ def handle_move(data):
             return
 
         outcomes = game.move(row, col)
-        # Moving onto a face-down card reveals one of the remaining unseen
-        # cards. As in Game.random_move(), any of the remaining face-down
-        # cards is an equally likely identity for it, so we pick one
-        # uniformly at random to reveal.
+        # Moving onto a face-down card reveals a uniformly-random unseen card
+        # (as in Game.random_move).
         room.game = random.choice(outcomes)
         if room.game_over:
-            _record_room_finished_locked(code, room)
+            record_room_finished_locked(code, room)
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
-    _maybe_play_computer_move(code, room)
-    _ensure_analysis_worker(code, room)
+    maybe_play_computer_move(code, room)
+    ensure_analysis_worker(code, room)
     _broadcast_lobby()
 
 
 @socketio.on("place_marker")
 def handle_place_marker(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         socketio.emit("error_message", {"message": "Missing player id."}, to=request.sid)
         return
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         socketio.emit("error_message", {"message": "That room doesn't exist."}, to=request.sid)
         return
@@ -725,16 +632,16 @@ def handle_place_marker(data):
             return
         room.game = game.place_marker(row, col)
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
     # If the computer is Player 1, it now makes the first move.
-    _maybe_play_computer_move(code, room)
+    maybe_play_computer_move(code, room)
 
 
 @socketio.on("history_step")
 def handle_history_step(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     try:
@@ -744,7 +651,7 @@ def handle_history_step(data):
 
     review_entry_id = (data.get("review_entry_id") or "").strip()
     if review_entry_id:
-        entry = _find_finished_room_entry(review_entry_id)
+        entry = find_finished_room_entry(review_entry_id)
         if entry is None:
             socketio.emit(
                 "error_message",
@@ -752,17 +659,17 @@ def handle_history_step(data):
                 to=request.sid,
             )
             return
-        with _finished_rooms_lock:
+        with finished_rooms_lock:
             total = len(entry["game"].moves)
             current = entry["history_index"].get(player_id, total)
             entry["history_index"][player_id] = max(0, min(total, current + delta))
         socketio.emit(
-            "state", {"html": _render_room_review_state(entry, player_id)}, to=request.sid
+            "state", {"html": render_room_review_state(entry, player_id)}, to=request.sid
         )
         return
 
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None or not room.game_over:
         return
 
@@ -771,13 +678,13 @@ def handle_history_step(data):
         current = room.history_index.get(player_id, total)
         room.history_index[player_id] = max(0, min(total, current + delta))
 
-    socketio.emit("state", {"html": _render_state(code, room, player_id)}, to=request.sid)
+    socketio.emit("state", {"html": render_state(code, room, player_id)}, to=request.sid)
 
 
 @socketio.on("history_goto")
 def handle_history_goto(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     try:
@@ -787,7 +694,7 @@ def handle_history_goto(data):
 
     review_entry_id = (data.get("review_entry_id") or "").strip()
     if review_entry_id:
-        entry = _find_finished_room_entry(review_entry_id)
+        entry = find_finished_room_entry(review_entry_id)
         if entry is None:
             socketio.emit(
                 "error_message",
@@ -795,16 +702,16 @@ def handle_history_goto(data):
                 to=request.sid,
             )
             return
-        with _finished_rooms_lock:
+        with finished_rooms_lock:
             total = len(entry["game"].moves)
             entry["history_index"][player_id] = max(0, min(total, index))
         socketio.emit(
-            "state", {"html": _render_room_review_state(entry, player_id)}, to=request.sid
+            "state", {"html": render_room_review_state(entry, player_id)}, to=request.sid
         )
         return
 
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None or not room.game_over:
         return
 
@@ -812,21 +719,17 @@ def handle_history_goto(data):
         total = len(room.game.moves)
         room.history_index[player_id] = max(0, min(total, index))
 
-    socketio.emit("state", {"html": _render_state(code, room, player_id)}, to=request.sid)
+    socketio.emit("state", {"html": render_state(code, room, player_id)}, to=request.sid)
 
 
 @socketio.on("calculate_move")
 def handle_calculate_move(data):
-    """Explicit "Calculate" click (see _game_state.html.jinja2's
-    move-analysis panel) for a position the automatic post-game worker gave
-    up on - see rooms.start_ondemand_analysis. Always replies with a fresh
-    render regardless of whether this call is the one that actually started
-    it, so a second click (or a second viewer's own click) while it's
-    already running just confirms it's under way rather than doing nothing
-    visible.
+    """Explicit "Calculate" click for a position the automatic post-game
+    worker gave up on. Always re-renders, so a redundant click while it's
+    already running still confirms it's under way.
     """
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
     try:
@@ -837,58 +740,54 @@ def handle_calculate_move(data):
 
     review_entry_id = (data.get("review_entry_id") or "").strip()
     if review_entry_id:
-        entry = _find_finished_room_entry(review_entry_id)
+        entry = find_finished_room_entry(review_entry_id)
         if entry is None:
             return
-        if not _grace_period_over(entry.get("analysis_deadline")):
+        if not grace_period_over(entry.get("analysis_deadline")):
             return
         start_ondemand_analysis(
             entry["analysis"],
             entry["analysis_inflight"],
             entry["analysis_calc_started"],
-            _finished_rooms_lock,
+            finished_rooms_lock,
             entry["game"],
             index,
             on_done=lambda: socketio.emit(
-                "state", {"html": _render_room_review_state(entry, player_id)}, to=sid
+                "state", {"html": render_room_review_state(entry, player_id)}, to=sid
             ),
         )
-        socketio.emit("state", {"html": _render_room_review_state(entry, player_id)}, to=sid)
+        socketio.emit("state", {"html": render_room_review_state(entry, player_id)}, to=sid)
         return
 
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         return
     with room.lock:
-        if not room.game_over or not _grace_period_over(room.analysis_deadline):
+        if not room.game_over or not grace_period_over(room.analysis_deadline):
             return
         game, game_id = room.game, room.game_id
         cache, inflight, calc_started = room.analysis, room.analysis_inflight, room.analysis_calc_started
 
     def on_done():
-        # The room may have since gone into a rematch, in which case
-        # whoever's still watching it live is looking at that new game, not
-        # this one - broadcasting here would clobber their board with a
-        # stale render, so there's nothing safe left to push; they'll find
-        # the result waiting next time they visit this match's own
-        # /review page instead (see _record_room_finished_locked).
-        current = _rooms.get(code)
+        # Skip if the room has since rematched - broadcasting would clobber
+        # watchers' boards with a stale render; the result waits on /review.
+        current = rooms.get(code)
         if current is not None and current.game_id == game_id:
-            _broadcast_state(code, current)
+            broadcast_state(code, current)
 
     start_ondemand_analysis(cache, inflight, calc_started, room.lock, game, index, on_done=on_done)
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
 
 
 @socketio.on("request_rematch")
 def handle_request_rematch(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         return
 
@@ -906,32 +805,29 @@ def handle_request_rematch(data):
             )
             return
         if room.computer_seat is not None:
-            # The computer always accepts immediately - there's no one to
-            # ask, and no point waiting.
-            _deal_fresh_locked(room)
+            # The computer always accepts immediately.
+            deal_fresh_locked(room)
         elif room.rematch_requested_by is not None and room.rematch_requested_by != player_id:
             # The other player already asked - treat this as accepting.
-            _deal_fresh_locked(room)
+            deal_fresh_locked(room)
         else:
             room.rematch_requested_by = player_id
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
-    # If the rematch dealt a fresh solo game with the computer in seat 1, it's
-    # already the computer's turn but no move has been played to trigger the
-    # usual post-move check - kick it here, exactly as swap_seats does (a
-    # no-op for a human's turn or a multiplayer room).
-    _maybe_play_computer_move(code, room)
+    # A fresh solo rematch may put the computer on the move; nothing else
+    # would trigger it (no-op otherwise).
+    maybe_play_computer_move(code, room)
 
 
 @socketio.on("respond_rematch")
 def handle_respond_rematch(data):
     data = data or {}
-    player_id = _normalize_player_id(data.get("player_id"))
+    player_id = normalize_player_id(data.get("player_id"))
     if player_id is None:
         return
-    code = _resolve_room_key(data.get("code", ""), player_id)
-    room = _rooms.get(code)
+    code = resolve_room_key(data.get("code", ""), player_id)
+    room = rooms.get(code)
     if room is None:
         return
 
@@ -944,10 +840,10 @@ def handle_respond_rematch(data):
         if room.rematch_requested_by is None or room.rematch_requested_by == player_id:
             return  # nothing to respond to, or you're the one who asked
         if accept:
-            _deal_fresh_locked(room)
+            deal_fresh_locked(room)
         room.rematch_requested_by = None
 
-    _broadcast_state(code, room)
+    broadcast_state(code, room)
     _broadcast_lobby()
 
 
@@ -965,22 +861,17 @@ def handle_leave_lobby():
 @socketio.on("disconnect")
 def handle_disconnect():
     sid = request.sid
-    with _sid_index_lock:
-        info = _sid_index.pop(sid, None)
+    with sid_index_lock:
+        info = sid_index.pop(sid, None)
     if info is not None:
         code, _player_id = info
-        room = _rooms.get(code)
+        room = rooms.get(code)
         if room is not None:
             with room.lock:
                 room.sid_players.pop(sid, None)
-            # Someone else still watching may now be able to offer a "Kick"
-            # button for the seat this connection just gave up (see
-            # RoomState.seat_disconnected) - without this, that would only
-            # ever show up once some other action (a move, a join) happened
-            # to re-render the board, which might be never if nobody else
-            # is doing anything yet (e.g. still waiting for the game to
-            # start).
-            _broadcast_state(code, room)
+            # Refresh so watchers get the "Kick" button for the seat this
+            # connection just abandoned (see RoomState.seat_disconnected).
+            broadcast_state(code, room)
             _broadcast_lobby()
 
 

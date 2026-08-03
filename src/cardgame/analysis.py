@@ -1,5 +1,5 @@
 """
-move_analysis.py — per-move offensive/defensive analysis for Cross Kings
+Per-move offensive/defensive analysis for Cross Kings
 -------------------------------------------------------------------------
 For each legal move from a position, computes how much it helps the current
 player (offensive value), how much it hurts the opponent (defensive value),
@@ -11,9 +11,9 @@ import time
 from collections import Counter
 
 from .game import Eval, _cached_score
-from .analysis_native import NATIVE_AVAILABLE, analyse_moves_native, move_eval_native
+from .analysis_native import NATIVE_AVAILABLE, analyse_moves_native, move_value_native
 
-__all__ = ("analyse_moves", "analyse_moves_by_deadline", "move_eval", "AnalysisAborted")
+__all__ = ("analyse_moves", "analyse_moves_by_deadline", "move_value", "AnalysisAborted")
 
 
 class AnalysisAborted(Exception):
@@ -53,13 +53,16 @@ def analyse_moves_by_deadline(game, deadline):
         return None
 
 
-def move_eval(game, marker):
+def move_value(game, marker):
     """Exact Eval(m, w, d, s) for a single legal `marker` move, in the current
     player's perspective - the full win/draw/loss/score-sum aggregate the exact
-    solver's single-integer value can't distinguish on its `w` term. Native
-    when available, pure-Python otherwise (both bit-identical)."""
+    solver's single-integer value can't distinguish on its `w` term. THE route
+    when you want one specific move's exact value (for the best move + full
+    distribution use `Game.evaluate`; for just the best move use
+    `best_move`). Native when available, pure-Python otherwise (both
+    bit-identical)."""
     if NATIVE_AVAILABLE:
-        return move_eval_native(game, marker)
+        return move_value_native(game, marker)
     state = game._hand_state()
     move_tuple = next(m for m in game.all_moves() if m[0].marker == marker)
     combined = None
