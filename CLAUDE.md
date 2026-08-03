@@ -16,8 +16,8 @@ This codebase is a python package for live gameplay and analysis of a cardgame d
 
 3. Evaluation improvement validation
    - When changes are made to `choose_move` or `Game.evaluate` tests should be run to ensure the output is identical to previous versions
-   - A set of labelled outputs is available in `data/oracle_labels.jsonl`
-   - Changes to the heuristics in `choose_move` must be checked for percentage agreement on a sample of oracle positions, and using the tooling in `arena.py` to check for improvements against the previous version
+   - A labelled corpus is generated on demand (not checked in - the older `data/*.jsonl` corpora were removed as their save strings are incompatible with the current `Game.load`): `python -m cardgame.validation.oracle generate --positions 800 --out data/oracle_labels.jsonl --jobs 8`
+   - Changes to the heuristics in `choose_move` must be checked for percentage agreement on a sample of oracle positions, and using the tooling in `cardgame.validation.arena` to check for improvements against the previous version
    - Only a limited depth of search (normally 14 cards) should be used for validation runs as the time increases signficantly
 
 4. Test results

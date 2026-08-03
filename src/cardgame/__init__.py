@@ -18,6 +18,7 @@ __all__ = (
     "solve",
     "solve_plain",
     "solve_native",
+    "solve_id_native",
 )
 
 from .game import Board, Hand, Game, ProbEval, Eval
@@ -27,4 +28,4 @@ from .ai import choose_move, AlphaBetaBot, SearchParams
 from .search import BestFirstSearch, format_snapshot
 from .search_alt import move_search_iterator, live_search
 from .solver import solve, solve_plain
-from .solver_native import solve_native
+from .solver_native import solve_native, solve_id_native

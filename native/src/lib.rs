@@ -22,6 +22,27 @@ const FACT: [i64; 13] = [
     1, 1, 2, 6, 24, 120, 720, 5040, 40320, 362880, 3628800, 39916800, 479001600,
 ];
 
+// Iterative-deepening exact solver (port of experiments/id_best.py). A
+// near-terminal subtree (<= GATE_CELLS untaken cells and <= GATE_UNKNOWNS
+// facedown) is solved exactly in the parent's window with its bound cached
+// across deepening passes; interior nodes are ordered by the mover's
+// marginal score gain with the prior pass's best move hoisted first.
+const GATE_CELLS: u32 = 6;
+const GATE_UNKNOWNS: usize = 5;
+const EXACT: i8 = 0;
+const LOWER: i8 = 1;
+const UPPER: i8 = 2;
+
+// (marker cell, taken-cell mask, mover int/kings, other int/kings). The
+// remaining unknown multiset is a function of these (the hands plus the
+// fixed board layout pin it down), so it need not be keyed on.
+type IdKey = (u8, u64, u32, u8, u32, u8);
+
+#[inline]
+fn id_key(cell: usize, rows: u64, mi: u32, mk: u8, oi: u32, ok: u8) -> IdKey {
+    (cell as u8, rows, mi, mk, oi, ok)
+}
+
 /// (sign_sum, score_sum): lexicographic order, componentwise addition.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct V(i64, i64);
@@ -189,6 +210,10 @@ struct Ctx {
     deadline: Option<Instant>, // None => never aborts (exhaustive solve)
     nodes: u64,
     aborted: bool,
+    // Iterative-deepening state (unused by the plain solve_root path).
+    table: HashMap<IdKey, usize>, // best move per node, hoisted across passes
+    cache: HashMap<IdKey, (V, i8)>, // gate bound cache (value, EXACT/LOWER/UPPER)
+    trunc: bool,                  // a depth cutoff was hit this pass
 }
 
 #[inline]
@@ -330,6 +355,224 @@ impl Ctx {
             done = done.add(r);
         }
         done
+    }
+
+    // --- Iterative-deepening exact search (port of id_best) ---------------
+
+    /// Legal cells ordered by the mover's marginal score gain (facedown last),
+    /// with `hint` (the prior pass's best move) hoisted to the front.
+    fn order(
+        &self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, hint: Option<usize>,
+    ) -> Vec<usize> {
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        let base = score(mi, mk);
+        let mut face: Vec<(i64, usize)> = Vec::with_capacity(n);
+        let mut chance: Vec<usize> = Vec::new();
+        for &t in &buf[..n] {
+            let p = self.cells[t];
+            if p < 0 {
+                chance.push(t);
+            } else if p > 0 {
+                face.push((base - score(mi | p as u32, mk), t));
+            } else {
+                face.push((base - score(mi, mk + 1), t));
+            }
+        }
+        face.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut order: Vec<usize> = face.into_iter().map(|(_, t)| t).collect();
+        order.extend(chance);
+        if let Some(h) = hint {
+            if let Some(pos) = order.iter().position(|&t| t == h) {
+                let it = order.remove(pos);
+                order.insert(0, it);
+            }
+        }
+        order
+    }
+
+    /// Windowed exact solve of a small subtree, its bound cached across passes.
+    #[allow(clippy::too_many_arguments)]
+    fn gate(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        nu: usize, alpha: V, beta: V,
+    ) -> V {
+        let key = id_key(cell, rows, mi, mk, oi, ok);
+        if let Some(&(v, flag)) = self.cache.get(&key) {
+            if flag == EXACT || (flag == LOWER && v >= beta) || (flag == UPPER && v <= alpha) {
+                return v;
+            }
+        }
+        let v = self.search(cell, rows, cols, mi, mk, oi, ok, nu, alpha, beta);
+        let flag = if alpha < v && v < beta {
+            EXACT
+        } else if v >= beta {
+            LOWER
+        } else {
+            UPPER
+        };
+        self.cache.insert(key, (v, flag));
+        v
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_id(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        nu: usize, mut alpha: V, beta: V, depth: i64,
+    ) -> V {
+        self.tick();
+        if self.aborted {
+            return alpha;
+        }
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            return self.leaf(mi, mk, oi, ok, nu);
+        }
+        if 36 - rows.count_ones() <= GATE_CELLS && nu <= GATE_UNKNOWNS {
+            return self.gate(cell, rows, cols, mi, mk, oi, ok, nu, alpha, beta);
+        }
+        if depth == 0 {
+            self.trunc = true;
+            return self.leaf(mi, mk, oi, ok, nu);
+        }
+        let key = id_key(cell, rows, mi, mk, oi, ok);
+        let hint = self.table.get(&key).copied();
+        let mut best: Option<V> = None;
+        let mut best_t = 0usize;
+        for target in self.order(cell, rows, cols, mi, mk, hint) {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let p = self.cells[target];
+            let v = if p < 0 {
+                self.chance_id(target, nrows, ncols, mi, mk, oi, ok, nu, alpha, beta, depth - 1)
+            } else if p > 0 {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi | p as u32, mk, nu,
+                    beta.neg(), alpha.neg(), depth - 1,
+                )
+                .neg()
+            } else {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi, mk + 1, nu,
+                    beta.neg(), alpha.neg(), depth - 1,
+                )
+                .neg()
+            };
+            if best.is_none() || v > best.unwrap() {
+                best = Some(v);
+                best_t = target;
+                if v >= beta {
+                    self.table.insert(key, best_t);
+                    return v;
+                }
+                if v > alpha {
+                    alpha = v;
+                }
+            }
+        }
+        self.table.insert(key, best_t);
+        best.unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chance_id(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        nu: usize, alpha: V, beta: V, depth: i64,
+    ) -> V {
+        let mc = FACT[nu - 1];
+        let child_bound = V(mc, SCORE_BOUND * mc);
+        let mut done = V(0, 0);
+        for i in 0..nu {
+            let rem = (nu - 1 - i) as i64;
+            let slack = V(child_bound.0 * rem, child_bound.1 * rem);
+            let a_i = alpha.sub(done).sub(slack);
+            let b_i = beta.sub(done).add(slack);
+            let card = self.unknowns[i];
+            for j in i..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            // chance nodes do not consume a ply (depth passed unchanged)
+            let r = if card > 0 {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi | card as u32, mk, nu - 1,
+                    b_i.neg(), a_i.neg(), depth,
+                )
+                .neg()
+            } else {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi, mk + 1, nu - 1,
+                    b_i.neg(), a_i.neg(), depth,
+                )
+                .neg()
+            };
+            for j in (i..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[i] = card;
+            if r >= b_i {
+                return done.add(r).sub(slack);
+            }
+            if r <= a_i {
+                return done.add(r).add(slack);
+            }
+            done = done.add(r);
+        }
+        done
+    }
+
+    /// One iterative-deepening pass over the root moves. Null-window rival
+    /// probes (alpha one below the incumbent) keep the best move's value exact
+    /// and the (value, marker) tie-break identical to solve_root. Returns
+    /// (best marker, best value, per-move rows); sets self.trunc if any
+    /// interior node hit the depth cutoff (i.e. the pass is not yet exact).
+    #[allow(clippy::too_many_arguments)]
+    fn root_pass(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        nu: usize, depth: i64,
+    ) -> (Option<(usize, usize)>, V, Vec<MoveRow>) {
+        let rkey = id_key(cell, rows, mi, mk, oi, ok);
+        let hint = self.table.get(&rkey).copied();
+        let order = self.order(cell, rows, cols, mi, mk, hint);
+        let mut best: Option<(V, (usize, usize))> = None;
+        let mut best_t = 0usize;
+        let mut moves: Vec<MoveRow> = Vec::with_capacity(order.len());
+        for target in order {
+            let alpha = match best {
+                None => INF.neg(),
+                Some((bv, _)) => bv.sub(V(0, 1)),
+            };
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let p = self.cells[target];
+            let v = if p < 0 {
+                self.chance_id(target, nrows, ncols, mi, mk, oi, ok, nu, alpha, INF, depth - 1)
+            } else if p > 0 {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi | p as u32, mk, nu,
+                    INF.neg(), alpha.neg(), depth - 1,
+                )
+                .neg()
+            } else {
+                self.search_id(
+                    target, nrows, ncols, oi, ok, mi, mk + 1, nu,
+                    INF.neg(), alpha.neg(), depth - 1,
+                )
+                .neg()
+            };
+            if self.aborted {
+                return (None, V(0, 0), Vec::new());
+            }
+            let marker = (target / 6, target % 6);
+            moves.push((marker, (v.0, v.1), best.is_none() || v > alpha));
+            if best.is_none() || (v, marker) > best.unwrap() {
+                best = Some((v, marker));
+                best_t = target;
+            }
+        }
+        self.table.insert(rkey, best_t);
+        let (bv, bm) = best.unwrap();
+        (Some(bm), bv, moves)
     }
 }
 
@@ -669,6 +912,24 @@ fn distribution(
 
 type MoveRow = ((usize, usize), (i64, i64), bool);
 
+fn new_ctx(cells: Vec<i64>, unknowns: &[i64], deadline_secs: Option<f64>) -> PyResult<Ctx> {
+    if cells.len() != 36 || unknowns.len() > 12 {
+        return Err(pyo3::exceptions::PyValueError::new_err("bad state shape"));
+    }
+    let mut u = [0i64; 12];
+    u[..unknowns.len()].copy_from_slice(unknowns);
+    Ok(Ctx {
+        cells: cells.try_into().unwrap(),
+        unknowns: u,
+        deadline: deadline_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
+        nodes: 0,
+        aborted: false,
+        table: HashMap::new(),
+        cache: HashMap::new(),
+        trunc: false,
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
 #[allow(clippy::too_many_arguments)]
@@ -676,18 +937,8 @@ fn solve_root(
     py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
     mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
 ) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)>> {
-    if cells.len() != 36 || unknowns.len() > 12 {
-        return Err(pyo3::exceptions::PyValueError::new_err("bad state shape"));
-    }
-    let mut ctx = Ctx {
-        cells: cells.try_into().unwrap(),
-        unknowns: [0; 12],
-        deadline: deadline_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
-        nodes: 0,
-        aborted: false,
-    };
+    let mut ctx = new_ctx(cells, &unknowns, deadline_secs)?;
     let nu = unknowns.len();
-    ctx.unknowns[..nu].copy_from_slice(&unknowns);
 
     py.detach(move || {
         let mut buf = [0usize; 10];
@@ -738,6 +989,49 @@ fn solve_root(
         }
         let (bv, bm) = best.unwrap();
         Ok(Some((Some(bm), (bv.0, bv.1), moves)))
+    })
+}
+
+/// Iterative-deepening exact root solve (port of id_best.solve_id). Returns
+/// the same shape as solve_root - the best marker and its value are exact and
+/// identical to solve_root; rival-move values are valid upper bounds but, being
+/// order- and deepening-dependent, may differ numerically. None on deadline.
+#[pyfunction]
+#[pyo3(signature = (cells, cell, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
+#[allow(clippy::too_many_arguments)]
+fn solve_id_root(
+    py: Python<'_>, cells: Vec<i64>, cell: usize, rows: u64, cols: u64, mi: u32,
+    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
+) -> PyResult<Option<(Option<(usize, usize)>, (i64, i64), Vec<MoveRow>)>> {
+    let mut ctx = new_ctx(cells, &unknowns, deadline_secs)?;
+    let nu = unknowns.len();
+
+    py.detach(move || {
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            let v = ctx.leaf(mi, mk, oi, ok, nu);
+            return Ok(Some((None, (v.0, v.1), Vec::new())));
+        }
+        // Deepen until a pass completes without truncation (exact). The gate
+        // caps depth: once every path reaches a gate or terminal the pass is
+        // exact, so max_depth (untaken cells) is an unreachable safety bound.
+        let max_depth = (36 - rows.count_ones()) as i64;
+        let mut depth = 1i64;
+        let mut result;
+        loop {
+            ctx.trunc = false;
+            result = ctx.root_pass(cell, rows, cols, mi, mk, oi, ok, nu, depth);
+            if ctx.aborted {
+                return Ok(None); // deadline tripped mid-pass; no exact result
+            }
+            if !ctx.trunc || depth >= max_depth {
+                break;
+            }
+            depth += 1;
+        }
+        let (bm, bv, moves) = result;
+        Ok(Some((bm, (bv.0, bv.1), moves)))
     })
 }
 
@@ -1401,6 +1695,7 @@ fn heuristic_probe(
 #[pymodule]
 fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_root, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_id_root, m)?)?;
     m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
     m.add_function(wrap_pyfunction!(distribution, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_root, m)?)?;

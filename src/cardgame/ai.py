@@ -46,7 +46,7 @@ from .analysis import move_eval
 from .cards import Card, Rank
 from .scoring import score_dp
 from .solver import solve, _root_state, decode
-from .solver_native import solve_native, NATIVE_AVAILABLE
+from .solver_native import solve_native, solve_id_native, NATIVE_AVAILABLE
 
 try:
     from cardgame_native import heuristic_root as _heuristic_root
@@ -182,22 +182,25 @@ class _Timeout(Exception):
 # returns None if it cannot finish, so a hard endgame keeps the heuristic move
 # instead of blowing the budget. This replaces a fitted feasibility gate that
 # mispredicted both ways - skipping cheap solves and committing to unbounded
-# ones.
-_EXACT_SOLVE = solve_native if NATIVE_AVAILABLE else solve
+# ones. solve_id_native (iterative-deepening + gate) is the default engine:
+# 2.2-2.8x faster than solve_native with identical best move+value, so within
+# the deadline it solves a wider endgame band (arena-neutral, see exact_id).
+_EXACT_SOLVE = solve_id_native if NATIVE_AVAILABLE else solve
 
 # Skip the exact-upgrade attempt with less budget than this left - too little
 # to finish anything, just wasted setup.
 _EXACT_UPGRADE_MIN_SECONDS = 0.05
 
 
-def _exact_move(game, deadline=None):
+def _exact_move(game, deadline=None, solver=solve_id_native):
     """Exact best move, or None if there is no move or the solve was abandoned
     (deadline tripped). With a deadline the native solver is required - the
-    pure-Python fallback cannot be interrupted."""
+    pure-Python fallback cannot be interrupted. `solver` selects the native
+    exact engine (solve_id_native by default, or solve_native)."""
     if deadline is not None:
         if not NATIVE_AVAILABLE:
             return None
-        result = solve_native(game, deadline=deadline)
+        result = solver(game, deadline=deadline)
     else:
         result = _EXACT_SOLVE(game)
     if result is None:
@@ -329,6 +332,13 @@ class SearchParams:
     deepen_fraction: float = 1.0
     # Defer to the exact solver inside the calibrated endgame region.
     exact_endgame: bool = True
+    # Endgame exact engine: the ID solver (solve_id_native) by default - 2.2-
+    # 2.8x faster than solve_native with identical best move+value, so within
+    # the leftover deadline it reaches exact play a ply earlier and solves a
+    # wider endgame band. Arena-neutral on strength (all-faceup 300 pairs @0.3s:
+    # +0.01 pts/pair, p=0.88) but strictly the faster/deeper solve; kept as an
+    # A/B knob - set False to force solve_native.
+    exact_id: bool = True
     # Run the opening/midgame iterative-deepening search in the Rust core
     # (cardgame_native.heuristic_root) instead of pure Python. Same search
     # and evaluation, bit-identical at equal depth (per-move values verified
@@ -377,7 +387,8 @@ class AlphaBetaBot:
                 "elapsed", self.time_budget
             )
             if leftover > _EXACT_UPGRADE_MIN_SECONDS:
-                exact = _exact_move(game, deadline=leftover)
+                solver = solve_id_native if self.params.exact_id else solve_native
+                exact = _exact_move(game, deadline=leftover, solver=solver)
                 if exact is not None:
                     return exact
         return move

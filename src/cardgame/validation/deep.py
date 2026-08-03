@@ -2,10 +2,11 @@
 
 The oracle corpus (data/oracle_labels.jsonl) stops at ~18 cards left
 because Game.evaluate is too slow deeper; above that only the approximate
-bootstrap corpus exists. The native solver (cardgame.solve_native) is
-alpha-beta pruned and ~11x faster, so low-face-down positions stay exactly
-solvable up to ~21 cards. This module labels single positions with their
-exact value and appends them to data/deep_labels.jsonl.
+bootstrap corpus exists. The native ID solver (cardgame.solve_id_native) is
+alpha-beta pruned with an iterative-deepening gate and ~11x faster than
+Game.evaluate (a further 2.2-2.8x over plain solve_native), so low-face-down
+positions stay exactly solvable up to ~21 cards. This module labels single
+positions with their exact value and appends them to data/deep_labels.jsonl.
 
 A record is one position (not a parent with all move resolutions - one
 solve per row, which lets us aim the sampler at specific depths):
@@ -21,10 +22,10 @@ these three numbers (solve returns them directly):
 `sign_sum = 2w+d-m = w-l`, so this equals the oracle corpus's
 `s/m + WIN_BONUS*(w-losses)/m` - deep and oracle rows mix in one fit.
 
-Feasibility is gated by ai._exact_feasible (the measured solve-cost table),
-so every attempted solve fits the budget - no per-solve timeout needed
-(the native solve releases the GIL, so a signal alarm could not interrupt
-it anyway). Positions above the table's reach (>21 cards) are skipped.
+Feasibility is bounded per solve: solve_id_native runs under a deadline and
+returns None if it cannot finish in the budget, in which case the sampled
+position is discarded and another drawn. (The native solve releases the GIL
+but polls an Instant deadline internally, so it self-aborts without a signal.)
 
 CLI:
     python -m cardgame.validation.deep generate --n 200 --budget 8
@@ -39,9 +40,8 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from ..ai import _exact_feasible
 from ..game import Game
-from ..solver_native import solve_native, NATIVE_AVAILABLE
+from ..solver_native import solve_id_native, NATIVE_AVAILABLE
 from .fit_weights import (
     WIN_BONUS,
     features,
@@ -76,8 +76,11 @@ _FORK = mp.get_context("fork")
 FIT_BANDS = [(12, 13), (14, 15), (16, 17), (18, 19), (20, 21)]
 
 
-def label_value(game):
-    r = solve_native(game)
+def label_value(game, deadline=None):
+    """Exact label for `game`, or None if `deadline` (seconds) trips first."""
+    r = solve_id_native(game, deadline=deadline)
+    if r is None:
+        return None
     return {
         "save": game.save(alnum=True),
         "cards_left": 36 - len(game.moves),
@@ -89,14 +92,17 @@ def label_value(game):
 
 
 def _gen_one(args):
-    """Sample and exactly label one feasible position for a target band."""
+    """Sample and exactly label one position for a target band, discarding
+    any whose exact solve does not finish within `budget`."""
     seed, cards, max_fd, budget = args
     rng = random.Random(seed)
     while True:
         game = sample_position(rng, cards, cards, max_fd)
-        if game is None or not _exact_feasible(game, budget):
+        if game is None:
             continue
-        return json.dumps(label_value(game))
+        label = label_value(game, deadline=budget)
+        if label is not None:
+            return json.dumps(label)
 
 
 def generate(n, budget, seed, out=DEEP_LABELS, progress=True, jobs=8):
