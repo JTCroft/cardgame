@@ -1,15 +1,10 @@
-"""Room state model, registries and lifecycle helpers, covering both
-multiplayer rooms and solo (vs. computer) games - the same `RoomState` under
-the hood, keyed in `rooms` by a 4-letter code or the owning player's id.
+"""Room state model, registries and lifecycle helpers for multiplayer rooms
+and solo (vs. computer) games - the same `RoomState`, keyed in `rooms` by a
+4-letter code or the owning player's id.
 
-A multiplayer room has two human seats; a solo game seats the computer in
-one (`RoomState.computer_seat`), a plain flag never stored in `seats`, so no
-client can impersonate "the computer". State is in-memory and per-process.
-
-Sibling modules: rendering.py (per-viewer render/broadcast + view models),
-analysis_worker.py (post-game analysis worker), analysis_policy.py
-(feasibility/grace-period predicates), game_flow.py (computer turn + freezing
-finished games). app.py owns the routes and socket handlers.
+A multiplayer room has two human seats; a solo game seats the computer in one
+(`RoomState.computer_seat`), never stored in `seats`. State is in-memory and
+per-process. app.py owns the routes and socket handlers.
 """
 
 import base64
@@ -56,9 +51,8 @@ def normalize_code(raw_code):
     return raw_code.upper()
 
 
-# Client-supplied visitor identity (a UUID from getPlayerId() in
-# base.html.jinja2, doubling as a solo room's key). Any short id-shaped token
-# is accepted, not strict RFC 4122 - the bound just keeps it a safe dict key.
+# Client-supplied visitor identity (a UUID from getPlayerId()), doubling as a
+# solo room's key. Any short id-shaped token is accepted.
 _PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 MAX_NAME_LENGTH = 24
 
@@ -73,54 +67,34 @@ def normalize_player_id(raw):
 @dataclass
 class RoomState:
     game: Game
-    # Stable id for the current match, fresh per dealt game (a room persists
-    # across rematches). Doubles as the frozen finished_rooms entry id, so a
-    # match's review URL is fixed from the deal, and lets the analysis worker
-    # detect a rematch with one equality check.
+    # Stable id for the current match, fresh per dealt game; also the frozen
+    # finished_rooms entry id.
     game_id: str = field(default_factory=lambda: secrets.token_hex(8))
-    # Human seat occupants, {1: player_id, 2: player_id}. Missing = vacant
-    # (unless it's the computer's, see computer_seat). Usually auto-claimed on
-    # join; claim_seat/vacate_seat handle explicit changes.
+    # Human seat occupants, {1: player_id, 2: player_id}. Missing = vacant.
     seats: dict = field(default_factory=dict)
-    # Seat the computer occupies in a solo room, else None. Kept out of
-    # `seats` so it's never confused with a real visitor's identity.
+    # Seat the computer occupies in a solo room, else None. Kept out of `seats`.
     computer_seat: int | None = None
-    # This room's copy of each player's display name (player_id -> name), for
-    # rendering to other viewers. The canonical name lives in localStorage.
+    # This room's copy of each player's display name (player_id -> name).
     player_names: dict = field(default_factory=dict)
-    # Connected socket ids watching this room -> the player id on each, so
-    # updates can be pushed to everyone watching.
+    # Connected socket ids watching this room -> the player id on each.
     sid_players: dict = field(default_factory=dict)
-    # player_id who requested a rematch and is awaiting the other seat's
-    # response. None if none pending or solo (the computer accepts at once).
-    # Cleared on accept/decline/fresh deal.
+    # player_id awaiting the other seat's rematch response, else None.
     rematch_requested_by: str | None = None
-    # Per-viewer position when stepping through a finished game's history
-    # (player_id -> move index, 0..len(moves)); absent = latest position.
-    # Cleared on a fresh deal.
+    # Per-viewer history position (player_id -> move index); absent = latest.
     history_index: dict = field(default_factory=dict)
-    # player_ids already shown the game-over modal this game, so it pops once
-    # per viewer. Cleared on a fresh deal.
+    # player_ids already shown the game-over modal.
     game_over_seen: set = field(default_factory=set)
-    # Post-game move analyses, {move_index: analyse_moves(...)}. Filled by the
-    # worker during the game and for a grace period after (see
-    # analysis_deadline). Shared with the frozen finished_rooms entry - same
-    # dict, so late analyses still land in the review. Reset to None on a
-    # fresh deal (the frozen entry keeps the old dict).
+    # Post-game move analyses, {move_index: analyse_moves(...)}. Shared with the
+    # frozen finished_rooms entry (same dict). Reset to None on a fresh deal.
     analysis: dict | None = None
-    # Move indices currently being analysed, so a fresh request doesn't
-    # duplicate one in flight. Replaced (not cleared) on a fresh deal.
+    # Move indices currently being analysed.
     analysis_inflight: set = field(default_factory=set)
-    # monotonic() start time of each index in analysis_inflight due to an
-    # explicit "Calculate" click, so the page can show how long the wait has
-    # run. Same sharing/reset rules as analysis_inflight.
+    # monotonic() start time of each in-flight "Calculate" click.
     analysis_calc_started: dict = field(default_factory=dict)
-    # Guard so at most one analysis worker runs per room.
+    # At most one analysis worker runs per room while this is set.
     analysis_running: bool = False
-    # monotonic() deadline for the worker's post-game grace period, set at
-    # game end so a backtracking analysis eventually stops. None while a game
-    # is in progress. Left untouched by a rematch - the worker clears it once
-    # safe (see analysis_worker._analysis_worker_loop).
+    # monotonic() deadline for the worker's post-game grace period, set at game
+    # end. None while a game is in progress.
     analysis_deadline: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -143,8 +117,7 @@ class RoomState:
 
     @property
     def game_over(self):
-        # An unplaced game also has no legal moves, but it's pre-game rather
-        # than finished - guard on the marker having been placed.
+        # Guard on the marker: an unplaced game also has no legal moves.
         return not self.game.needs_marker and not self.game.legal_moves
 
     @property
@@ -181,9 +154,8 @@ class RoomState:
     def claim_seat(self, seat, player_id):
         """Try to claim a vacant seat. Returns (success, error_message).
 
-        No game_started guard: seats are otherwise locked mid-game, but a
-        seat can only be vacant mid-game because kick_seat emptied it, and
-        claiming it then is exactly what's wanted.
+        No game_started guard: a seat is only vacant mid-game if kick_seat
+        emptied it, and claiming it then is wanted.
         """
         with self.lock:
             if seat not in (1, 2):
@@ -271,19 +243,16 @@ class RoomState:
         return self.game.undo(total - index), index, total
 
 
-# Shared registries, public because rendering, analysis_worker, game_flow and
-# app all read them as the room subsystem's cross-module state.
+# Shared registries, read across the room subsystem's modules.
 rooms: dict[str, RoomState] = {}
 rooms_lock = threading.Lock()
 
-# Connected socket id -> (room key, player_id), so disconnect knows what to
-# clean up. Review viewers aren't added (a frozen entry never pushes updates).
+# Connected socket id -> (room key, player_id), for disconnect cleanup.
+# Review viewers aren't added.
 sid_index: dict[str, tuple[str, str]] = {}
 sid_index_lock = threading.Lock()
 
-# Frozen snapshots of finished rooms, oldest first, each keeping the final
-# Game, a per-viewer history position, an id, and an is_solo flag - so a
-# match stays reviewable after the room rematches. See
+# Frozen snapshots of finished rooms, oldest first. See
 # rendering._room_review_context.
 finished_rooms: list[dict] = []
 finished_rooms_lock = threading.Lock()
@@ -321,7 +290,7 @@ def get_or_create_room(code, solo=False):
     with rooms_lock:
         room = rooms.get(code)
         if room is None:
-            # Dealt unplaced: seat 2 places the marker before play begins.
+            # Dealt unplaced: seat 2 places the marker before play.
             room = RoomState(game=Game.deal(marker=None))
             if solo:
                 room.computer_seat = 2

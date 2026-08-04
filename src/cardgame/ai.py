@@ -2,35 +2,18 @@
 
 `AlphaBetaBot` plays in two regimes:
 
-* **Endgame** — once the exact solver's measured worst case for the
-  position's (cards left, face-down) cell fits the per-move budget, it
-  defers to `cardgame.best_move` (native, pure-Python fallback), which
-  optimises win/draw/loss expectation directly - reaching exact play
-  from ~16-19 cards at normal budgets.
-* **Opening/midgame** — iterative-deepening expectiminimax under a time
-  budget: negamax with alpha-beta at decision nodes, expectation with
-  Star1 cutoffs at face-down (chance) nodes — each resolution searched
-  only in the window of contributions that could still move the
-  expectation into the parent's (alpha, beta) — and a heuristic leaf
-  evaluation built from:
+* **Endgame** — once the exact solver fits the per-move budget, defers to
+  `cardgame.best_move`, which optimises win/draw/loss expectation directly
+  (exact play from ~16-19 cards at normal budgets).
+* **Opening/midgame** — iterative-deepening expectiminimax: negamax with
+  alpha-beta at decision nodes, expectation with Star1 cutoffs at face-down
+  chance nodes, and a heuristic leaf built from the hand score difference,
+  "potential" (discounted marginal of every card still on the board against
+  each hand), decaying rank centrality, a mobility term, and a win/loss bonus.
 
-  - the score difference between the two hands (via the scoring DP),
-  - "potential": the discounted marginal score of every card still on the
-    board against each hand — taking a card the opponent needs denies it, so
-    denial is valued automatically,
-  - rank centrality, decaying as the game progresses (middle ranks fit into
-    more runs, worth more early),
-  - a small mobility term, and a terminal win/loss bonus so the bot steers
-    towards ending the game while ahead.
-
-Every behavioral tunable lives in `SearchParams`; a bot is an `AlphaBetaBot`
-(params + time budget), so variants can be matched against each other via
-`cardgame.validation.arena`. Module-level `choose_move` is the default-param
-convenience API.
-
-Averaging over the remaining face-down cards is legitimate card counting:
-the deck and every face-up card are public, so both players can deduce the
-face-down multiset — no knowledge of which cell hides which card is used.
+Every behavioral tunable lives in `SearchParams`; module-level `choose_move`
+is the default-param convenience API. Averaging over the face-down multiset is
+legitimate card counting - the deck and every face-up card are public.
 """
 
 import time
@@ -78,16 +61,12 @@ def _centrality_table():
 
 
 _CENTRALITY = _centrality_table()
-# King centrality inside the *move-ordering* key only: the _ORDER_*
-# weights below were jointly fitted with kings pinned at 1.0, so this
-# stays a constant alongside them. The evaluation's king centrality is
-# SearchParams.king_centrality (same 1.0 default, independently tunable).
+# King centrality inside the move-ordering key only (the evaluation's is
+# SearchParams.king_centrality). Constant alongside the _ORDER_* weights.
 _KING_CENTRALITY = 1.0
 
-# Move-ordering score weights, fitted by within-position least squares on
-# oracle-labeled positions (cardgame.validation.oracle). Ordering never
-# changes what a search returns, only how early it cuts. `replies` is how
-# many moves the opponent is left with (restricting mobility orders well).
+# Move-ordering score weights, within-position least-squares fit on
+# oracle-labeled positions. `replies` is the opponent's move count.
 _ORDER_ME = 0.5883
 _ORDER_OPP = 0.1114
 _ORDER_CENT = 2.8549
@@ -95,9 +74,8 @@ _ORDER_KING = 0.2874
 _ORDER_FD = -0.1927
 _ORDER_REPLIES = -0.4922
 
-# Bitmask of the cells reachable from each marker (its row and column,
-# self excluded), so opponent reply counts cost one AND + popcount
-# against the taken-cell mask.
+# Bitmask of the cells reachable from each marker (its row and column, self
+# excluded). Opponent reply counts are one AND + popcount against the taken mask.
 _REPLY_MASK = {
     (i, j): sum(
         1 << (r * 6 + c)
@@ -137,8 +115,7 @@ def _centrality_sum(hand, king_centrality=1.0):
 
 
 # Cards pre-encoded for the leaf potential loop: a king is -1, anything else
-# is its Hand.as_int bit. The remaining-card multiset is threaded down the
-# search as a tuple of these tokens, shrinking by the taken card each ply.
+# is its Hand.as_int bit. Threaded down the search as a tuple of these tokens.
 _TOKEN = {
     card: (-1 if card[0] is Rank.K else 1 << (card[1] * 8 + card[0] - 1))
     for card in Card.deck()
@@ -168,25 +145,23 @@ class _Timeout(Exception):
     pass
 
 
-# Skip the exact-upgrade attempt with less budget than this left - too little
-# to finish anything, just wasted setup.
+# Skip the exact-upgrade attempt with less budget than this left.
 _EXACT_UPGRADE_MIN_SECONDS = 0.05
 
 
 def _exact_move(game, deadline=None):
-    """Exact best move, or None if there is no move or the solve was abandoned
-    (deadline tripped). A deadline requires the native solver - the pure-Python
-    fallback cannot be interrupted (best_move returns None then)."""
+    """Exact best move, or None if there is no move or the solve was abandoned.
+    A deadline requires the native solver; the pure-Python fallback returns
+    None when a deadline is given."""
     result = best_move(game, deadline=deadline)
     if result is None:
         return None
     marker = result["marker"]
     if marker is None:
         return None
-    # The solver ranks by (2w+d, s), dropping evaluate's middle "prefer
-    # decisive" term (w) for sound pruning (see solver.py). Among moves tied on
-    # 2w+d, re-rank by the full (2w+d, w, s) so a guaranteed draw never beats an
-    # equal-expectation move that can still win. Untied winners skip this.
+    # The solver ranks by (2w+d, s). Among moves tied on 2w+d, re-rank by the
+    # full (2w+d, w, s) so a guaranteed draw never beats an equal-expectation
+    # move that can still win. Untied winners skip this.
     moves = result["moves"]
     best_sign = max(decode(value)[0] for value, _exact in moves.values())
     tied = [mk for mk, (value, _exact) in moves.items() if decode(value)[0] == best_sign]
@@ -201,66 +176,48 @@ def _exact_move(game, deadline=None):
 
 @dataclass(frozen=True)
 class SearchParams:
-    """Every *behavioral* tunable of the midgame search - anything that can
-    change what it returns - in one immutable object, so bot variants can be
-    built side by side and A/B tested (see `cardgame.validation.arena`).
-    Speed-only or feature-shape constants (the `_ORDER_*` weights, the
-    `_CENTRALITY` table) live at module level: they are offline-fit outputs,
-    only coherent to change by refitting, and arena-invisible individually."""
+    """Every behavioral tunable of the midgame search - anything that can
+    change what it returns - in one immutable object, so variants can be A/B
+    tested (see cardgame.validation.arena). Speed-only or offline-fit
+    constants (_ORDER_* weights, _CENTRALITY) stay at module level.
+    """
 
-    # Upper bound on any value the search can return, used for Star1 cutoffs
-    # at chance nodes (tighter = stronger). Sound by construction: terminal
-    # and leaf values are clamped to this range on return.
+    # Upper bound on any value the search returns; the Star1 cutoff bound at
+    # chance nodes (tighter = stronger). Terminal and leaf values clamp to it.
     value_bound: float = 36.0
     win_bonus: float = 6.0
-    # Heuristic leaf weights, fitted by least squares against exact oracle
-    # values (cardgame.validation.oracle) and arena-validated. The centrality
-    # weight is fitted under the linear decay below.
+    # Heuristic leaf weights, least-squares fit against exact oracle values.
     potential_weight: float = 0.238
     centrality_weight: float = 7.562
     mobility_weight: float = 0.378
-    # King centrality relative to the 0..1 rank table (4/5 = 1.0) in the
-    # evaluation's centrality sum. Pinned at 1.0; fittable via fit_weights.
+    # King centrality relative to the 0..1 rank table (4/5 = 1.0).
     king_centrality: float = 1.0
     # Phase slopes: each base weight varies linearly in cards left above the
-    # pivot, w_eff = weight + slope * max(cards_left - pivot, 0), so play at
-    # <= pivot cards is exactly the arena-validated champion and the
-    # correction only ramps in toward the opening. `centrality_base` adds a
-    # flat floor to the decayed centrality term. Slopes = 0 recovers the
-    # phase-flat champion. Fitted on the exact + bootstrap corpora.
+    # pivot, w_eff = weight + slope * max(cards_left - pivot, 0). centrality_base
+    # is a flat floor on the decayed centrality term; slopes = 0 recovers the
+    # phase-flat weights.
     potential_slope: float = -0.01199
     centrality_base: float = 0.0
     mobility_slope: float = 0.00037
     tempo_slope: float = -0.1182
-    # Where the phase ramp starts, in cards left. The slopes are only valid
-    # at the pivot they were fitted against; refitting them (fit_weights'
-    # phase-fit section) is what changes it, not a free knob.
+    # Where the phase ramp starts, in cards left.
     phase_pivot: float = 12.0
     # Constant added to every heuristic leaf: the value of being on move.
-    # Affects only comparisons against terminal values, encoding that a live
-    # position is worth more than its bare score.
     tempo_bonus: float = 2.367
-    # Face-down moves branch into one child per possible hidden card; deeper
-    # in the tree the expectation is approximated with this many evenly-spaced
-    # samples of the rank-ordered possibilities.
+    # Deeper in the tree, the face-down expectation uses this many evenly-spaced
+    # samples of the rank-ordered hidden cards.
     resolution_cap: int = 5
     # Positions with at most this many cards left are solved exactly by
-    # Game.evaluate instead of leaf-evaluated. Affordable but arena-neutral,
-    # so off by default (suspected value-scale mismatch vs heuristic leaves).
-    # 0 disables.
+    # Game.evaluate instead of leaf-evaluated. 0 disables.
     exact_leaf_cards: int = 0
-    # Don't start another deepening iteration past this fraction of the
-    # budget. 1.0 keeps deepening until the deadline aborts mid-iteration:
-    # the previous best is searched first and improvements kept, so an
-    # interrupted iteration is never worse than idling.
+    # Don't start another deepening iteration past this fraction of the budget.
+    # 1.0 deepens until the deadline aborts mid-iteration.
     deepen_fraction: float = 1.0
     # Defer to the exact solver inside the calibrated endgame region.
     exact_endgame: bool = True
-    # Run the midgame search in the Rust core (heuristic_root) instead of
-    # Python. Same search, bit-identical at equal depth; the win is speed and
-    # it is arena-neutral, so it is the default. Falls back to Python when the
-    # native core is unavailable or exact_leaf_cards is set (native port is
-    # exact_leaf_cards=0 only). native=False forces the Python reference.
+    # Run the midgame search in the Rust core instead of Python (bit-identical
+    # at equal depth). Falls back to Python when the native core is unavailable
+    # or exact_leaf_cards is set. native=False forces the Python reference.
     native: bool = True
 
 
@@ -280,10 +237,9 @@ class AlphaBetaBot:
         """Pick a legal (row, col) move for `game`'s current player.
 
         Runs the iterative-deepening heuristic search first (always yields a
-        move). If it converged with budget to spare (the endgame), the leftover
-        time attempts an exact solve under a hard deadline - it enumerates every
-        face-down resolution the heuristic only samples. If it finishes its move
-        wins, otherwise the deadline trips and the heuristic move stands."""
+        move). If it converged with budget to spare, the leftover time attempts
+        an exact solve under a hard deadline; if that finishes its move wins,
+        otherwise the heuristic move stands."""
         legal_moves = game.legal_moves
         if not legal_moves:
             raise ValueError("Game is over - no legal moves to choose from")
@@ -310,11 +266,10 @@ class AlphaBetaBot:
         return 0.0
 
     def _full_potential(self, hand):
-        """Sum of `hand`'s marginals over the *root* remaining multiset.
-        Tokens the hand already holds contribute zero (the OR is a no-op)
-        and are skipped without a probe; every king has the same marginal,
-        solved once. Cached per hand in `_fullpot` for the whole root
-        search, so this O(cards-left) pass runs once per distinct hand."""
+        """Sum of `hand`'s marginals over the root remaining multiset. Tokens
+        the hand already holds contribute zero and are skipped; every king has
+        the same marginal, solved once. Cached per hand in `_fullpot` for the
+        whole root search."""
         score = _score
         hand_int, kings = hand
         base = score(hand_int, kings)
@@ -323,10 +278,8 @@ class AlphaBetaBot:
         for token in self._root_tokens:
             if token < 0:
                 if king_marginal is None:
-                    # A 4-king hand has no kings left to gain: its king
-                    # marginal is only ever multiplied by zero net remaining
-                    # kings, so any value cancels — use 0 (the DP does not
-                    # go past 4 kings). Must match _evaluate_leaf's guard.
+                    # 4-king guard: no kings left to gain, the term cancels
+                    # (use 0). Must match _evaluate_leaf's guard.
                     king_marginal = (
                         score(hand_int, kings + 1) - base if kings < 4 else 0
                     )
@@ -336,12 +289,10 @@ class AlphaBetaBot:
         return total
 
     def _evaluate_leaf(self, game, me, opp, taken, remaining):
-        # The search's hot spot. The potential term (each hand's summed
-        # marginals over cards still on the board) is computed the shorter of
-        # two equivalent ways per leaf: direct (one probe per hand per
-        # remaining card) or incremental (the _fullpot-cached root potential
-        # minus the path's taken marginals). Shallow horizons go incremental,
-        # deep endgame horizons direct; integer sums, so identical either way.
+        # The search's hot spot. The potential term is computed the shorter of
+        # two equivalent ways per leaf: direct (one probe per hand per remaining
+        # card) or incremental (the _fullpot-cached root potential minus the
+        # path's taken marginals). Integer sums, identical either way.
         params = self.params
         score = _score
         me_int, me_kings = me
@@ -360,8 +311,7 @@ class AlphaBetaBot:
             for token in taken:
                 if token < 0:
                     if king_mine is None:
-                        # 4-king guard mirrors _full_potential: the terms
-                        # cancel.
+                        # 4-king guard, mirrors _full_potential.
                         king_mine = (
                             score(me_int, me_kings + 1) - my_base
                             if me_kings < 4 else 0
@@ -418,14 +368,10 @@ class AlphaBetaBot:
         return tuple(ordered[i] for i in indices)
 
     def _ordered_markers(self, game, me, opp, mask):
-        """Legal moves as (marker, facedown), best-looking first for the
-        mover, with no child games constructed - callers build resolutions
-        only for moves that are actually searched, so moves behind a cutoff
-        cost nothing. The key is the fitted _ORDER_* score: the card's
-        marginal to each hand (cached DP), its static centrality/king
-        value, the face-down flag (means over the hidden multiset), and
-        how many replies the move leaves the opponent (one popcount
-        against `mask`, the taken-cell bitmask)."""
+        """Legal moves as (marker, facedown), best-looking first for the mover,
+        with no child games constructed. The key is the fitted _ORDER_* score:
+        the card's marginal to each hand, its static centrality/king value, the
+        face-down flag, and how many replies the move leaves the opponent."""
         facedown_key = None
         board = game.board
         facedown_positions = board.facedown_positions
@@ -470,14 +416,12 @@ class AlphaBetaBot:
         self, resolutions, depth, alpha, beta, me, opp, taken, remaining,
         mask, deadline,
     ):
-        """Expected value over equally-likely face-down resolutions (Star1):
-        each child is searched only in the window of contributions that could
+        """Expected value over equally-likely face-down resolutions (Star1).
+
+        Each child is searched only in the window of contributions that could
         still move the expectation into (alpha, beta), and the loop returns a
-        bound as soon as the running mean can no longer enter the window. A
-        child cut off by its narrowed window returns a fail-soft bound, which
-        makes the running total a bound in exactly the direction that triggers
-        the corresponding cutoff check below, so the returned value stays
-        sound."""
+        bound as soon as the running mean can no longer enter the window.
+        """
         bound = self.params.value_bound
         n = len(resolutions)
         total = 0.0
@@ -504,8 +448,7 @@ class AlphaBetaBot:
         """Exact value of a small position: the expectation of the terminal
         scoring (score difference with the win bonus) over Game.evaluate's
         outcome distribution, from the mover's perspective. Cached per root
-        search keyed by move prefix, so the frontier subtrees revisited by
-        every deepening iteration are solved once."""
+        search, keyed by move prefix."""
         value = self._exact_cache.get(game.moves)
         if value is None:
             prob, _best = game.evaluate()
@@ -525,10 +468,8 @@ class AlphaBetaBot:
         if 36 - len(game.moves) <= self.params.exact_leaf_cards:
             return self._exact_leaf(game)
         # Transposition probe. The taken-cell mask, marker and both hands
-        # fully determine the subgame (hands alone don't). Entries are
-        # (depth, flag, value, best_marker), flag 0 exact / 1 lower / -1 upper
-        # (fail-soft); a shallower entry can't answer a deeper request but its
-        # best move still improves ordering.
+        # fully determine the subgame. Entries are (depth, flag, value,
+        # best_marker), flag 0 exact / 1 lower / -1 upper (fail-soft).
         key = (mask, game.moves[-1], me, opp)
         entry = self._tt.get(key)
         tt_move = None
@@ -619,13 +560,10 @@ class AlphaBetaBot:
         params = self.params
         bound = params.value_bound
         self._exact_cache = {}
-        # Per-hand cache of the full-board potential (see _full_potential);
-        # valid for exactly one root search, whose remaining multiset is
-        # fixed in _root_tokens.
+        # Per-hand cache of the full-board potential (see _full_potential),
+        # valid for one root search (remaining multiset fixed in _root_tokens).
         self._fullpot = {}
-        # Fresh table per root search: keys are per-deal (card -> cell
-        # mappings differ between deals) and per-position entries go stale
-        # as the game advances anyway (the taken-cell mask only grows).
+        # Fresh transposition table per root search (keys are per-deal).
         self._tt = {}
         self._tt_cuts = 0
         start = time.perf_counter()
@@ -641,16 +579,13 @@ class AlphaBetaBot:
         mask = 0
         for row, col in game.moves:
             mask |= 1 << (row * 6 + col)
-        # The root is one node: materialise its children once and reuse
-        # them across every deepening iteration.
+        # Materialise the root's children once and reuse them each iteration.
         moves = [
             (marker, self._resolutions(game, marker, facedown))
             for marker, facedown in self._ordered_markers(game, me, opp, mask)
         ]
         best_marker = moves[0][0]
-        # Value of best_marker to the player to move (higher = better for the
-        # mover). Tracked so choose_placement can compare positions, not just
-        # pick a move. Set once depth 1 completes.
+        # Value of best_marker to the player to move; set once depth 1 completes.
         best_value = -bound
         max_depth = 36 - len(game.moves)
         depth = 1
@@ -684,9 +619,8 @@ class AlphaBetaBot:
                         iteration_best = marker
             except _Timeout:
                 # Keep a mid-iteration improvement: the previous best was
-                # searched first, so a move that raised alpha at this depth
-                # has proven itself better under the deeper search (its
-                # value is a sound fail-soft lower bound).
+                # searched first, so a move that raised alpha here is a sound
+                # fail-soft lower bound proven better under the deeper search.
                 interrupted = True
                 if iteration_best is not None:
                     best_marker = iteration_best
@@ -715,11 +649,10 @@ class AlphaBetaBot:
         """Best starting cell for the placer (the player NOT moving first):
         the one MINIMISING the mover's best reply.
 
-        Shares one search across the four placements. The starting cell is
-        never collected, so the position after the mover's first move depends
-        only on the target cell, and the transposition table keys exactly on
-        that - every shared subtree is searched once. Joint iterative deepening
-        keeps all four values at equal, comparable depth."""
+        Shares one search across the four placements - the starting cell is
+        never collected, so subtrees transpose and are searched once. Joint
+        iterative deepening keeps all four values at comparable depth.
+        """
         if self._use_native() and _heuristic_placement is not None:
             return self._choose_placement_native(game)
         return self._choose_placement_python(game)
@@ -779,8 +712,7 @@ class AlphaBetaBot:
                     value = -bound
                     for marker, resolutions in children:
                         child_mask = 1 << (marker[0] * 6 + marker[1])
-                        # Full window: exact child values (comparable across
-                        # placements) and exact table entries (maximal reuse).
+                        # Full window: child values comparable across placements.
                         if len(resolutions) == 1:
                             child = resolutions[0]
                             token = _TOKEN[child.taken_card]
@@ -809,8 +741,7 @@ class AlphaBetaBot:
             "elapsed": time.perf_counter() - start,
             "values": best,
         }
-        # Placer minimises the mover's value; ties break to the lower/righter
-        # cell via the natural order of _valid_starting_positions.
+        # Placer minimises the mover's value; ties break by cell order.
         return min(best, key=lambda pos: (best[pos], pos))
 
 

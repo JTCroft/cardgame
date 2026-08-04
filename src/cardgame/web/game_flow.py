@@ -1,10 +1,8 @@
-"""Game-flow glue that spans the model, view, and analysis subsystems:
-driving the computer opponent's turn, and freezing a finished game into
-review history (which also kicks off the post-game analysis grace period).
+"""Game-flow glue spanning model, view, and analysis: driving the computer
+opponent's turn and freezing a finished game into review history.
 
-These sit above the other web modules - they call into the model (rooms),
-the view (rendering), and the worker (analysis_worker) - so they live here
-rather than in any one of those, and app.py's socket handlers call them.
+Sits above the other web modules (rooms, rendering, analysis_worker) and is
+called from app.py's socket handlers.
 """
 
 import random
@@ -17,55 +15,37 @@ from .rooms import finished_rooms, finished_rooms_lock
 
 __all__ = ("maybe_play_computer_move", "record_room_finished_locked")
 
-# Floor on how long the computer takes to play, so a move it solves near-
-# instantly (e.g. a forced move or a shallow endgame) still reads as a
-# deliberate turn rather than snapping onto the board. Only ever pads a fast
-# move up to this; a longer think is left alone.
+# Pad a fast computer move up to this so it reads as a deliberate turn.
 _COMPUTER_MIN_MOVE_SECONDS = 1.0
 
-# How many finished games (rooms and solo games together) the /rooms
-# "Recently finished games" table keeps around - see
-# record_room_finished_locked.
+# Finished games kept in the /rooms "Recently finished games" table.
 _MAX_FINISHED_ENTRIES = 20
 
-# Total background time the post-game worker keeps backtracking after a game
-# ends (see record_room_finished_locked / analysis_worker).
+# Background time the post-game worker keeps backtracking after a game ends.
 _ANALYSIS_TIME_CAP = 120.0
 
 
 def record_room_finished_locked(code, room):
-    """Freeze this room's just-finished result into history. Caller must
-    already hold room.lock, so the snapshot (game object included)
-    reflects exactly the move that just finished it - not a later one.
+    """Freeze this room's just-finished result into history.
+
+    Caller must hold room.lock, so the snapshot reflects the move that just
+    finished the game. Starts the post-game analysis grace period.
     """
     entry = room_summary_locked(code, room)
-    # Reuse the match's own id (assigned at deal time - see RoomState.game_id)
-    # rather than minting a fresh one: the /review URL for this match was
-    # already fixed the moment it was dealt.
+    # Reuse the match's own id so the /review URL stays fixed from deal time.
     entry["id"] = room.game_id
     entry["game"] = room.game
     entry["history_index"] = {}
-    # One shared cache for the room's own post-game review and this frozen
-    # entry's /review page - usually already largely filled during the game;
-    # the worker's post-game grace period (below) adds whatever more it can
-    # in the time it has left. Viewers already scrubbing get a refresh when
-    # it's done; anyone arriving later just finds it ready.
+    # One shared analysis cache for the room's review and this frozen entry.
     if room.analysis is None:
         room.analysis = {}
-    # Give the worker _ANALYSIS_TIME_CAP more seconds to keep backtracking -
-    # long enough to let anything already in flight finish rather than
-    # aborting it outright, and to fill in a bit more depth besides - before
-    # it stops burning CPU on a game nobody is playing any more. See
-    # analysis_worker and analysis_deadline's field comment.
+    # Give the worker _ANALYSIS_TIME_CAP more seconds to keep backtracking.
     room.analysis_deadline = time.monotonic() + _ANALYSIS_TIME_CAP
     entry["analysis"] = room.analysis
     entry["analysis_inflight"] = room.analysis_inflight
     entry["analysis_calc_started"] = room.analysis_calc_started
-    # Copied by value, not shared like the dicts above: the live room's own
-    # analysis_deadline gets repurposed (or cleared - see its field comment)
-    # by a later rematch, but a frozen entry's "has the automatic grace
-    # period passed, so is a 'Calculate' button appropriate" question always
-    # refers to *this* match's own deadline, fixed at the moment it froze.
+    # Copied by value: a frozen entry's deadline refers to this match only,
+    # even after a rematch repurposes the live room's field.
     entry["analysis_deadline"] = room.analysis_deadline
     start_analysis_worker_locked(code, room)
     with finished_rooms_lock:
@@ -75,21 +55,18 @@ def record_room_finished_locked(code, room):
 
 
 def maybe_play_computer_move(code, room):
-    """If it's now the computer's turn (only ever true for a solo-vs-
-    computer room), play its move and broadcast the result. Loops in case
-    that leaves it the computer's turn again, though a single move always
-    hands the turn back in practice. A harmless no-op for any room without
-    a computer seat, so callers can invoke this unconditionally after every
-    move.
+    """Play the computer's move and broadcast it if it's now its turn.
+
+    Only ever acts in a solo-vs-computer room; a harmless no-op otherwise,
+    so callers can invoke it unconditionally after every move. Loops in case
+    the move leaves it the computer's turn again.
     """
     while True:
         with room.lock:
             if room.computer_seat is None or room.game_over:
                 return
             if room.game.needs_marker:
-                # Computer placer (seat 2 only): choose a starting cell once
-                # both seats are filled. Placing from seat 1 is never the
-                # computer's call - that's the human's.
+                # Computer placer is seat 2 only; seat 1 placement is the human's.
                 if not room.both_seated or room.computer_seat != 2:
                     return
                 placing = True
@@ -98,10 +75,8 @@ def maybe_play_computer_move(code, room):
             else:
                 placing = False
             game, game_id = room.game, room.game_id
-        # Think (and enforce the minimum move time) outside the lock, so a
-        # slow think no longer holds the room's lock and the padding sleep
-        # never blocks broadcasts or the analysis worker. Placement runs the
-        # same budgeted search over the four starting cells.
+        # Think and pad outside the lock so a slow think doesn't block
+        # broadcasts or the analysis worker.
         start = time.monotonic()
         if placing:
             placement = choose_placement(game)
@@ -111,11 +86,8 @@ def maybe_play_computer_move(code, room):
         if remaining > 0:
             time.sleep(remaining)
         with room.lock:
-            # The game may have moved on while we were thinking (a rematch
-            # dealt a fresh game, a seat was swapped, the move/placement was
-            # applied by another caller): only apply if it is still exactly
-            # the position we solved. `room.game is not game` already covers a
-            # marker placed meanwhile (the game object would have changed).
+            # Only apply if the position we solved is still current (a rematch,
+            # seat swap, or another caller may have moved on meanwhile).
             if (
                 room.game is not game
                 or room.game_id != game_id
@@ -124,10 +96,7 @@ def maybe_play_computer_move(code, room):
             ):
                 return
             if placing:
-                # Re-check the placement preconditions under the lock: a seat
-                # swap during the think can hand seat 2 (the placer) to the
-                # human, in which case the computer must not place after all.
-                # (The turn re-check below is the move-branch equivalent.)
+                # Re-check under the lock: a seat swap can hand seat 2 to the human.
                 if not room.both_seated or room.computer_seat != 2:
                     return
                 room.game = room.game.place_marker(*placement)
@@ -139,6 +108,5 @@ def maybe_play_computer_move(code, room):
                     record_room_finished_locked(code, room)
         broadcast_state(code, room)
         if placing:
-            # The move turn is now P1's; loop in case it becomes the
-            # computer's turn again (it never is in practice).
+            # Loop in case it's the computer's turn again (never is in practice).
             continue

@@ -14,25 +14,19 @@ env = Environment(
     loader=PackageLoader(package_name="cardgame", package_path="../../templates")
 )
 
-# This is the approximate upper bound of the difference between 2 players scores
-# Not proven, but here's two disjoint hands that achieve this
-# 31 points - [A♣, 2♣, 2♠, 3♥, 3♣, 3♠, 4♣, 4♦, 4♠, 5♣, 5♠, 6♥, 6♣, 6♠, K♥, K♣]
-# 5 points -  [A♥, A♠, 2♥, 2♦, 3♦, 4♥, 5♥, 5♦, 6♦, 7♥, 7♠, 8♥, 8♣, 8♦, 8♠]
+# Approximate (unproven) upper bound on the score difference between two hands;
+# these two disjoint hands reach it: 31 vs 5 points.
 _SCORE_DIFFERENCE_BOUND = 26
 
-# Scoring dominates the tree search (terminal positions outnumber interior
-# ones several-fold and each used to pay two uncached DP solves), and
-# transpositions make hands recur constantly, so a big cache pays for
-# itself many times over. Hand.score routes through this too.
+# Global scoring cache, shared across the tree search where hands recur
+# constantly. Hand.score routes through this too.
 _cached_score = lru_cache(maxsize=1 << 20)(score_dp)
 
 _FACTORIAL = tuple(factorial(n) for n in range(13))
 
 
-# Legal-move memo shared by every game: the marker cell plus the occupancy
-# of its row and column fully determine the legal set, and the marker's own
-# bits are always set in the key, so there are at most 36 * 32 * 32 distinct
-# keys process-wide. Values are frozensets, shared rather than rebuilt.
+# Legal-move memo shared by every game, keyed by marker cell plus its row and
+# column occupancy (at most 36 * 32 * 32 keys). Values are shared frozensets.
 _LEGAL_MEMO = {}
 
 
@@ -57,11 +51,8 @@ class Board(tuple):
         return instance
 
     def __getnewargs__(self):
-        # Same mismatch as Card: __new__ takes the row layout and
-        # facedown_cards (an instance attribute, not part of the tuple
-        # contents) as separate args, not what tuple's default pickling
-        # reduction assumes. Unwrapped to a plain tuple - passing `self`
-        # here would recurse back into pickling this same Board forever.
+        # __new__ takes the row layout and facedown_cards separately; unwrap to
+        # a plain tuple so pickling doesn't recurse back into this Board.
         return (tuple(self), self.facedown_cards)
 
     def save(self, alnum=False):
@@ -103,9 +94,7 @@ class Board(tuple):
         return self.template.render(board=self)
 
     def resolve(self, row, col):
-        # Reuses the five unchanged row tuples and bypasses __new__'s
-        # re-tupling walk - this runs once per possibility of every chance
-        # node in the search.
+        # Reuses the five unchanged row tuples and bypasses __new__'s re-tupling.
         before, target, after = self[:row], self[row], self[row + 1 :]
         left, right = target[:col], target[col + 1 :]
         facedown_cards = self.facedown_cards
@@ -194,10 +183,8 @@ class Eval(tuple):
         return inst
 
     def __getnewargs__(self):
-        # __new__ takes multiplicity separately from (w, d, s) - tuple's
-        # default pickling reduction doesn't know that and would otherwise
-        # pass the packed tuple as a single arg and drop multiplicity
-        # (an instance attribute, not part of the tuple contents) entirely.
+        # __new__ takes multiplicity separately from (w, d, s); reconstruct it
+        # so pickling doesn't drop multiplicity.
         return (self.multiplicity, *self)
 
     @property
@@ -252,11 +239,8 @@ class Eval(tuple):
         )
 
     def decisively_exceeds(self, other):
-        # Prune-safe strict comparison on 2w+d alone. Full (2w+d, w, s)
-        # ordering is not reversed by negation - the w tiebreak survives
-        # negating both sides - so pruning on it is unsound, but a strict
-        # 2w+d difference is immune (see evaluate-alpha-beta-ordering-bug
-        # in project memory for the counterexample).
+        # Prune-safe strict comparison on 2w+d alone (the full (2w+d, w, s)
+        # ordering isn't negation-safe; see evaluate-alpha-beta-ordering-bug).
         self_multip = self.multiplicity
         other_multip = other.multiplicity
         if self_multip == other_multip:
@@ -293,9 +277,8 @@ class ProbEval(Counter):
         return w, d, s
 
     def _bound_evals(self):
-        """(lower_bound.eval, upper_bound.eval) in a single pass with no
-        Counter copies - equivalent to self.bound(-26).eval /
-        self.bound(+26).eval, which the search consults constantly."""
+        """(lower_bound.eval, upper_bound.eval) in a single pass with no Counter
+        copies - equivalent to self.bound(-26).eval / self.bound(+26).eval."""
         w = d = s = observed = 0
         for k, v in self.items():
             observed += v
@@ -359,11 +342,8 @@ class ProbEval(Counter):
         return self._bound_evals()[0] >= other._bound_evals()[1]
 
     def __eq__(self, other):
-        # Compare on (w, d, s) bounds, consistent with __lt__/__gt__. The
-        # inherited dict __eq__ compared raw Counter contents, so two
-        # distributions with equal bounds but different frequency maps came
-        # out simultaneously not-equal/not-less/not-greater, breaking the
-        # (value, marker) tie-break used throughout the search.
+        # Compare on (w, d, s) bounds, consistent with __lt__/__gt__ (not the
+        # inherited dict __eq__ on raw Counter contents).
         self_bounds = self._bound_evals()
         other_bounds = other._bound_evals()
         return self_bounds[0] == other_bounds[0] and self_bounds[1] == other_bounds[1]
@@ -397,9 +377,8 @@ class Game:
     def __init__(self, board, moves, start=starting_position):
         self.board = board
         self.moves = moves
-        # The cell the marker was placed on, or None if it hasn't been
-        # placed yet. Constant across a game's lineage; _child carries it to
-        # every descendant so move/undo never have to mention it.
+        # The cell the marker was placed on, or None if unplaced. Constant
+        # across a game's lineage; _child carries it to every descendant.
         self.start = start
 
     @classmethod
@@ -421,16 +400,14 @@ class Game:
         return self.__class__(self.board, self.moves, start=(row, col))
 
     def clear_marker(self):
-        """Undo a marker placement, returning to the unplaced board. Only
-        valid before any move (placement changes nothing but `start`, so
-        this is lossless); used when the seat that placed it changes hands."""
+        """Undo a marker placement, returning to the unplaced board. Only valid
+        before any move (placement changes nothing but `start`)."""
         if self.moves:
             raise ValueError("Cannot clear the marker once play has begun")
         return self.__class__(self.board, self.moves, start=None)
 
     def _child(self, board, moves):
-        # Every descendant of a game inherits its marker start; this is the
-        # single place that carries it forward, so move/undo never mention it.
+        # The single place that carries the marker start to descendants.
         return self.__class__(board, moves, start=self.start)
 
     @property
@@ -439,9 +416,8 @@ class Game:
 
     @property
     def _taken_masks(self):
-        # Row-major and column-major occupancy bitmasks of the taken cells.
-        # Built once per game from the move list; `move` and `all_moves`
-        # extend them incrementally so search descents never rebuild them.
+        # Row-major and column-major occupancy bitmasks of the taken cells,
+        # built once per game; `move`/`all_moves` extend them incrementally.
         try:
             return self._taken_masks_cache
         except AttributeError:
@@ -454,10 +430,8 @@ class Game:
 
     @property
     def legal_moves(self):
-        # Memoised twice: per game (games are immutable, and the search
-        # consults this several times per node), and globally via
-        # _LEGAL_MEMO - two shifts and a dict probe replace the set
-        # difference over the whole move list.
+        # Memoised per game and globally via _LEGAL_MEMO: two shifts and a dict
+        # probe replace the set difference over the move list.
         try:
             return self._legal_moves_cache
         except AttributeError:
@@ -469,8 +443,7 @@ class Game:
             return self._legal_moves_cache
         row, col = marker
         rows, cols = self._taken_masks
-        # The marker's own bits are forced on so the root marker (whose
-        # starting cell was never taken) excludes itself like any other.
+        # Force the marker's own bits on so it excludes itself like any other.
         row_bits = ((rows >> (row * 6)) | (1 << col)) & 63
         col_bits = ((cols >> (col * 6)) | (1 << row)) & 63
         key = (row * 6 + col, row_bits, col_bits)
@@ -546,8 +519,7 @@ class Game:
 
     @property
     def is_p2_turn(self):
-        # Player 2 also acts during the placement phase - they choose the
-        # marker's starting cell before Player 1 makes the first move.
+        # Player 2 also acts during placement, choosing the marker's start.
         return self.needs_marker or bool(self.legal_moves and (len(self.moves) % 2))
 
     def _repr_html_(self):
@@ -585,10 +557,9 @@ class Game:
         return self.board[row][col]
 
     def _hand_state(self):
-        """Both hands as scoring ints, mover first: (mover_int,
-        mover_kings, other_int, other_kings), in Hand.as_int's encoding.
-        Threaded incrementally through evaluate so terminals score from
-        the cache with no Hand construction."""
+        """Both hands as scoring ints, mover first: (mover_int, mover_kings,
+        other_int, other_kings), in Hand.as_int's encoding. Threaded through
+        evaluate so terminals score from the cache with no Hand construction."""
         hands = [[0, 0], [0, 0]]
         board = self.board
         for i, (row, col) in enumerate(self.moves):
@@ -616,24 +587,19 @@ class Game:
 
     @staticmethod
     def _get_bounds(branch_multiplicity, move_score, alpha, beta):
-        # Same arithmetic as the original Counter-copy formulation, one
-        # pass and no allocation: filling the remaining unevaluated mass
-        # at -26 adds (0, 0, -26*rem) to the observed (w, d, s); at +26 it
-        # adds (rem, 0, +26*rem).
+        # One-pass, no-allocation fill of the remaining unevaluated mass:
+        # at -26 adds (0, 0, -26*rem) to the observed (w, d, s), at +26 (rem, 0, +26*rem).
         w, d, s = move_score.observed_wds
         remaining_unevaled_after_branch = (
             move_score.multiplicity - move_score.observed - branch_multiplicity
         )
         filled = _SCORE_DIFFERENCE_BOUND * remaining_unevaled_after_branch
-        # How good does the branch evaluation have to be
-        # So that the LOWER BOUND of the combined eval with the move score
-        # would be ABOVE beta
+        # subbeta: how good the branch eval must be for the combined lower bound
+        # to exceed beta.
         subbeta = Eval(
             branch_multiplicity, beta[0] - w, beta[1] - d, beta[2] - (s - filled)
         )
-        # How bad does the branch evaluation have to be
-        # So that the UPPER BOUND of the combined eval with the move score
-        # would be BELOW alpha
+        # subalpha: how bad it must be for the combined upper bound to fall below alpha.
         subalpha = Eval(
             branch_multiplicity,
             alpha[0] - (w + remaining_unevaled_after_branch),
@@ -652,17 +618,14 @@ class Game:
 
     def evaluate(self):
         """Exact value of this position as a single ProbEval (the score-
-        difference distribution under optimal play, in the mover's own
-        perspective) together with the best move's marker (None at a
-        terminal). Native-backed when the Rust core is available (one
-        `evaluate_root` walk), falling back to the pure-Python
-        `_evaluate_python` engine otherwise.
+        difference distribution under optimal play, in the mover's perspective)
+        with the best move's marker (None at a terminal). Native-backed when the
+        Rust core is available, else the pure-Python `_evaluate_python` engine.
 
-        Returns (ProbEval, best_marker). The native and pure-Python engines
-        agree exactly on the value's (w, d, s) and on the best move; they may
-        differ in how the histogram distributes weight among tied-optimal
-        lines, which is invisible to every consumer (ProbEval orders on its
-        (w, d, s) bounds, not raw counts)."""
+        Returns (ProbEval, best_marker). The two engines agree exactly on the
+        value's (w, d, s) and the best move; they may differ in how the
+        histogram distributes weight among tied-optimal lines.
+        """
         from .solver_native import NATIVE_AVAILABLE, evaluate_native
 
         if NATIVE_AVAILABLE:
@@ -671,21 +634,18 @@ class Game:
         return result["Evaluation"], result["best_marker"]
 
     def _evaluate_python(self, alpha=None, beta=None, _state=None):
-        # Pure-Python reference engine behind Game.evaluate (the no-native
-        # fallback), and the recursive workhorse: it calls itself under
+        # Pure-Python reference engine behind Game.evaluate, recursing under
         # negated windows. Returns the full internal dict (Evaluation, the
-        # deterministic optimal PV, per-branch scores, and the best marker);
-        # the public `evaluate` reduces that to (ProbEval, best_marker).
+        # deterministic optimal PV, per-branch scores, best marker); `evaluate`
+        # reduces that to (ProbEval, best_marker).
         #
-        # Unexplored-branch placeholders use the loose global ±26. Tighter
-        # per-position bounds are sound in principle but corrupt this
-        # engine's fail-soft bookkeeping (found by counterexample) and prune
-        # nothing at the other fill sites (see position-bounds-finding).
+        # Unexplored-branch placeholders use the loose global ±26; tighter
+        # per-position bounds break this engine's fail-soft bookkeeping (see
+        # position-bounds-finding).
         multiplicity = self.multiplicity
         if not self.legal_moves:
-            # _state is the incrementally threaded (mover_int, mover_kings,
-            # other_int, other_kings) - equal to negamax_score, minus the
-            # Hand construction, with the scoring DP cached.
+            # _state is the threaded (mover_int, mover_kings, other_int,
+            # other_kings), with the scoring DP cached.
             if _state is None:
                 _state = self._hand_state()
             diff = _cached_score(_state[0], _state[1]) - _cached_score(
@@ -777,11 +737,10 @@ class Game:
         }
 
     def save(self, alnum=False):
-        # Format: "<board>//<start><moves>". <start> is one digit, the index
-        # of the marker's starting cell in _valid_starting_positions, and
-        # each <moves> digit indexes the taken cell in the sorted possible
-        # moves from the previous marker. An unplaced game has no marker, so
-        # the trailing section is empty.
+        # Format: "<board>//<start><moves>". <start> indexes the marker's
+        # starting cell in _valid_starting_positions; each <moves> digit indexes
+        # the taken cell in the sorted moves from the previous marker. An
+        # unplaced game leaves the trailing section empty.
         board_str = self.board.save(alnum=alnum)
         if self.start is None:
             return f"{board_str}//"

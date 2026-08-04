@@ -71,9 +71,8 @@ from .rooms import (
     status_counts,
 )
 
-# flask-socketio broadcast group for the /rooms lobby listing (identical for
-# every viewer, unlike per-viewer game state). Distinct from our 4-letter
-# game room codes.
+# flask-socketio broadcast group for the /rooms lobby listing (one shared
+# render for every viewer). Distinct from our 4-letter game room codes.
 _LOBBY_GROUP = "lobby"
 
 
@@ -92,9 +91,8 @@ def _how_to_play_context():
     game = Game.deal()
     board = game.board
 
-    # A reachable position for the "passing over gaps" diagram: play a short
-    # legal sequence so the marker sits in a gap with further gaps to reach
-    # past. Facedown destinations resolve to several children; any one will do.
+    # A reachable position for the "passing over gaps" diagram: the marker sits
+    # in a gap with further gaps past it. Any facedown resolution will do.
     gap_game = game
     for move in [(2, 3), (4, 3), (4, 1), (1, 1), (1, 3)]:
         gap_game = gap_game.move(*move)[0]
@@ -218,9 +216,8 @@ def create_app():
 
     @app.get("/play-from/<state>")
     def play_from(state):
-        # "Play from here": seed a solo game from a position encoded in the
-        # URL. Validated eagerly so a mangled link 404s here; the JS carries
-        # `state` up with its "join", where the room is actually created.
+        # "Play from here": seed a solo game from a URL-encoded position.
+        # Validated eagerly here; the JS creates the room on its "join".
         game = decode_game_state(state)
         if game is None or not game.legal_moves:
             abort(404, description="That saved position could not be loaded.")
@@ -235,8 +232,7 @@ def create_app():
 
     @app.get("/review/<entry_id>")
     def review(entry_id):
-        # Finished entries never change, so 404 eagerly. Dispatch on the
-        # frozen entry's is_solo flag to pick the template (solo vs room).
+        # Dispatch on the frozen entry's is_solo flag (solo vs room template).
         entry = find_finished_room_entry(entry_id)
         if entry is None:
             abort(404, description="That finished game could no longer be found.")
@@ -281,7 +277,7 @@ def handle_join(data):
         return
 
     # review_entry_id names a frozen finished room for read-only review - a
-    # separate, stateless path with no live RoomState to join.
+    # stateless path with no live RoomState to join.
     review_entry_id = (data.get("review_entry_id") or "").strip()
     if review_entry_id:
         entry = find_finished_room_entry(review_entry_id)
@@ -299,10 +295,9 @@ def handle_join(data):
 
     name = (data.get("name") or "").strip()[:MAX_NAME_LENGTH]
     # Solo "start a new game" flow. Client flags: `start` (first join of a
-    # fresh page load, not a reconnect), `force` (confirmed the new-game
-    # prompt), `load_state` (a "Play from here" position to seed from). Rather
-    # than clobber a game in progress, the server offers a Resume/new choice
-    # (solo_prompt). Untouched by multiplayer/spectate/review joins.
+    # fresh page load), `force` (confirmed the new-game prompt), `load_state`
+    # (a "Play from here" seed position). A game in progress gets a Resume/new
+    # choice (solo_prompt) rather than being clobbered.
     start = bool(data.get("start"))
     force = bool(data.get("force"))
     load_state = (data.get("load_state") or "").strip()
@@ -364,8 +359,7 @@ def handle_join(data):
             room.player_names[player_id] = name
 
         # Auto-claim a vacant seat. A multiplayer seat needs a name first
-        # (needs_name prompts and retries); a solo room's seat is exempt,
-        # since the computer opponent doesn't care who you are.
+        # (needs_name prompts and retries); a solo room's seat is exempt.
         vacant_seat = next(
             (seat for seat in (1, 2) if not room.occupied(seat)), None
         )
@@ -382,16 +376,14 @@ def handle_join(data):
         sid_index[sid] = (code, player_id)
 
     if needs_name:
-        # Withhold the board behind the name prompt; the retry (with a name)
-        # renders the real, already-seated board for everyone.
+        # Withhold the board behind the name prompt; the retry renders it.
         socketio.emit("need_name", {}, to=sid)
     else:
         broadcast_state(code, room)
         # Offer the joiner Resume vs new-game for a game in progress.
         if pending_prompt is not None:
             socketio.emit("solo_prompt", pending_prompt, to=sid)
-    # A solo computer in seat 2 places the marker once the human is seated
-    # (or after a fresh deal above).
+    # A solo computer in seat 2 places the marker once the human is seated.
     maybe_play_computer_move(code, room)
     ensure_analysis_worker(code, room)
     _broadcast_lobby()
@@ -419,9 +411,8 @@ def handle_set_name(data):
             with room.lock:
                 room.player_names[player_id] = name
                 is_seated = room.seat_of(player_id) is not None
-            # Only broadcast if the name is visible to others (player seated);
-            # broadcasting for an unseated visitor would leak a premature
-            # spectator board before the pending "join" retry seats them.
+            # Only broadcast for a seated player; an unseated visitor's name
+            # isn't visible to others yet.
             if is_seated:
                 broadcast_state(code, room)
                 _broadcast_lobby()
@@ -770,8 +761,7 @@ def handle_calculate_move(data):
         cache, inflight, calc_started = room.analysis, room.analysis_inflight, room.analysis_calc_started
 
     def on_done():
-        # Skip if the room has since rematched - broadcasting would clobber
-        # watchers' boards with a stale render; the result waits on /review.
+        # Skip if the room has since rematched; the result waits on /review.
         current = rooms.get(code)
         if current is not None and current.game_id == game_id:
             broadcast_state(code, current)
@@ -815,8 +805,7 @@ def handle_request_rematch(data):
 
     broadcast_state(code, room)
     _broadcast_lobby()
-    # A fresh solo rematch may put the computer on the move; nothing else
-    # would trigger it (no-op otherwise).
+    # A fresh solo rematch may put the computer on the move.
     maybe_play_computer_move(code, room)
 
 
@@ -869,8 +858,7 @@ def handle_disconnect():
         if room is not None:
             with room.lock:
                 room.sid_players.pop(sid, None)
-            # Refresh so watchers get the "Kick" button for the seat this
-            # connection just abandoned (see RoomState.seat_disconnected).
+            # Refresh so watchers get the "Kick" button for the abandoned seat.
             broadcast_state(code, room)
             _broadcast_lobby()
 

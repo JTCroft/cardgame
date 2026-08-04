@@ -1,11 +1,7 @@
-"""View layer for rooms: turns a RoomState (or a frozen finished entry)
-into the per-viewer template context, renders it, and pushes it out to
-connected sockets. Also builds the lobby listing summaries and the
-post-game move-analysis panel (including its outcome heatmap).
-
-Depends only on the room-state model (rooms) and the pure analysis
-policy predicates (analysis_policy) - never on the analysis worker, which
-depends on *this* module (for broadcast_state) instead.
+"""View layer for rooms: turns a RoomState (or a frozen finished entry) into
+per-viewer template context, renders it, and pushes it to connected sockets.
+Also builds the lobby listing summaries and the post-game move-analysis panel
+(including its outcome heatmap).
 """
 
 import time
@@ -34,19 +30,15 @@ __all__ = (
 )
 
 
-# Sequential ramp for the outcome heatmap's cells: dark (0% of outcomes,
-# matching .move-analysis's own background so an empty cell reads as
-# "nothing here") up to this site's existing accent blue (100%). A single
-# hue carries likelihood; which side of the axis a cell sits on is what
-# carries who it favours, so the two are never conflated in one channel.
+# Sequential ramp for the heatmap cells: dark (0% of outcomes) to accent blue
+# (100%). A single hue carries likelihood.
 _HEATMAP_BASE_RGB = (0x2B, 0x2B, 0x2B)
 _HEATMAP_ACCENT_RGB = (0x7C, 0xB8, 0xFF)
 
 
 def _heatmap_style(pct):
-    """The cell's background - interpolated along the sequential ramp - and
-    a text color for the percentage label printed on top of it, picked by
-    the background's luminance so the label stays legible at both ends."""
+    """Cell background interpolated along the ramp, plus a luminance-picked
+    text color for the label so it stays legible at both ends."""
     t = min(1.0, max(0.0, pct / 100))
     r, g, b = (
         round(base + (accent - base) * t)
@@ -57,24 +49,19 @@ def _heatmap_style(pct):
     return f"#{r:02x}{g:02x}{b:02x}", text
 
 
-# The heatmap's axis is fixed rather than sized to each position's actual
-# range, so positions can be compared at a glance instead of each drawing
-# its own scale. Outcomes beyond it collapse into the two end cells.
+# Fixed heatmap axis, so positions can be compared at a glance. Outcomes
+# beyond it collapse into the two end cells.
 _HEATMAP_RANGE = 4
 
 
 def _outcome_heatmap(distribution, mover_seat):
-    """Turn a move's {mover_diff: weight} distribution (see analyse_moves)
-    into the "who's winning" heatmap's template context: a fixed row of
-    cells from -_HEATMAP_RANGE to +_HEATMAP_RANGE (P1 - P2), each annotated
-    with its likelihood, plus two end cells pooling everything beyond that
-    range - and the single most likely outcome, called out as the headline
-    text. Face-down cards mean even optimal play from a fixed position can
-    end in a spread of scores, not one number, which is what this is for.
+    """Turn a move's {mover_diff: weight} distribution into the heatmap's
+    template context: a fixed row of cells from -_HEATMAP_RANGE to
+    +_HEATMAP_RANGE (P1 - P2), two end cells pooling everything beyond, and
+    the single most likely outcome as the headline text.
     """
     total = sum(distribution.values())
-    # distribution is in the mover's own perspective (self - opponent);
-    # flip it onto the fixed P1 - P2 axis the template renders.
+    # Flip from the mover's perspective onto the fixed P1 - P2 axis.
     sign = 1 if mover_seat == 1 else -1
     p1_distribution = Counter({sign * diff: weight for diff, weight in distribution.items()})
 
@@ -101,16 +88,12 @@ def _outcome_heatmap(distribution, mover_seat):
 def _move_analysis_context(cache, full_game, display_game, history_index, p1_name, p2_name,
                            inflight=frozenset(), calc_started=None, grace_period_over=False):
     """Build the move-comparison panel's template context for the position
-    currently being reviewed, or None when there's nothing to show at all
-    (final position, or no analysis recorded and the position is one the
-    automatic worker hasn't given up on yet). Returns {"pending": True, ...}
-    while the background computation hasn't reached a tractable position
-    yet - or is mid-flight on this one - so the template can say it's on
-    its way; {"calculable": True, ...} once the automatic post-game grace
-    period (_ANALYSIS_TIME_CAP) has passed and this position was never
-    reached - too deep for the worker's own unattended budget, but still
-    computable on explicit request (see start_ondemand_analysis) - so the
-    template can offer a "Calculate" button instead of showing nothing.
+    being reviewed, or None when there's nothing to show.
+
+    Returns {"pending": True, ...} while analysis hasn't reached a tractable
+    position yet or is mid-flight; {"calculable": True, ...} once the grace
+    period has passed and this position was never reached, so the template
+    can offer a "Calculate" button (see start_ondemand_analysis).
     """
     if cache is None or history_index >= len(full_game.moves):
         return None
@@ -126,25 +109,17 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
             if calc_started is not None and history_index in calc_started:
                 started_ago = time.monotonic() - calc_started[history_index]
             return {"pending": True, "mover_name": mover_name, "started_ago": started_ago}
-        # A feasible position the worker hasn't reached yet is "coming soon" -
-        # but only while the grace period is still running. Once it's over the
-        # worker has stopped for good, so a position it never got to (e.g. the
-        # forward slot was starved of a pool thread - see _get_analysis_pools)
-        # would otherwise be stuck showing "still being computed" forever with
-        # no way to trigger it. Fall through to the "Calculate" button instead,
-        # exactly as an infeasible position does.
+        # A feasible position the worker hasn't reached is "coming soon", but
+        # only while the grace period runs. Once it's over, fall through to the
+        # "Calculate" button rather than spin forever.
         if analysis_feasible(display_game) and not grace_period_over:
             return {"pending": True, "mover_name": mover_name, "started_ago": None}
         if grace_period_over:
             return {"calculable": True, "mover_name": mover_name, "history_index": history_index}
         return None
-    # A partial entry (see _stream_analysis) carries the moves solved so far
-    # under a wrapper - "streaming" True while still calculating, False once a
-    # deadline stopped it short - with the winner's heatmap not yet computed.
-    # A finished analysis is a plain {(row, col): stats} dict (no "streaming"
-    # key, since its keys are all (row, col) tuples). The rows below render
-    # any of the three; only the heatmap, the note, and the still-uncomputed
-    # placeholder rows differ.
+    # A partial entry (see _stream_analysis) wraps the moves solved so far,
+    # "streaming" True while calculating. A finished analysis is a plain
+    # {(row, col): stats} dict. The rows below render either.
     partial = isinstance(data, dict) and "streaming" in data
     in_progress = bool(partial and data["streaming"])
     done_count = total_count = None
@@ -155,20 +130,14 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
         computed = data
     played_marker = full_game.moves[history_index]
     rows = []
-    # Same (eval, marker) tie-break analyse_moves itself uses to decide
-    # "best" - not `combined`, which is a mean-based delta that can tie (or
-    # even disagree in sign) between moves with different win/draw shapes.
-    # Sorting by it too keeps the badged best move first in the table.
+    # Sort by the same (eval, marker) tie-break analyse_moves uses for "best",
+    # so the badged best move stays first in the table.
     for marker, move in sorted(
         computed.items(), key=lambda item: (item[1]["eval"], item[0]), reverse=True
     ):
         card = move["card"]
-        # analyse_moves reports win_pct/loss_pct/defensive/offensive from
-        # the mover's own perspective, which alternates with mover_seat as
-        # you step through history - fixed to P1/P2 here so the columns
-        # mean the same thing on every position instead of swapping sides
-        # each time the mover changes (see _outcome_heatmap for the same
-        # fix already applied to the heatmap's axis).
+        # analyse_moves reports pcts from the mover's perspective; fix to P1/P2
+        # so the columns mean the same on every position.
         if mover_seat == 1:
             p1_win_pct, p2_win_pct = move["win_pct"], move["loss_pct"]
             p1_change, p2_change = move["defensive"], move["offensive"]
@@ -179,9 +148,7 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
             {
                 "marker": marker,
                 "card": card,
-                # A face-down move's analysis averages over what it might
-                # have been, but the one actually played has a known
-                # outcome - the final board holds its revealed identity.
+                # The played face-down move has a known identity on the final board.
                 "revealed": (
                     full_game.board[marker[0]][marker[1]]
                     if card.facedown and marker == played_marker
@@ -198,11 +165,8 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
                 "status": None,  # a solved row - see placeholders below
             }
         )
-    # For a partial entry, list the moves not yet solved too, so the table
-    # shows the full slate from the start rather than growing a row at a time -
-    # tagged "calculating" while the walk is still running, "stopped" once a
-    # deadline cut it short. display_game is the position being reviewed, so
-    # its legal moves are exactly the ones the analysis covers.
+    # For a partial entry, list the not-yet-solved moves too, tagged
+    # "calculating" while running, "stopped" once a deadline cut it short.
     if partial:
         status = "calculating" if in_progress else "stopped"
         for marker in sorted(set(display_game.legal_moves) - set(computed)):
@@ -221,16 +185,13 @@ def _move_analysis_context(cache, full_game, display_game, history_index, p1_nam
                     "status": status,
                 }
             )
-    # The winner's distribution (and so the heatmap) is only there once the
-    # analysis has fully finished - a partial entry shows the table alone.
+    # The heatmap is only available once analysis fully finished; a partial
+    # entry shows the table alone.
     best_distribution = None
     if not partial:
         best = next(row for row in rows if row["best"])
         best_distribution = computed[best["marker"]]["distribution"]
-    # Once every move is solved the walk is on its final, separate step - the
-    # winner's outcome distribution (see iter_move_analyses / the native
-    # `distribution` call), the one expensive piece - so the note flips from
-    # "solving moves" to "generating heatmap" for that window.
+    # Every move solved but not final: the note flips to "generating heatmap".
     generating_heatmap = in_progress and done_count == total_count
     return {
         "pending": False,
@@ -260,9 +221,8 @@ def _room_context(code, room, player_id):
 
     turn_seat = None if game_over else room.current_turn_seat
 
-    # Placement phase: the marker is dealt but not yet placed, and both seats
-    # are filled so seat 2 can choose its starting cell. your_placement marks
-    # the viewer who gets the clickable central cells.
+    # Placement phase: marker dealt but unplaced, both seats filled so seat 2
+    # can choose. your_placement marks the viewer with the clickable cells.
     needs_marker = display_game.needs_marker and room.both_seated
     your_placement = needs_marker and my_seat == 2
 
@@ -303,9 +263,8 @@ def _room_context(code, room, player_id):
             grace_period_over=grace_period_over(room.analysis_deadline),
         )
 
-    # "Play from here" - a link to open a fresh solo game from the position
-    # currently under review (see create_solo_room_from_state). Only offered
-    # for a non-terminal reviewed position; the final one has nothing to play.
+    # "Play from here": link to a fresh solo game from the reviewed position
+    # (see create_solo_room_from_state). Only for a non-terminal position.
     play_from_state = (
         encode_game_state(display_game)
         if game_over and display_game.legal_moves
@@ -352,14 +311,10 @@ def _room_context(code, room, player_id):
 
 
 def _room_review_context(entry, viewer_id):
-    """Build the template context for one viewer reviewing a frozen,
-    finished room (a finished_rooms entry) - as opposed to _room_context,
-    which reads the live, possibly-since-rematched RoomState. The Game
-    object itself never changes here; only which move *this viewer* is
-    currently scrubbed to does, tracked the same way as everywhere else -
-    a per-viewer position in entry["history_index"] - so review reuses the
-    exact same join/history_step/history_goto socket flow as live play and
-    spectating, just pointed at a frozen entry instead of a live room.
+    """Build the template context for one viewer reviewing a frozen finished
+    room (a finished_rooms entry), rather than the live RoomState _room_context
+    reads. The Game never changes; only this viewer's scrubbed-to position
+    (entry["history_index"]) does, so review reuses the live history flow.
     """
     game = entry["game"]
     total = len(game.moves)
@@ -443,10 +398,8 @@ def render_state(code, room, player_id):
 def broadcast_state(code, room):
     """Push a freshly rendered, viewer-specific board to everyone in the room.
 
-    Each viewer's status bar/seat buttons depend on who *they* are (their
-    own seat, whether they can join a vacant one, etc.), so unlike the lobby
-    listing below this can't be sent as one shared broadcast - it's rendered
-    and sent individually per connected socket.
+    Each viewer's status bar/seat buttons depend on who they are, so this is
+    rendered and sent individually per connected socket, not shared.
     """
     with room.lock:
         sid_players = dict(room.sid_players)
@@ -456,14 +409,12 @@ def broadcast_state(code, room):
 
 
 def room_summary_locked(code, room):
-    """Like _room_summary, but assumes the caller already holds room.lock
-    (needed so a finished-game snapshot can be taken atomically with the
-    move that just finished it - see game_flow.record_room_finished_locked).
+    """Like _room_summary, but assumes the caller holds room.lock, so a
+    finished-game snapshot is atomic with the move that finished it (see
+    game_flow.record_room_finished_locked).
     """
     game = room.game
-    # An unplaced game (fresh room awaiting a marker) has no legal moves but
-    # isn't finished - otherwise a room with a vacant seat would be filtered
-    # out of the lobby as "finished" (see lobby_active_summaries).
+    # Guard on the marker: an unplaced game has no legal moves but isn't over.
     game_over = not game.needs_marker and not game.legal_moves
     game_started = room.game_started
     seated_ids = set(room.seats.values())
@@ -478,10 +429,8 @@ def room_summary_locked(code, room):
     return {
         "code": code,
         "is_solo": room.computer_seat is not None,
-        # A multiplayer room with a free seat is joinable; once both are taken
-        # (even before the first move, while placing the marker) it's spectate
-        # only. Drives the lobby's Join vs Spectate label - "waiting for
-        # players" (no moves yet) is NOT the same as "has a free seat".
+        # Drives the lobby's Join vs Spectate label; distinct from "waiting for
+        # players" (which is about moves, not free seats).
         "has_open_seat": room.computer_seat is None and len(room.seats) < 2,
         "has_moves": game_started,
         "p1_name": room.name_for_seat(1),
@@ -500,15 +449,10 @@ def _room_summary(code, room):
 
 
 def lobby_active_summaries():
-    """Active games - multiplayer rooms and solo-vs-computer games alike -
-    for the /rooms list's "Ongoing games" table. A room/solo game are the
-    same underlying thing (see module docstring), so one list covers both;
-    the template distinguishes them via each summary's "is_solo" flag
-    (e.g. to link to room_view vs spectate_solo). Solo games with no moves
-    yet are left off - there's nothing meaningful to watch, and every
-    /play visit otherwise creates one of these; a multiplayer room with no
-    moves yet still shows (as "waiting for players"), since that's exactly
-    what a second player needs to see to find it.
+    """Active games - rooms and solo games alike - for the /rooms "Ongoing
+    games" table; the template distinguishes them via "is_solo". Solo games
+    with no moves yet are left off (nothing to watch), but a multiplayer room
+    with none still shows as "waiting for players" so a joiner can find it.
     """
     with rooms_lock:
         codes = list(rooms.keys())
@@ -529,10 +473,8 @@ def lobby_active_summaries():
 
 
 def lobby_finished_summaries():
-    """The most recently finished games - rooms and solo games alike, most-
-    recent first - frozen snapshots taken as each one finished (see
-    game_flow.record_room_finished_locked), so a later rematch/new game
-    doesn't change or remove its entry here.
+    """The most recently finished games, most-recent first - frozen snapshots
+    taken as each one finished, so a later rematch doesn't change its entry.
     """
     with finished_rooms_lock:
         return list(reversed(finished_rooms))
