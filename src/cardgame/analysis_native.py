@@ -1,12 +1,15 @@
 """Rust-backed per-move analysis: analysis.analyse_moves via the native core.
 
 Mirrors analysis.py field-for-field, but drives the walk one root move at a
-time through cardgame_native (analyse_move for each move's exact aggregate,
-distribution for the winner's outcome histogram). The per-move granularity
-is what lets iter_move_analyses stream results to the UI as each move lands;
-analyse_moves_native just drains that generator into the same dict the pure-
-Python analyse_moves returns. Requires the optional cardgame-native package;
-analysis.py keeps the pure-Python implementation as the reference fallback.
+time through a native MoveAnalyzer: analyse_move_exact for each move's exact
+aggregate (all moves share one transposition cache) and distribution for the
+winner's outcome histogram (reconstructed from that warm cache). The per-move
+granularity is what lets iter_move_analyses stream results to the UI as each
+move lands; analyse_moves_native just drains that generator into the same dict
+the pure-Python analyse_moves returns. The standalone analyse_move function is
+still used by move_value_native for single-move tie-breaks. Requires the
+optional cardgame-native package; analysis.py keeps the pure-Python
+implementation as the reference fallback.
 """
 
 import time
@@ -16,9 +19,12 @@ from .game import Eval
 from .solver import _root_state, _legal_cells
 
 try:
-    from cardgame_native import analyse_move as _analyse_move, distribution as _distribution
+    from cardgame_native import (
+        analyse_move as _analyse_move,
+        MoveAnalyzer as _MoveAnalyzer,
+    )
 except ImportError:
-    _analyse_move = _distribution = None
+    _analyse_move = _MoveAnalyzer = None
 
 NATIVE_AVAILABLE = _analyse_move is not None
 
@@ -112,6 +118,12 @@ def iter_move_analyses(game, deadline=None):
     each one lands, then (FINAL, move_data) once the best move, deltas and
     the winner's outcome distribution are all in.
 
+    Each move is solved with the exact-matching pruned solver (the solver's
+    alpha-beta + Star1 machinery, cutoffs on strict 2w+d so results are
+    field-identical to the exhaustive walk) - the speedup is the pruning, not
+    caching. The best move's heatmap distribution is carried as one more
+    aggregated field on its own solve (distribution_exact).
+
     Each intermediate yield carries the full accumulated dict with
     provisional deltas applied (the best move can still change as later moves
     arrive - see _apply_deltas), so a streaming caller can render a live,
@@ -123,20 +135,22 @@ def iter_move_analyses(game, deadline=None):
     """
     from .analysis import AnalysisAborted
 
-    if _analyse_move is None:
+    if _MoveAnalyzer is None:
         raise ImportError("cardgame-native is not installed")
     if not game.legal_moves:
         raise ValueError("Game is already over — no legal moves to analyse.")
 
     cells, cell, rows, cols, mi, mk, oi, ok, unknowns = _root_state(game)
     cells_i = [-1 if c is None else c for c in cells]
-    uk = list(unknowns)
+    analyzer = _MoveAnalyzer(
+        cells_i, rows, cols, mi, mk, oi, ok, list(unknowns), _remaining(deadline)
+    )
     move_data = {}
     for target in _legal_cells(cell, rows, cols):
         budget = _remaining(deadline)
         if budget is not None and budget <= 0:
             raise AnalysisAborted
-        agg = _analyse_move(cells_i, target, rows, cols, mi, mk, oi, ok, uk, budget)
+        agg = analyzer.analyse_move_exact(target)
         if agg is None:
             raise AnalysisAborted
         marker = divmod(target, 6)
@@ -149,7 +163,7 @@ def iter_move_analyses(game, deadline=None):
     if budget is not None and budget <= 0:
         raise AnalysisAborted
     best_target = best_marker[0] * 6 + best_marker[1]
-    dist = _distribution(cells_i, best_target, rows, cols, mi, mk, oi, ok, uk, budget)
+    dist = analyzer.distribution(best_target)
     if dist is None:
         raise AnalysisAborted
     move_data[best_marker]["distribution"] = Counter({diff: w for diff, w in dist})

@@ -65,6 +65,8 @@ impl V {
 // Sign component far above any reachable value (max real sign is 12!),
 // with enough i64 headroom for every window +/- slack derivation.
 const INF: V = V(1 << 45, 0);
+// Same, as a bare sign_sum bound for the 1-D exact-matching solver windows.
+const INF_SS: i64 = 1 << 45;
 
 // ---------------------------------------------------------------------------
 // Scoring DP (port of scoring.score_dp)
@@ -582,9 +584,11 @@ impl Ctx {
 // Unlike the solver these walks never prune: analyse_moves needs exact
 // per-move win/draw/loss/score aggregates for *every* legal move, and the
 // (2w+d, w, s) line-selection tie-break is not an ordered group, so
-// alpha-beta on it would be unsound. Each root move is independent (no
-// pruning between them), which is what lets a caller solve them one at a
-// time and stream the results.
+// alpha-beta on it would be unsound. Pruning between root moves is likewise
+// out. Instead the sibling moves share one exact-aggregate cache (see ACtx),
+// so subtrees transposed between them are solved once, and the winner's
+// distribution is reconstructed from that warm cache (recon_search) rather
+// than re-walked. MoveAnalyzer drives the moves one at a time for streaming.
 // ---------------------------------------------------------------------------
 
 // Score diffs are in [-26, 26]; the histogram carries generous headroom
@@ -643,12 +647,44 @@ impl Agg {
     }
 }
 
+// A node value carrying the solver's prunable projection `v = (sign_sum,
+// score_sum)` plus the full aggregate payload. Cutoffs compare only `v`; `agg`
+// rides the selected line for the win/draw/mover_sum stats. Exact at any node
+// whose value lands inside the search window (the PV/optimal line), so a
+// full-window move solve returns that move's exact aggregate.
+#[derive(Clone, Copy)]
+struct AV {
+    v: V,
+    agg: Agg,
+}
+
+impl AV {
+    #[inline]
+    fn exact(agg: Agg) -> AV {
+        AV { v: V(2 * agg.w + agg.d - agg.m, agg.s), agg }
+    }
+    #[inline]
+    fn neg(self) -> AV {
+        AV { v: self.v.neg(), agg: self.agg.neg() }
+    }
+}
+
+// Cap on the analysis transposition tables (bounds peak memory on the largest
+// feasible positions; a miss past the cap just recomputes that subtree).
+const AGG_CACHE_CAP: usize = 4_000_000;
+
 struct ACtx {
     cells: [i64; 36],
     unknowns: [i64; 12],
     deadline: Option<Instant>,
     nodes: u64,
     aborted: bool,
+    // Exact per-position aggregate memo, keyed like the solver's bound cache
+    // (id_key omits unknowns - (rows, hands) determine them). Shared across a
+    // position's per-move solves and the winner's distribution reconstruction.
+    cache: HashMap<IdKey, Agg>,
+    // Bound cache for the pruned aggregating solver (psearch): (value, flag).
+    bound_cache: HashMap<IdKey, (AV, i8)>,
 }
 
 impl ACtx {
@@ -696,6 +732,10 @@ impl ACtx {
         if n == 0 {
             return self.leaf(mi, mk, oi, ok, nu);
         }
+        let key = id_key(cell, rows, mi, mk, oi, ok);
+        if let Some(&a) = self.cache.get(&key) {
+            return a;
+        }
         let mut best: Option<(Agg, (usize, usize))> = None;
         for &target in &buf[..n] {
             let nrows = rows | 1 << target;
@@ -718,7 +758,12 @@ impl ACtx {
                 best = Some((candidate, marker));
             }
         }
-        best.unwrap().0
+        let result = best.unwrap().0;
+        // Don't cache a subtree cut short by the deadline (it's not exact).
+        if !self.aborted && self.cache.len() < AGG_CACHE_CAP {
+            self.cache.insert(key, result);
+        }
+        result
     }
 
     /// Sum of the resolutions' child-perspective aggregates (no negation -
@@ -823,6 +868,241 @@ impl ACtx {
         }
         (agg, hist)
     }
+
+    /// Winner's outcome histogram reconstructed from a warm agg cache: pick the
+    /// optimal child at each decision node by its cached aggregate (no re-walk
+    /// of the losers) and recurse only into it. Selects the identical line
+    /// dist_search does - same (2w+d, w, s)-then-marker key - so the histogram
+    /// is bit-identical, but branches only at chance nodes. A cache miss falls
+    /// back to agg_search (still exact), so this is safe on any subtree.
+    #[allow(clippy::too_many_arguments)]
+    fn recon_search(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+        ok: u8, nu: usize,
+    ) -> Hist {
+        if self.aborted {
+            return [0; HIST_SIZE];
+        }
+        self.tick();
+        let mut buf = [0usize; 10];
+        let n = legal(cell, rows, cols, &mut buf);
+        if n == 0 {
+            let mut h = [0i64; HIST_SIZE];
+            let diff = score(mi, mk) - score(oi, ok);
+            h[(diff + HIST_OFFSET) as usize] = FACT[nu];
+            return h;
+        }
+        let mut best: Option<((i64, i64, i64), (usize, usize), usize, i64)> = None;
+        for &target in &buf[..n] {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = self.cells[target];
+            let cagg = if payload < 0 {
+                self.agg_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+            } else if payload > 0 {
+                self.agg_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+            } else {
+                self.agg_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+            };
+            let candidate = cagg.neg();
+            let marker = (target / 6, target % 6);
+            let better = match best {
+                None => true,
+                Some((bk, bm, _, _)) => (candidate.key(), marker) > (bk, bm),
+            };
+            if better {
+                best = Some((candidate.key(), marker, target, payload));
+            }
+        }
+        let (_, _, target, payload) = best.unwrap();
+        let nrows = rows | 1 << target;
+        let ncols = cols | col_bit(target);
+        let chist = if payload < 0 {
+            self.recon_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+        } else if payload > 0 {
+            self.recon_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+        } else {
+            self.recon_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+        };
+        hist_rev(&chist)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recon_chance(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8,
+        oi: u32, ok: u8, nu: usize,
+    ) -> Hist {
+        let mut hist = [0i64; HIST_SIZE];
+        for i in 0..nu {
+            let card = self.unknowns[i];
+            for j in i..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            let rh = if card > 0 {
+                self.recon_search(target, nrows, ncols, oi, ok, mi | card as u32, mk, nu - 1)
+            } else {
+                self.recon_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu - 1)
+            };
+            for j in (i..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[i] = card;
+            for k in 0..HIST_SIZE {
+                hist[k] += rh[k];
+            }
+        }
+        hist
+    }
+
+    // --- Pruned aggregating solver (solver's alpha-beta + Star1, carrying Agg)
+    // Same cutoffs as Ctx::search / Ctx::chance (compared on `v`), but the value
+    // is `AV` so win/draw/mover_sum ride the selected line. A node whose value
+    // is inside the window returns exactly (all its resolutions came back
+    // inside their windows), so a full-window move solve is exact.
+
+    /// Legal cells ordered by the mover's marginal score gain, facedown last
+    /// (port of Ctx::order without the cross-pass best-move hint).
+    fn porder(&self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, buf: &mut [usize; 10]) -> usize {
+        let n = legal(cell, rows, cols, buf);
+        let base = score(mi, mk);
+        // insertion-sort faceup cells by marginal gain; facedown (payload<0) last
+        let mut keys = [0i64; 10];
+        for i in 0..n {
+            let p = self.cells[buf[i]];
+            keys[i] = if p < 0 {
+                i64::MAX
+            } else if p > 0 {
+                base - score(mi | p as u32, mk)
+            } else {
+                base - score(mi, mk + 1)
+            };
+        }
+        for i in 1..n {
+            let (kt, ct) = (keys[i], buf[i]);
+            let mut j = i;
+            while j > 0 && (keys[j - 1] > kt || (keys[j - 1] == kt && buf[j - 1] > ct)) {
+                keys[j] = keys[j - 1];
+                buf[j] = buf[j - 1];
+                j -= 1;
+            }
+            keys[j] = kt;
+            buf[j] = ct;
+        }
+        n
+    }
+    // --- Exact-matching pruned solver -----------------------------------
+    // Cutoffs on strict sign_sum only (2w+d - m), keeping sign_sum-ties fully
+    // evaluated and selecting by the full (2w+d, w, s) key - so the reported
+    // win/draw split and score are field-identical to the exhaustive walk,
+    // while dominated branches are still pruned (alpha-beta + Star1). Windows
+    // are 1-D sign_sum values; strict boundaries keep ties exact.
+
+    #[allow(clippy::too_many_arguments)]
+    fn psearch_exact(
+        &mut self, cell: usize, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32,
+        ok: u8, nu: usize, mut alpha: i64, beta: i64,
+    ) -> AV {
+        self.tick();
+        if self.aborted {
+            return AV { v: V(alpha, 0), agg: Agg::zero() };
+        }
+        let mut buf = [0usize; 10];
+        let n = self.porder(cell, rows, cols, mi, mk, &mut buf);
+        if n == 0 {
+            return AV::exact(self.leaf(mi, mk, oi, ok, nu));
+        }
+        let key = id_key(cell, rows, mi, mk, oi, ok);
+        if let Some(&(av, flag)) = self.bound_cache.get(&key) {
+            let ss = av.v.0;
+            if flag == EXACT || (flag == LOWER && ss > beta) || (flag == UPPER && ss < alpha) {
+                return av;
+            }
+        }
+        let alpha0 = alpha;
+        let mut best: Option<AV> = None;
+        let mut best_marker = (0usize, 0usize);
+        for &target in &buf[..n] {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let p = self.cells[target];
+            let child = if p < 0 {
+                self.pchance_exact(target, nrows, ncols, mi, mk, oi, ok, nu, alpha, beta)
+            } else if p > 0 {
+                self.psearch_exact(target, nrows, ncols, oi, ok, mi | p as u32, mk, nu, -beta, -alpha)
+                    .neg()
+            } else {
+                self.psearch_exact(target, nrows, ncols, oi, ok, mi, mk + 1, nu, -beta, -alpha)
+                    .neg()
+            };
+            let css = child.v.0;
+            // Fail-high only on strict sign_sum domination (keeps beta-ties exact).
+            if css > beta {
+                if !self.aborted && self.bound_cache.len() < AGG_CACHE_CAP {
+                    self.bound_cache.insert(key, (child, LOWER));
+                }
+                return child;
+            }
+            // Select by the full (2w+d, w, s) key then marker - the exhaustive
+            // walk's tie-break, so tied lines resolve to the same mover_sum.
+            let marker = (target / 6, target % 6);
+            if best.is_none() || (child.agg.key(), marker) > (best.unwrap().agg.key(), best_marker) {
+                best = Some(child);
+                best_marker = marker;
+            }
+            if css > alpha {
+                alpha = css;
+            }
+        }
+        let b = best.unwrap();
+        if !self.aborted && self.bound_cache.len() < AGG_CACHE_CAP {
+            let flag = if b.v.0 < alpha0 { UPPER } else { EXACT };
+            self.bound_cache.insert(key, (b, flag));
+        }
+        b
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pchance_exact(
+        &mut self, target: usize, nrows: u64, ncols: u64, mi: u32, mk: u8,
+        oi: u32, ok: u8, nu: usize, alpha: i64, beta: i64,
+    ) -> AV {
+        let mc = FACT[nu - 1];
+        let mut done_ss: i64 = 0;
+        let mut done_agg = Agg::zero();
+        for i in 0..nu {
+            let rem = (nu - 1 - i) as i64;
+            let slack = mc * rem;
+            let a_i = alpha - done_ss - slack;
+            let b_i = beta - done_ss + slack;
+            let card = self.unknowns[i];
+            for j in i..nu - 1 {
+                self.unknowns[j] = self.unknowns[j + 1];
+            }
+            let r = if card > 0 {
+                self.psearch_exact(target, nrows, ncols, oi, ok, mi | card as u32, mk, nu - 1, -b_i, -a_i)
+                    .neg()
+            } else {
+                self.psearch_exact(target, nrows, ncols, oi, ok, mi, mk + 1, nu - 1, -b_i, -a_i)
+                    .neg()
+            };
+            for j in (i..nu - 1).rev() {
+                self.unknowns[j + 1] = self.unknowns[j];
+            }
+            self.unknowns[i] = card;
+            let r_ss = r.v.0;
+            let agg = done_agg.add(r.agg);
+            // Strict cutoffs keep boundary ties exact for the parent's tiebreak.
+            if r_ss > b_i {
+                return AV { v: V(done_ss + r_ss - slack, agg.s), agg };
+            }
+            if r_ss < a_i {
+                return AV { v: V(done_ss + r_ss + slack, agg.s), agg };
+            }
+            done_ss += r_ss;
+            done_agg = agg;
+        }
+        AV { v: V(done_ss, done_agg.s), agg: done_agg }
+    }
 }
 
 fn new_actx(cells: Vec<i64>, unknowns: &[i64], deadline_secs: Option<f64>) -> PyResult<ACtx> {
@@ -837,6 +1117,8 @@ fn new_actx(cells: Vec<i64>, unknowns: &[i64], deadline_secs: Option<f64>) -> Py
         deadline: deadline_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
         nodes: 0,
         aborted: false,
+        cache: HashMap::new(),
+        bound_cache: HashMap::new(),
     })
 }
 
@@ -870,40 +1152,94 @@ fn analyse_move(
     })
 }
 
-/// The winner's outcome distribution: (score_diff, weight) pairs in the
-/// analysed player's own perspective (self - opponent), matching
-/// analyse_moves' `distribution`. None if the deadline tripped.
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn distribution(
-    py: Python<'_>, cells: Vec<i64>, target: usize, rows: u64, cols: u64, mi: u32,
-    mk: u8, oi: u32, ok: u8, unknowns: Vec<i64>, deadline_secs: Option<f64>,
-) -> PyResult<Option<Vec<(i64, i64)>>> {
-    let mut ctx = new_actx(cells, &unknowns, deadline_secs)?;
-    let nu = unknowns.len();
-    py.detach(move || {
-        let nrows = rows | 1 << target;
-        let ncols = cols | col_bit(target);
-        let payload = ctx.cells[target];
-        let (_, hist) = if payload < 0 {
-            ctx.dist_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
-        } else if payload > 0 {
-            ctx.dist_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
-        } else {
-            ctx.dist_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
-        };
-        if ctx.aborted {
-            return Ok(None);
-        }
-        // Top level applies no flip; distribution key is other - mover =
-        // -(mover - other), i.e. the child histogram reversed.
-        let final_hist = hist_rev(&hist);
-        let out: Vec<(i64, i64)> = (0..HIST_SIZE)
-            .filter(|&i| final_hist[i] != 0)
-            .map(|i| (i as i64 - HIST_OFFSET, final_hist[i]))
-            .collect();
-        Ok(Some(out))
-    })
+/// Stateful per-position analyser: solves each root move through one shared
+/// agg cache (transpositions between the sibling moves are solved once) and
+/// reconstructs the winner's distribution from that warm cache. Same
+/// per-move aggregates and histogram as calling analyse_move / distribution
+/// standalone, just without re-solving shared subtrees. Streaming-friendly:
+/// Python drives it one move at a time.
+#[pyclass]
+struct MoveAnalyzer {
+    ctx: ACtx,
+    rows: u64,
+    cols: u64,
+    mi: u32,
+    mk: u8,
+    oi: u32,
+    ok: u8,
+    nu: usize,
+}
+
+#[pymethods]
+impl MoveAnalyzer {
+    #[new]
+    #[pyo3(signature = (cells, rows, cols, mi, mk, oi, ok, unknowns, deadline_secs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cells: Vec<i64>, rows: u64, cols: u64, mi: u32, mk: u8, oi: u32, ok: u8,
+        unknowns: Vec<i64>, deadline_secs: Option<f64>,
+    ) -> PyResult<Self> {
+        let nu = unknowns.len();
+        let ctx = new_actx(cells, &unknowns, deadline_secs)?;
+        Ok(MoveAnalyzer { ctx, rows, cols, mi, mk, oi, ok, nu })
+    }
+
+    /// One root move's aggregate via the exact-matching pruned solver (strict
+    /// sign_sum cutoffs). Field-identical to the exhaustive walk - same
+    /// (2w+d, w, s) line - but pruned. None if the deadline tripped.
+    fn analyse_move_exact(&mut self, py: Python<'_>, target: usize) -> Option<(i64, i64, i64, i64, i64)> {
+        let (rows, cols, mi, mk, oi, ok, nu) =
+            (self.rows, self.cols, self.mi, self.mk, self.oi, self.ok, self.nu);
+        let ctx = &mut self.ctx;
+        py.detach(move || {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = ctx.cells[target];
+            let av = if payload < 0 {
+                ctx.pchance_exact(target, nrows, ncols, mi, mk, oi, ok, nu, -INF_SS, INF_SS)
+            } else if payload > 0 {
+                ctx.psearch_exact(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu, -INF_SS, INF_SS)
+                    .neg()
+            } else {
+                ctx.psearch_exact(target, nrows, ncols, oi, ok, mi, mk + 1, nu, -INF_SS, INF_SS)
+                    .neg()
+            };
+            if ctx.aborted {
+                return None;
+            }
+            let a = av.agg;
+            Some((a.m, a.w, a.d, a.s, a.mover_sum))
+        })
+    }
+
+    /// The winner's outcome distribution as (score_diff, weight) pairs,
+    /// reconstructed from the warm cache (see recon_search). None on deadline.
+    fn distribution(&mut self, py: Python<'_>, target: usize) -> Option<Vec<(i64, i64)>> {
+        let (rows, cols, mi, mk, oi, ok, nu) =
+            (self.rows, self.cols, self.mi, self.mk, self.oi, self.ok, self.nu);
+        let ctx = &mut self.ctx;
+        py.detach(move || {
+            let nrows = rows | 1 << target;
+            let ncols = cols | col_bit(target);
+            let payload = ctx.cells[target];
+            let hist = if payload < 0 {
+                ctx.recon_chance(target, nrows, ncols, mi, mk, oi, ok, nu)
+            } else if payload > 0 {
+                ctx.recon_search(target, nrows, ncols, oi, ok, mi | payload as u32, mk, nu)
+            } else {
+                ctx.recon_search(target, nrows, ncols, oi, ok, mi, mk + 1, nu)
+            };
+            if ctx.aborted {
+                return None;
+            }
+            let final_hist = hist_rev(&hist);
+            let out: Vec<(i64, i64)> = (0..HIST_SIZE)
+                .filter(|&i| final_hist[i] != 0)
+                .map(|i| (i as i64 - HIST_OFFSET, final_hist[i]))
+                .collect();
+            Some(out)
+        })
+    }
 }
 
 /// Root exact evaluation in one walk: the position's value distribution AND
@@ -1675,7 +2011,7 @@ fn heuristic_placement(
 fn cardgame_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_root, m)?)?;
     m.add_function(wrap_pyfunction!(analyse_move, m)?)?;
-    m.add_function(wrap_pyfunction!(distribution, m)?)?;
+    m.add_class::<MoveAnalyzer>()?;
     m.add_function(wrap_pyfunction!(evaluate_root, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_root, m)?)?;
     m.add_function(wrap_pyfunction!(heuristic_placement, m)?)?;
