@@ -1,58 +1,78 @@
-<h2>Ongoing games</h2>
-{% if not rooms %}
-<p>No ongoing games yet. <a href="{{ url_for('index') }}">Create a room</a> or
-<a href="{{ url_for('play') }}">play vs computer</a>.</p>
-{% else %}
-<table class="room-list">
-    <thead>
-        <tr>
-            <th>Room</th>
-            <th>Player 1</th>
-            <th>Player 2</th>
-            <th>Status</th>
-            <th>Spectators</th>
-            <th></th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for game in rooms %}
-        <tr>
-            <td><span class="room-code">{{ "Solo" if game.is_solo else game.code }}</span></td>
-            <td>{{ game.p1_name or "— vacant —" }}{% if game.p1_score is not none %} ({{ game.p1_score }}){% endif %}</td>
-            <td>{{ game.p2_name or "— vacant —" }}{% if game.p2_score is not none %} ({{ game.p2_score }}){% endif %}</td>
-            <td>{{ game.status }}</td>
-            <td>{{ game.spectators }}</td>
-            <td>
-                <a class="button" href="{{ url_for('spectate_solo', player_id=game.code) if game.is_solo else url_for('room_view', code=game.code) }}">{{ "Join" if game.has_open_seat else "Spectate" }}</a>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
-{% endif %}
+{# The two lobby tab panels. Swapped wholesale by the lobby_state socket
+   event, so the tab bar itself lives in rooms.html.jinja2 (outside this
+   fragment) and reads its counts back off the panels' data-count. #}
 
-{% if finished_games %}
-<h2>Recently finished games</h2>
-<table class="room-list">
-    <thead>
-        <tr>
-            <th>Room</th>
-            <th>Player 1</th>
-            <th>Player 2</th>
-            <th></th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for game in finished_games %}
-        <tr>
-            <td><span class="room-code">{{ "Solo" if game.is_solo else game.code }}</span></td>
-            <td>{{ game.p1_name or "— vacant —" }}{% if game.p1_score is not none %} ({{ game.p1_score }}){% endif %}</td>
-            <td>{{ game.p2_name or "— vacant —" }}{% if game.p2_score is not none %} ({{ game.p2_score }}){% endif %}</td>
-            <td>
-                <a class="button" href="{{ url_for('review', entry_id=game.id) }}">Review</a>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
-{% endif %}
+{# One seat row: a name and, once the game has started, a score. A vacant
+   seat is drawn as a dashed slot instead. The leader takes a gold border -
+   on the Finished tab that is the winner, and a game with neither seat
+   outlined was a draw. #}
+{% macro seat(name, score, lead=false) %}
+<div class="seat{% if not name %} open{% elif lead %} lead{% endif %}">
+    <span class="who">{{ name or "Waiting for a player" }}</span>
+    {% if score is not none %}<span class="pts">{{ score }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{# A whole game as a single link: identity line (code or Solo, spectators,
+   status pill) above the two seats. The card is the only click target -
+   the page header carries the "select a game to..." wording. #}
+{% macro game_card(game, finished=false) %}
+{% set scored = game.p1_score is not none and game.p2_score is not none %}
+{% set p1_lead = scored and game.p1_score > game.p2_score %}
+{% set p2_lead = scored and game.p2_score > game.p1_score %}
+{% set open_seats = 0 if game.is_solo else (0 if game.p1_name else 1) + (0 if game.p2_name else 1) %}
+{% set n1 = game.p1_name or "an open seat" %}
+{% set n2 = game.p2_name or "an open seat" %}
+<a class="game-card" href="{% if finished %}{{ url_for('review', entry_id=game.id) }}{% elif game.is_solo %}{{ url_for('spectate_solo', player_id=game.code) }}{% else %}{{ url_for('room_view', code=game.code) }}{% endif %}"
+   aria-label="{% if finished %}Review the finished game between {{ n1 }} and {{ n2 }}{% elif open_seats %}Join room {{ game.code }}{% else %}Watch {{ n1 }} versus {{ n2 }}{% endif %}">
+    <div class="top">
+        {% if game.is_solo %}<span class="solo-tag">Solo game</span>{% else %}<span class="room-code">{{ game.code }}</span>{% endif %}
+        {% if finished %}
+            <span class="badge badge-done">Finished</span>
+        {% else %}
+            {% if game.spectators %}<span class="spec">{{ game.spectators }} watching</span>{% endif %}
+            {% if open_seats %}
+                <span class="badge badge-open">{{ "Open seat" if open_seats == 1 else "2 open seats" }}</span>
+            {% elif game.has_moves %}
+                <span class="badge badge-live">In progress</span>
+            {% else %}
+                <span class="badge badge-done">Waiting to start</span>
+            {% endif %}
+        {% endif %}
+    </div>
+    <div class="seats">
+        {{ seat(game.p1_name, game.p1_score, lead=p1_lead) }}
+        {{ seat(game.p2_name, game.p2_score, lead=p2_lead) }}
+    </div>
+</a>
+{% endmacro %}
+
+<div class="tabpanel" id="panel-ongoing" role="tabpanel" aria-labelledby="tab-ongoing" data-count="{{ rooms|length }}">
+    {% if rooms %}
+    <div class="game-grid">
+        {% for game in rooms %}{{ game_card(game) }}{% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-panel">
+        <p>Nobody is playing at the moment. Create a room and share the code &mdash; it will appear here for anyone to join.</p>
+        <div class="acts">
+            <form method="post" action="{{ url_for('create_room') }}">
+                <button type="submit">Create a room</button>
+            </form>
+            <a class="button" href="{{ url_for('play') }}">Play the computer</a>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<div class="tabpanel" id="panel-finished" role="tabpanel" aria-labelledby="tab-finished" data-count="{{ finished_games|length }}">
+    {% if finished_games %}
+    <div class="game-grid">
+        {% for game in finished_games %}{{ game_card(game, finished=true) }}{% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-panel">
+        <p>No games have finished yet. When one does it will show up here, and you can step back through every move.</p>
+    </div>
+    {% endif %}
+</div>

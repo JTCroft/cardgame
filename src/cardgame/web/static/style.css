@@ -318,9 +318,11 @@
         border-radius: 999px;
         margin-left: 4px;
     }
-    .badge-best { background: #2e5c34; color: #b8f0c0; }
-    .badge-played { background: #2e4a6b; color: #bcd9ff; }
-    .badge-out { background: #4a4a4a; color: #aaa; }
+    /* The room list's status pills share the analysis palette: joinable /
+       active / inactive map onto the same three colours. */
+    .badge-best, .badge-open { background: #2e5c34; color: #b8f0c0; }
+    .badge-played, .badge-live { background: #2e4a6b; color: #bcd9ff; }
+    .badge-out, .badge-done { background: #4a4a4a; color: #aaa; }
     .badge-calculating { background: #4a4326; color: #f0dfa8; }
     .badge-stopped { background: #4a2e2e; color: #f0b8b8; }
     .analysis-out td { opacity: 0.55; }
@@ -684,15 +686,204 @@
     .hand > .card:nth-child(8) { left: calc(var(--cell) * 1.68); }
     .hand > .card:nth-child(9) { left: calc(var(--cell) * 1.92); }
 
-    /* Room list */
-    table.room-list {
-        border-collapse: collapse;
-        width: 100%;
+    /* ---- Room list (/rooms) ----
+       A grid of game cards under two tabs. Each card is a single link -
+       there are no buttons inside one - so the whole card is the click
+       target and the page header supplies the verb. */
+    .lobby-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: 12px 20px;
+        margin-bottom: 18px;
     }
-    table.room-list th, table.room-list td {
-        text-align: left;
-        padding: 8px 10px;
-        border-bottom: 1px solid #555;
+    .lobby-head .titles { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .lobby-head h1 { margin: 0; }
+    .lobby-head .sub { margin: 0; color: #bbb; line-height: 1.5; max-width: 46ch; }
+    .lobby-head .acts { display: flex; gap: 8px; margin-left: auto; }
+    .lobby-head .acts form { margin: 0; }
+    /* Advertises that the list updates itself over the socket. */
+    .live-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.8em;
+        color: #9a9a9a;
+    }
+    .live-dot::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #5fbf7a;
+        animation: live-pulse 2.4s ease-out infinite;
+    }
+    @keyframes live-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(95, 191, 122, 0.5); }
+        70% { box-shadow: 0 0 0 6px rgba(95, 191, 122, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(95, 191, 122, 0); }
+    }
+
+    /* Tabs: same active vocabulary as .mobile-hand-tabs - lifted
+       background plus a 2px accent edge. */
+    .lobby-tabs {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        border-bottom: 1px solid #444;
+        margin-bottom: 18px;
+    }
+    .lobby-tabs .tab {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        border-radius: 6px 6px 0 0;
+        padding: 10px 16px;
+        margin-bottom: -1px;
+        color: #bbb;
+    }
+    .lobby-tabs .tab:hover { background: #3a3a3a; color: #eee; }
+    .lobby-tabs .tab[aria-selected="true"] {
+        background: #2b2b2b;
+        border-bottom-color: #7cb8ff;
+        color: #fff;
+        font-weight: bold;
+    }
+    .lobby-tabs .tab .n {
+        font-size: 0.8em;
+        font-variant-numeric: tabular-nums;
+        background: #3d3d3d;
+        color: #ccc;
+        border-radius: 999px;
+        padding: 1px 8px;
+    }
+    .lobby-tabs .tab[aria-selected="true"] .n { background: #2e4a6b; color: #bcd9ff; }
+    .lobby-tabs .live-dot { margin-left: auto; padding-right: 4px; }
+
+    .game-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(258px, 1fr));
+        gap: 16px;
+    }
+    .game-card {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        background: #2b2b2b;
+        border: 1px solid #444;
+        border-radius: 10px;
+        padding: 16px;
+        color: #eee;
+        text-decoration: none;
+        cursor: pointer;
+        transition: background 0.12s ease-out, border-color 0.12s ease-out, transform 0.12s ease-out;
+    }
+    /* With no button and no per-card wording, hover carries the whole
+       affordance: the card lifts, takes the link blue, and casts a
+       shadow it doesn't have at rest. */
+    .game-card:hover, .game-card:focus-visible {
+        background: #333;
+        border-color: #5c86bd;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    }
+    .game-card:focus-visible { outline: 3px solid #7cb8ff; outline-offset: 2px; }
+    .game-card .top { display: flex; align-items: center; gap: 8px; }
+    .game-card .top .badge { margin-left: auto; }
+    /* The spectator count / draw marker take the free space instead, so
+       the status pill stays pinned to the right edge beside them. */
+    .game-card .top .spec {
+        margin-left: auto;
+        color: #999;
+        font-size: 0.82em;
+        white-space: nowrap;
+    }
+    .game-card .top .spec ~ .badge { margin-left: 0; }
+    .seats { display: flex; flex-direction: column; gap: 8px; }
+    .seat {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 7px 10px;
+        background: #333;
+        border: 1px solid #3d3d3d;
+        border-radius: 6px;
+    }
+    .game-card:hover .seat { background: #2b2b2b; }
+    .seat .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .seat .pts {
+        margin-left: auto;
+        font-size: 1.15em;
+        font-weight: bold;
+        font-variant-numeric: tabular-nums;
+    }
+    .seat.lead { border-color: #d4a017; }
+    .seat.open {
+        border-style: dashed;
+        border-color: #4d6b4d;
+        background: transparent;
+        color: #9ec7a3;
+    }
+    .game-card:hover .seat.open {
+        border-color: #6fa877;
+        background: rgba(46, 92, 52, 0.22);
+        color: #b8f0c0;
+    }
+    /* Marks a game that has no room code (Solo) - the room-code pill is
+       monospace and letterspaced, which suits a code and not a word. */
+    .solo-tag {
+        display: inline-block;
+        font-size: 0.72em;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #bbb;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 1px 6px;
+        vertical-align: middle;
+    }
+    .empty-panel {
+        background: #2b2b2b;
+        border: 1px solid #444;
+        border-radius: 10px;
+        padding: 28px 20px;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        align-items: center;
+    }
+    .empty-panel p { margin: 0; color: #ccc; line-height: 1.5; max-width: 42ch; }
+    .empty-panel .acts { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+    .empty-panel form { margin: 0; }
+
+    @media (prefers-reduced-motion: reduce) {
+        .live-dot::before { animation: none; }
+        .game-card { transition: none; }
+        .game-card:hover, .game-card:focus-visible { transform: none; }
+    }
+
+    /* Narrow screens: the header actions and the tabs each take a full
+       row. Deliberately its own breakpoint - the game's mobile block
+       below also trips on viewport *height*, which shouldn't reflow a
+       list page. */
+    @media (max-width: 600px) {
+        .lobby-head .acts { margin-left: 0; width: 100%; }
+        /* Equal halves: the form-wrapped button and the plain link are
+           different elements, so both need the same flex basis to share
+           the row evenly rather than sizing to their own text. */
+        .lobby-head .acts > * { flex: 1 1 0; min-width: 0; }
+        .lobby-head .acts .button, .lobby-head .acts button {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            text-align: center;
+        }
+        .lobby-tabs .tab { flex: 1; justify-content: center; padding: 10px 8px; }
+        .lobby-tabs .live-dot { display: none; }
     }
 
     /* Mobile hand tabs, hidden on desktop */
@@ -716,8 +907,13 @@
            not a drawer you tap open, so it costs board space the whole
            time you're playing - claw some of that back from the page's
            top padding rather than shrinking the board itself, and reserve
-           room at the bottom so it doesn't sit on top of the board. */
-        .page { padding-top: 8px; padding-bottom: 246px; }
+           room at the bottom so it doesn't sit on top of the board.
+           Scoped to the game pages: this block also trips on viewport
+           *height*, so an unscoped .page rule would shift the top of every
+           other page (and reserve 246px under it) on any short window.
+           Keyed on #game-state, which is in their initial markup, so the
+           padding doesn't jump when the board arrives over the socket. */
+        .page:has(#game-state) { padding-top: 8px; padding-bottom: 246px; }
         /* Not shrink-wrapped on mobile (the desktop centring trick): a definite
            full width means wide content - the move-comparison table - scrolls
            inside its own overflow-x container instead of stretching the page. */

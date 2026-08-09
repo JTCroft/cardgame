@@ -1,8 +1,26 @@
 {% extends "base.html.jinja2" %}
 {% block title %}Room List - Cross Kings{% endblock %}
 {% block content %}
-<h1>Room List</h1>
-<p><a href="{{ url_for('index') }}">&larr; Back to home</a></p>
+<div class="lobby-head">
+    <div class="titles">
+        <h1>Room list</h1>
+        <p class="sub">Games happening right now. Select a game to join, watch live, or review.</p>
+    </div>
+    <div class="acts">
+        <form method="post" action="{{ url_for('create_room') }}">
+            <button type="submit">Create a room</button>
+        </form>
+        <a class="button" href="{{ url_for('play') }}">Play the computer</a>
+    </div>
+</div>
+
+{# The tab bar sits outside #lobby-list: a lobby_state update replaces that
+   div's contents, which would otherwise reset the open tab mid-browse. #}
+<div class="lobby-tabs" role="tablist" aria-label="Room list sections">
+    <button type="button" class="tab" role="tab" id="tab-ongoing" aria-controls="panel-ongoing" aria-selected="true">Ongoing <span class="n" id="count-ongoing">{{ rooms|length }}</span></button>
+    <button type="button" class="tab" role="tab" id="tab-finished" aria-controls="panel-finished" aria-selected="false" tabindex="-1">Finished <span class="n" id="count-finished">{{ finished_games|length }}</span></button>
+    <span class="live-dot">Updating live</span>
+</div>
 
 <div id="lobby-list">
     {% include "_lobby_state.html.jinja2" %}
@@ -11,11 +29,62 @@
 
 {% block scripts %}
 <script>
+    const LOBBY_TABS = ["ongoing", "finished"];
+
+    function activeLobbyTab() {
+        const tab = document.querySelector('.lobby-tabs .tab[aria-selected="true"]');
+        return tab ? tab.id.replace("tab-", "") : LOBBY_TABS[0];
+    }
+
+    function selectLobbyTab(name) {
+        for (const other of LOBBY_TABS) {
+            const on = other === name;
+            const tab = document.getElementById("tab-" + other);
+            const panel = document.getElementById("panel-" + other);
+            tab.setAttribute("aria-selected", on ? "true" : "false");
+            tab.tabIndex = on ? 0 : -1;
+            if (panel) panel.hidden = !on;
+        }
+        // Shareable: /rooms#finished opens straight onto the review archive.
+        history.replaceState(null, "", "#" + name);
+    }
+
+    // A lobby_state update replaces both panels, so re-apply the open tab and
+    // refresh the counts the tab bar shows. Also the no-JS fallback's cleanup:
+    // the server renders both panels visible, and this hides the inactive one.
+    function syncLobbyTabs() {
+        for (const name of LOBBY_TABS) {
+            const panel = document.getElementById("panel-" + name);
+            const count = document.getElementById("count-" + name);
+            if (panel && count) count.textContent = panel.dataset.count;
+        }
+        selectLobbyTab(activeLobbyTab());
+    }
+
+    document.querySelector(".lobby-tabs").addEventListener("click", (event) => {
+        const tab = event.target.closest(".tab");
+        if (tab) selectLobbyTab(tab.id.replace("tab-", ""));
+    });
+
+    document.querySelector(".lobby-tabs").addEventListener("keydown", (event) => {
+        const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+        if (!step) return;
+        event.preventDefault();
+        const index = LOBBY_TABS.indexOf(activeLobbyTab());
+        const next = LOBBY_TABS[(index + step + LOBBY_TABS.length) % LOBBY_TABS.length];
+        selectLobbyTab(next);
+        document.getElementById("tab-" + next).focus();
+    });
+
+    const requested = location.hash.replace("#", "");
+    selectLobbyTab(LOBBY_TABS.includes(requested) ? requested : LOBBY_TABS[0]);
+
     socket.on("connect", () => {
         socket.emit("join_lobby");
     });
     socket.on("lobby_state", (payload) => {
         document.getElementById("lobby-list").innerHTML = payload.html;
+        syncLobbyTabs();
     });
 </script>
 {% endblock %}
